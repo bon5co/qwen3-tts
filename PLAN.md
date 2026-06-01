@@ -106,6 +106,13 @@ Two structural facts drive the map:
   CP) still uses the f32 path — small but free. (VNNI is the x86 twin, 21.3, needs the rented box.)
 - [ ] `[LOW]` No `silvio_17b.qvoice` to test custom voice on 1.7B (needs `qwen3-tts-1.7b-base` to
   create). 1.7B preset already validates the Talker int8+SDOT critical path.
+
+> **Next session (2026-06-02) — validation & release gate.** Before merging `feat/int8-sdot`:
+> 1. Download `qwen3-tts-1.7b-base`, create `silvio_17b.qvoice`, test custom voice on the 1.7B.
+> 2. Massive total regression: `make test-small`/`test-large`, server (bf16 + int8 + `.qvoice`),
+>    voice-clone e2e, both models, SDOT on AND off (`QWEN_NO_SDOT`).
+> 3. IF all green AND Phase 21 plan is considered done → merge `feat/int8-sdot` → `feat/labs`
+>    (then evaluate → `main`) AND cut a release. ("vediamo" — gated on the tests.)
 - [ ] `[HIGH]` **Group-wise scales for int4** (not per-row absmax like int8). Q4_0 already does
   per-32-block scales — that's the "no big quality loss" enabler. Per-row int4 = quality death.
 - [ ] `[HIGH]` **Native int8 dot (ARM SDOT)** — M1 has `__ARM_FEATURE_DOTPROD`. Today int8 does
