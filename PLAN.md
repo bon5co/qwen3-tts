@@ -812,6 +812,12 @@ Non era un legno di lusso, ma un semplice pezzo da catasta...
 
 ## Phase 20: Ideas from `faster-qwen3-tts` (Andres Marafioti) + CPU/build safety
 
+> 👉 **NEXT UP (after the int8 merge).** The transferable Andres idea is **20.1 streaming with
+> a proper left-context window** to attack TTFA (today: prefill + full generation before any
+> audio). The decoder is already chunk-invariant-enough (±1 LSB, see 18.6); the work is the
+> UX/latency layer (emit first chunk early). This was the original request that kicked off the
+> int8 detour — come back to it.
+
 Analysis of [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) (talk:
 "Reachy Mini", AI Engineer). His 3 tricks and what is/isn't transferable to our pure-C
 CPU engine.

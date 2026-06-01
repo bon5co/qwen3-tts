@@ -59,7 +59,7 @@ make blas
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`.
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
-- **INT8/INT4 quantization** — 15% speedup on 1.7B with `--int8`.
+- **INT8 quantization** — `--int8` quantizes Talker + Code Predictor: **0.6B RTF 1.70→1.29 (−24%)**, **1.7B 2.66→1.79 (−33%)**. Works with preset speakers and custom `.qvoice` voices. (INT4 is opt-in but slower than INT8 on CPU — nibble-unpack overhead.)
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
 - **24 kHz WAV output** — 16-bit PCM, mono.
 
@@ -94,8 +94,8 @@ Optional:
   --voice-design             VoiceDesign mode (create voice from --instruct)
   --stream                   Stream audio (decode chunks during generation)
   --stdout                   Output raw s16le PCM to stdout (implies --stream)
-  --int8                     INT8 quantized (1.7B recommended)
-  --int4                     Q4_0 quantized (1.7B only, experimental)
+  --int8                     INT8 quantized — recommended (0.6B & 1.7B; faster, ~same quality)
+  --int4                     Q4_0 quantized (experimental; slower than --int8 on CPU)
   -j, --threads <n>          Worker threads (default: 4)
   --silent                   Suppress status output
   --debug                    Verbose diagnostics
@@ -238,8 +238,10 @@ Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (`make bench-full`):
 RTF = processing_time / audio_duration. Lower is better; <1.0 = faster than real-time.
 
 Longer audio improves RTF (fixed costs amortize): 0.6B long text reaches **RTF 1.29**.
-Streaming has identical performance to normal mode. `--int8` gives ~11% speedup on 1.7B
-([details](docs/quantization.md)).
+Streaming has identical performance to normal mode. **`--int8`** quantizes both the Talker
+and the Code Predictor and is now a real speed win on both models — **0.6B RTF 1.70→1.29
+(−24%)**, **1.7B 2.66→1.79 (−33%)** — with no perceptible quality loss, and it works with
+custom `.qvoice` voices too ([details](docs/quantization.md)).
 
 Run benchmarks on your machine:
 
