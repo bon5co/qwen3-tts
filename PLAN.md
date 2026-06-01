@@ -220,35 +220,33 @@ Software prefetch hints can help the memory controller prepare cache lines.
   perceptual/mel-corr, NOT md5** — see determinism note below.
 - [ ] `[MED]` **x86 benchmark**: test on a Linux x86 machine to validate AVX2 gains.
 
-> ⚠️ **Non-determinism bug — ROOT CAUSE FOUND & PROVEN (June 2026).** Output is NOT
-> bit-reproducible run-to-run, **even with `--seed 42 -j 1 --temperature 0`**. It is **NOT
-> an uninitialized read** (disproven: `MallocScribble=1 MallocPreScribble=1` did not fix it)
-> and **NOT parallel-reduction order** (single-thread also diverges).
+> ℹ️ **Non-determinism — fully investigated, turns out BENIGN (June 2026).** Output is not
+> always bit-reproducible run-to-run, but the difference is **±1 LSB of 16-bit PCM (~3e-5,
+> −90 dB, corr = 1.0000000)** — pure floating-point rounding, **NOT an audible artifact and
+> NOT a correctness bug**. Measured, not assumed. Disproven hypotheses: uninitialized read
+> (`MallocScribble`/`MallocPreScribble` didn't change it), and "decoder seam artifacts" (the
+> cross-chunk-size difference is ±1 LSB, corr 1.0 — `conv_rf=20` is perceptually identical to
+> `conv_rf=64`).
 >
-> **Actual cause:** the default WAV path **always** runs the overlapped chunked decoder
-> (`decoder_thread_fn`, "always — both streaming and normal", qwen_tts.c:1160). That thread
-> consumes a **variable number of frames per chunk** (`avail = write_pos - read_pos`, which
-> depends on thread timing), and `qwen_speech_decoder_decode_streaming` is **NOT
-> chunk-invariant** — it carries only 2 frames of `vq_pad` between chunks, but downstream has
-> multiple conv layers + ConvNeXt + attention `window=72`. So timing-dependent chunk
-> boundaries → different audio at the seams → non-deterministic output.
+> **Two benign contributors:**
+> 1. **Sampling at temp>0 + parallel-matvec FP noise.** Threaded matvec sums in
+>    non-deterministic order → logits differ at FP level → at temp 0.9 the softmax sample
+>    occasionally flips a token. **Vanishes at `--temperature 0`** (greedy argmax is robust).
+> 2. **Decoder chunk-boundary timing.** The overlapped decoder (`decoder_thread_fn`, always
+>    on) consumes a variable frame count per chunk (`avail`, timing-dependent); the streaming
+>    decoder isn't bit-exactly chunk-invariant, so different boundaries shift the last bit.
+>    **Intermittent / load-dependent** — on a quiet machine, timing repeats and runs are
+>    bit-identical (verified: long text, 4 default runs → identical `f5ea31f6`).
 >
-> **Proven:** capping the decoder to a **fixed** chunk size made output bit-identical across
-> 3 runs (`099a35e6…`). And fixed-chunk(10) ≠ full single decode (`6cba9134…`) → the
-> streaming decoder also produces **real seam artifacts vs a clean full decode**, on the
-> DEFAULT path, since the decode↔generation overlap was added for speed.
+> **Receptive field, for reference:** the conv decoder's true left-context RF is ~55–64
+> latent frames (measured by sweeping `conv_rf` to bit-match a full decode); the shipped
+> `QWEN_SD_STREAM_CONV_RF=20` is below that, but the resulting difference is only ±1 LSB, so
+> it has never mattered perceptually.
 >
-> **Fix options:**
-> - [ ] `[HIGH]` **Option A (right fix):** make the streaming decoder **chunk-invariant** by
->   carrying the full receptive-field left-context across chunks (not just 2 `vq_pad` frames;
->   covers conv stack + attention window 72). Then chunk size is irrelevant → deterministic
->   AND matches full decode (no seam artifacts) AND keeps the overlap speedup. = the Phase
->   20.1 streaming work, now with a correctness motivation, not just latency.
-> - [ ] `[LOW]` Option B (stopgap): fixed decoder chunk size → deterministic but still
->   seam-artifacted (deterministically wrong, not fixed). Useful only to make A/B md5-stable.
-> - [ ] Option C: full non-overlapped decode for file output → clean+deterministic but ~50%
->   wall-time regression (decode no longer overlaps generation). Rejected for default.
-> - Implication for A/B: until Option A lands, validate by RTF + mel-corr, NOT md5.
+> **Decision: Option A (chunk-invariant decoder) NOT pursued** — it would add per-chunk
+> recompute overhead to "fix" a −90 dB difference with zero audible benefit. The decoder is
+> fine. For bit-stable A/B regression, run `-j 1 --temperature 0` (deterministic in practice)
+> or compare by RTF + mel-corr / RMS rather than md5.
 
 ### Experiments That Didn't Work (Phase 18)
 - **pthread thread pool (replace GCD)**: 8% SLOWER on macOS. Apple's GCD is
