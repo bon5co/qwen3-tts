@@ -870,6 +870,15 @@ We already have streaming scaffolding (`qwen_sd_stream_state_t`, `qwen_sd_stream
   negligible. (`qwen_tts.c` decoder_thread_fn: `if first_chunk && ctx->stream → target=2`.)
 - Note: the "25-frame left context" idea is moot — our decoder is already chunk-invariant to
   ±1 LSB (see 18.6); chunk SIZE (not left-context) is the TTFA knob.
+- [x] `[HIGH]` **Batched prefill for int8** (the other half of TTFA): int8/int4 prefill was
+  forced sequential (per-token), 2.2x slower than bf16's batched sgemm (477 vs 226 ms on
+  0.6B). Fixed — int8 now uses the batched path (bf16 weights are still mmap-resident); only
+  server delta-reuse stays sequential. **TTFA 822→567 ms.** Cumulative TTFA: uniform-chunk-10
+  int8 1571 ms → ramped + batched-prefill **560 ms (−64%)**.
+- **Regression (June 2026): all green.** `make test-small` (bf16, 5/5) PASS; server bf16 +
+  int8 (`/v1/tts`, `/v1/tts/stream`) + int8 with Silvio `.qvoice` preload all coherent;
+  voice-clone e2e coherent. Clean warm 0.6B same-text: bf16 RTF 1.36 → int8 1.22, TTFA 560 ms.
+  Quality preserved across all paths (preset, custom voice, streaming, server).
 
 ### 20.2 Short prefill (x-vector-only voice cloning) — DOES NOT apply to our HQ formats `[LOW / mostly N/A]`
 
