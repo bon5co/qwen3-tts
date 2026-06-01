@@ -221,6 +221,9 @@ extern int qwen_speech_decoder_load(qwen_tts_ctx_t *ctx);
 extern int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len);
 extern int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out);
 extern int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes);
+#ifdef CP_MICROBENCH
+extern void qwen_cp_microbench_report(int frames);
+#endif
 extern int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames, float **audio_out, int *n_samples);
 extern int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx, const int *new_codes, int new_frames, float **audio_out, int *n_samples);
 extern void qwen_sd_stream_init(qwen_sd_stream_state_t *st);
@@ -1300,6 +1303,9 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                 t_talker_step_total, ctx->codec_frames > 0 ? t_talker_step_total / ctx->codec_frames : 0,
                 t_cp_total, ctx->codec_frames > 0 ? t_cp_total / ctx->codec_frames : 0);
         fprintf(stderr, "  Embed: %.0f ms, Codec head+sampling: %.0f ms\n", t_embed_total, t_codec_head);
+#ifdef CP_MICROBENCH
+        qwen_cp_microbench_report(ctx->codec_frames);
+#endif
     }
 
     /* Speech decoder */

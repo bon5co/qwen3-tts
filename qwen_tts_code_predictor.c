@@ -22,6 +22,51 @@
 #endif
 
 /* ========================================================================
+ * CP micro-benchmark (compile with -DCP_MICROBENCH, e.g. `make cp-microbench`)
+ *
+ * Partitions the per-frame Code Predictor time among its sub-operations so we
+ * can see what dominates the ~87 ms/f (QKV proj, attention, FFN, norms,
+ * lm_head, embed). Zero overhead and zero footprint when CP_MICROBENCH is
+ * undefined — all macros expand to nothing. Single-threaded orchestration
+ * (the matvecs spawn threads internally, but cp_layer_body runs serially),
+ * so a file-scope timestamp threaded through the frame is correct.
+ * ======================================================================== */
+#ifdef CP_MICROBENCH
+#include <sys/time.h>
+typedef enum {
+    CPB_EMBED, CPB_INNORM, CPB_QKV, CPB_QKNORM, CPB_ROPE, CPB_KVSTORE,
+    CPB_ATTN, CPB_OPROJ, CPB_RESNORM, CPB_FFN_GU, CPB_SWIGLU, CPB_FFN_DOWN,
+    CPB_LMHEAD, CPB_N
+} cpb_slot_t;
+static double cpb_acc[CPB_N];
+static double cpb_t;  /* last timestamp (ms) */
+static const char *cpb_name[CPB_N] = {
+    "Embed+project", "Input norm", "QKV proj", "Q/K norm", "RoPE", "KV store",
+    "Attention", "O proj", "Resid+Norm", "FFN gate_up", "SwiGLU", "FFN down",
+    "lm_head argmax"
+};
+static inline double cpb_now(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
+}
+#define CPB_RESET()    do { cpb_t = cpb_now(); } while (0)
+#define CPB_MARK(slot) do { double _n = cpb_now(); cpb_acc[slot] += _n - cpb_t; cpb_t = _n; } while (0)
+void qwen_cp_microbench_report(int frames) {
+    double tot = 0; for (int i = 0; i < CPB_N; i++) tot += cpb_acc[i];
+    fprintf(stderr, "\n  === CP micro-bench (%d frames, -DCP_MICROBENCH) ===\n", frames);
+    for (int i = 0; i < CPB_N; i++)
+        fprintf(stderr, "    %-16s %8.1f ms  %6.3f ms/f  %5.1f%%\n",
+                cpb_name[i], cpb_acc[i], frames > 0 ? cpb_acc[i] / frames : 0,
+                tot > 0 ? 100.0 * cpb_acc[i] / tot : 0);
+    fprintf(stderr, "    %-16s %8.1f ms  %6.3f ms/f  (CP total measured here)\n",
+            "TOTAL", tot, frames > 0 ? tot / frames : 0);
+}
+#else
+#define CPB_RESET()
+#define CPB_MARK(slot)
+#endif
+
+/* ========================================================================
  * bf16 helpers
  * ======================================================================== */
 
@@ -313,21 +358,25 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
                               l->wq_bf16, l->wk_bf16, l->wv_bf16,
                               x_norm, cp_h, cp_q_dim, cp_kv_dim);
     }
+    CPB_MARK(CPB_QKV);
 
     /* Q/K RMSNorm per-head */
     qwen_rms_norm_per_head(ctx->cp_dec_q, l->q_norm, 1, c->cp_num_heads, c->cp_head_dim, eps);
     qwen_rms_norm_per_head(ctx->cp_dec_k, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
+    CPB_MARK(CPB_QKNORM);
 
     /* NeoX RoPE */
     apply_rope_neox(ctx->cp_dec_q, c->cp_num_heads, c->cp_head_dim,
                     ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
     apply_rope_neox(ctx->cp_dec_k, c->cp_num_kv_heads, c->cp_head_dim,
                     ctx->cp_rope_cos, ctx->cp_rope_sin, pos);
+    CPB_MARK(CPB_ROPE);
 
     /* Store KV in cache (convert f32→bf16) */
     int64_t kv_off = (int64_t)layer * ctx->cp_kv_max * cp_kv_dim + (int64_t)pos * cp_kv_dim;
     f32_to_bf16_vec(ctx->cp_kv_k + kv_off, ctx->cp_dec_k, cp_kv_dim);
     f32_to_bf16_vec(ctx->cp_kv_v + kv_off, ctx->cp_dec_v, cp_kv_dim);
+    CPB_MARK(CPB_KVSTORE);
 
     /* Causal GQA attention (bf16 KV cache) */
     uint16_t *layer_k = ctx->cp_kv_k + (int64_t)layer * ctx->cp_kv_max * cp_kv_dim;
@@ -335,15 +384,18 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     qwen_causal_attention_bf16kv(ctx->cp_dec_attn_out, ctx->cp_dec_q, layer_k, layer_v,
                                  1, pos + 1, c->cp_num_heads, c->cp_num_kv_heads,
                                  c->cp_head_dim, attn_scale, pos);
+    CPB_MARK(CPB_ATTN);
 
     /* Output projection */
     if (l->wo_int8)
         qwen_matvec_int8(proj, l->wo_int8, l->wo_scale, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
     else
         matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+    CPB_MARK(CPB_OPROJ);
 
     /* Fused residual-add + post-attention RMSNorm (saves one pass over x) */
     qwen_rms_norm_residual(x_norm, x, proj, l->post_attn_norm, cp_h, eps);
+    CPB_MARK(CPB_RESNORM);
 
     /* Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
     if (l->gate_up_fused_int8)
@@ -351,13 +403,16 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
                           x_norm, 2 * cp_inter, cp_h);
     else
         matvec_bf16(ctx->cp_dec_gate, l->gate_up_fused_bf16, x_norm, 2 * cp_inter, cp_h);
+    CPB_MARK(CPB_FFN_GU);
     qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
+    CPB_MARK(CPB_SWIGLU);
 
     /* Down projection */
     if (l->down_int8)
         qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
     else
         matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
+    CPB_MARK(CPB_FFN_DOWN);
 
     /* Fused residual-add + next layer's input RMSNorm (or just add for last layer) */
     if (layer + 1 < c->cp_num_layers) {
@@ -365,6 +420,7 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     } else {
         for (int i = 0; i < cp_h; i++) x[i] += proj[i];
     }
+    CPB_MARK(CPB_RESNORM);
 }
 
 static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
@@ -373,6 +429,7 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 
     /* First layer: standard input RMSNorm, then body produces fused norm for next */
     qwen_rms_norm(x_norm, x, ctx->cp_layers[0].input_norm, 1, cp_h, c->rms_norm_eps);
+    CPB_MARK(CPB_INNORM);
     for (int layer = 0; layer < c->cp_num_layers; layer++)
         cp_layer_body(ctx, x, x_norm, pos, layer);
 }
@@ -416,8 +473,10 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     float *cp_normed = ctx->cp_dec_attn_out; /* reuse: not overlapping with transformer step output */
     float *x_norm = ctx->cp_dec_ffn_out;     /* reuse: scratch for transformer step */
 
+    CPB_RESET();
     /* Step 0: process talker hidden state (project if needed) */
     cp_mtp_project(ctx, cp_x, talker_hidden);
+    CPB_MARK(CPB_EMBED);
     cp_transformer_step(ctx, cp_x, x_norm, 0);
 
     /* Step 1: embed code0 using TALKER's codec embedding (NOT CP's).
@@ -432,6 +491,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
             memset(cp_x, 0, cp_h * sizeof(float));
         }
     }
+    CPB_MARK(CPB_EMBED);
     cp_transformer_step(ctx, cp_x, x_norm, 1);
 
     /* Predict codebook 1: fused argmax+matvec (greedy — avoids writing 2048 logits) */
@@ -441,6 +501,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
                                                 ctx->cp_lm_head_scale[0], cp_h, c->codebook_size);
     else
         out_codes[0] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[0], cp_h, c->codebook_size);
+    CPB_MARK(CPB_LMHEAD);
 
     /* Steps 2-15: generate codebooks 2-15. */
     for (int g = 1; g < 15; g++) {
@@ -457,6 +518,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         } else {
             memset(cp_x, 0, cp_h * sizeof(float));
         }
+        CPB_MARK(CPB_EMBED);
 
         cp_transformer_step(ctx, cp_x, x_norm, pos);
 
@@ -467,6 +529,7 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
                                                     ctx->cp_lm_head_scale[g], cp_h, c->codebook_size);
         else
             out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
+        CPB_MARK(CPB_LMHEAD);
     }
 
     return 0;

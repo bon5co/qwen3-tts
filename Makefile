@@ -17,7 +17,7 @@ else
     LDLIBS += -lopenblas
 endif
 
-CFLAGS = $(CFLAGS_BASE)
+CFLAGS = $(CFLAGS_BASE) $(EXTRA_CFLAGS)
 
 # Source files
 SRCS = main.c \
@@ -68,6 +68,7 @@ help:
 	@echo "Benchmark:"
 	@echo "  make bench           - RTF benchmark (short+long, normal+stream)"
 	@echo "  make bench-full      - Full benchmark (+ server, qvoice, instruct, INT8)"
+	@echo "  make cp-microbench   - Build qwen_tts_cpbench (per-op Code Predictor breakdown)"
 	@echo ""
 	@echo "Example: make blas && ./$(TARGET) -d $(MODEL_DIR) -t \"Hello world\" -o output.wav"
 
@@ -76,6 +77,15 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
 blas: $(TARGET)
+
+# CP micro-benchmark: separate binary instrumented with -DCP_MICROBENCH.
+# Partitions per-frame Code Predictor time among sub-ops (QKV/attn/FFN/norm/lm_head).
+# Clean rebuild into qwen_tts_cpbench so instrumented and normal .o never mix.
+cp-microbench:
+	$(MAKE) clean
+	$(MAKE) TARGET=qwen_tts_cpbench EXTRA_CFLAGS=-DCP_MICROBENCH qwen_tts_cpbench
+	@echo ""
+	@echo "Built ./qwen_tts_cpbench  (run a normal generation; CP breakdown prints in the summary)"
 
 # Compile C sources
 %.o: %.c
@@ -562,7 +572,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve \
+.PHONY: all help blas clean debug info serve cp-microbench \
         test-serve test-serve-bench test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \

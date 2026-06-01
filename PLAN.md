@@ -133,6 +133,12 @@ Both models must benefit, all optimizations must be cross-platform (ARM + x86).
 
 ### 18.1 CP Overhead Reduction (cross-platform)
 
+> ⚠️ **REFUTED by micro-bench (June 2026 — see Phase 20.3).** `make cp-microbench` showed
+> the CP is **90.7% matvec/GEMV** (FFN 53%, QKV+O 38%); all "overhead" ops (attention 0.7%,
+> RoPE 0.1%, norms+residual ~0.5%, KV store, dispatch) total **<3%**. The tasks below target
+> that <3% and are **not worth pursuing**. The CP is matvec/bandwidth-bound → the real lever
+> is **CP weight quantization (18.2)** + bf16 GEMV bandwidth saturation. Kept for the record.
+
 The CP calls `cp_transformer_step()` 17 times per frame (2 prefill + 15 decode).
 Each step has 5 layers, each layer has multiple dispatch barriers and function calls.
 At 42% bandwidth utilization, the gap is overhead, not raw throughput.
@@ -204,12 +210,45 @@ Software prefetch hints can help the memory controller prepare cache lines.
 
 ### 18.6 Benchmark and Validation
 
-- [ ] `[HIGH]` **Per-component micro-benchmark**: add `--bench` flag that runs N frames
-  and reports per-component ms/f breakdown (Talker step, CP total, CP per-pass,
-  attention, matvec, norm, embed, sampling). Essential for measuring optimization impact.
+- [x] `[HIGH]` **Per-component CP micro-benchmark**: DONE via `make cp-microbench` (compile
+  flag `-DCP_MICROBENCH`, separate `qwen_tts_cpbench` binary, zero overhead on normal build).
+  Partitions CP ms/f among QKV/attn/FFN/norm/lm_head/embed. Result in 20.3. (A generalized
+  `--bench` flag for the whole pipeline is still optional — the existing summary already
+  reports Talker/CP/embed/codec-head per-frame.)
 - [ ] `[HIGH]` **A/B test each optimization**: before/after RTF with identical params
-  (seed 42, ryan, English long text). Both 0.6B and 1.7B.
+  (seed 42, ryan, English long text). Both 0.6B and 1.7B. ⚠️ **Validate by RTF (timing) +
+  perceptual/mel-corr, NOT md5** — see determinism note below.
 - [ ] `[MED]` **x86 benchmark**: test on a Linux x86 machine to validate AVX2 gains.
+
+> ⚠️ **Non-determinism bug — ROOT CAUSE FOUND & PROVEN (June 2026).** Output is NOT
+> bit-reproducible run-to-run, **even with `--seed 42 -j 1 --temperature 0`**. It is **NOT
+> an uninitialized read** (disproven: `MallocScribble=1 MallocPreScribble=1` did not fix it)
+> and **NOT parallel-reduction order** (single-thread also diverges).
+>
+> **Actual cause:** the default WAV path **always** runs the overlapped chunked decoder
+> (`decoder_thread_fn`, "always — both streaming and normal", qwen_tts.c:1160). That thread
+> consumes a **variable number of frames per chunk** (`avail = write_pos - read_pos`, which
+> depends on thread timing), and `qwen_speech_decoder_decode_streaming` is **NOT
+> chunk-invariant** — it carries only 2 frames of `vq_pad` between chunks, but downstream has
+> multiple conv layers + ConvNeXt + attention `window=72`. So timing-dependent chunk
+> boundaries → different audio at the seams → non-deterministic output.
+>
+> **Proven:** capping the decoder to a **fixed** chunk size made output bit-identical across
+> 3 runs (`099a35e6…`). And fixed-chunk(10) ≠ full single decode (`6cba9134…`) → the
+> streaming decoder also produces **real seam artifacts vs a clean full decode**, on the
+> DEFAULT path, since the decode↔generation overlap was added for speed.
+>
+> **Fix options:**
+> - [ ] `[HIGH]` **Option A (right fix):** make the streaming decoder **chunk-invariant** by
+>   carrying the full receptive-field left-context across chunks (not just 2 `vq_pad` frames;
+>   covers conv stack + attention window 72). Then chunk size is irrelevant → deterministic
+>   AND matches full decode (no seam artifacts) AND keeps the overlap speedup. = the Phase
+>   20.1 streaming work, now with a correctness motivation, not just latency.
+> - [ ] `[LOW]` Option B (stopgap): fixed decoder chunk size → deterministic but still
+>   seam-artifacted (deterministically wrong, not fixed). Useful only to make A/B md5-stable.
+> - [ ] Option C: full non-overlapped decode for file output → clean+deterministic but ~50%
+>   wall-time regression (decode no longer overlaps generation). Rejected for default.
+> - Implication for A/B: until Option A lands, validate by RTF + mel-corr, NOT md5.
 
 ### Experiments That Didn't Work (Phase 18)
 - **pthread thread pool (replace GCD)**: 8% SLOWER on macOS. Apple's GCD is
@@ -698,6 +737,183 @@ No, ragazzi, avete [emph]sbagliato[/emph]. C'era una volta un [emph]pezzo di leg
 Non era un legno di lusso, ma un semplice pezzo da catasta...
 [/instruct]
 ```
+
+---
+
+## Phase 20: Ideas from `faster-qwen3-tts` (Andres Marafioti) + CPU/build safety
+
+Analysis of [faster-qwen3-tts](https://github.com/andimarafioti/faster-qwen3-tts) (talk:
+"Reachy Mini", AI Engineer). His 3 tricks and what is/isn't transferable to our pure-C
+CPU engine.
+
+### 20.0 Key insight — why his 5.8× does NOT transfer
+
+His own slide says it: **"Compute-bound? No. Launch-overhead-bound."** On GPU the talker
+(28 layers) + code predictor (5 layers × 15 tokens) issue **~500 tiny CUDA kernel
+launches per decode step**, and the GPU idles between each one waiting for Python to
+dispatch the next. His entire 5.8× comes from **removing that overhead** via CUDA graph
+capture.
+
+A pure-C engine **does not pay that tax**: no Python dispatch, no kernel-launch overhead,
+direct inline calls. So:
+- Trick #1 (static KV cache): **we already do this** — KV is pre-allocated
+  `[num_layers × kv_max × kv_dim]`, scratch buffers (`codes`, `audio_buf`, `emb_cache`,
+  `emb_tmp*`) allocated once, not per-frame.
+- Trick #2 (CUDA graph capture): **N/A** — cures a problem (Python/launch overhead) we
+  don't have. Our RTF 1.3–1.7 already reflects being compute-bound.
+- Trick #3 (streaming): **the one genuinely transferable idea** — it's perceived-latency
+  UX, not throughput.
+
+> Bottom line: most of his speedup is overhead removal we already get for free. Our real
+> lever (proven by the CP micro-bench in 20.3) is **CP weight quantization on BOTH models** —
+> the CP is 91% matvec/bandwidth-bound, even on 0.6B (the old "0.6B not bandwidth-bound" was
+> the Talker, not the CP). NOT graph capture, NOT the per-op micro-opts of 18.1 (<3% of CP),
+> NOT sampling (0.35 ms/f). Streaming remains the separate latency (TTFA) lever.
+
+### 20.1 Streaming chunked decode — refine existing infra `[MED]`
+
+We already have streaming scaffolding (`qwen_sd_stream_state_t`, `qwen_sd_stream_free`,
+`decoder_thread_t`, `--stream`). Adopt/verify his concrete params:
+- [ ] **25-frame left-context sliding window** to avoid chunk-boundary artifacts.
+- [ ] `chunk_size=8 → ~667 ms audio/chunk` ratio as reference.
+- [ ] Measure **real TTFA on CPU** with vs without streaming (M1, 4 threads). On CPU,
+  TTFA is higher than GPU so streaming matters *more*: turns "wait for whole utterance"
+  into "hear audio after first chunk". No compute saved, big perceived-latency win.
+
+### 20.2 Short prefill (x-vector-only voice cloning) — DOES NOT apply to our HQ formats `[LOW / mostly N/A]`
+
+His x-vector mode: **10-token prefill vs ~80+ in full ICL clone**. Re-checked against our
+actual voice formats (June 2026) — **the idea does not transfer to our flagship format**:
+- Our shipping HQ format is **WDELTA `.qvoice` (int16+LZ4, bit-identical)**: voice identity
+  comes from **weight deltas applied at load time**, NOT from a voice prefill. The prompt is
+  plain text → **TTFA equals a preset voice**. The cost is **LZ4 delta decompression at load
+  (~1s, +7%)**, a completely different bottleneck than prefill length.
+- `.qvkv` (KV prefix, the format the original note referenced) is **ABANDONED** — superseded
+  by WDELTA (see Phase 13).
+- Short prefill (x-vector-only) only applies to the **Base-ICL path**, where it's exactly
+  the quality↔speed trade-off we **already characterized**: x-vector-only = our `.bin`
+  (~60-70% fidelity), a quality downgrade. ICL (ref_codes+ref_text) is the HQ path.
+- [ ] (optional, low value) Only revisit if a latency-over-fidelity Base-ICL mode is ever
+  wanted; otherwise nothing to do — TTFA on HQ voices is already preset-level.
+
+> Correction: prefill length is **not** a lever for our HQ voices. The real latency lever
+> is streaming (20.1), and for WDELTA specifically, faster delta decompression at load.
+
+### 20.3 Our real CPU levers — grounded in OUR measured data (NOT generic) `[HIGH value]`
+
+Corrected June 2026 after re-reading our quantization tests (`docs/quantization.md`,
+Phase 18). The earlier "quantization is candidate #1" framing was **wrong for the 0.6B**.
+The honest, per-model picture:
+
+**Quantization reality (measured, do not re-litigate):**
+- INT8: **~14-15% speedup on 1.7B ONLY**. **0% on 0.6B** (hidden=1024 too small).
+- INT4 Q4_0: **4% SLOWER even on 1.7B** (nibble unpack > bandwidth saving). Opt-in only.
+- INT8 on 0.6B CP: **hangs** (numerical issues at hidden=1024) → auto-skipped < hidden 2048.
+- Root cause: **0.6B runs at only ~42% memory-bandwidth utilization → NOT bandwidth-bound.**
+  Nothing to free by quantizing. Only the 1.7B is bandwidth-bound.
+
+**CP micro-bench (June 2026, `make cp-microbench`, 0.6B, Italian, seed 42, 114 frames):**
+The instrumented TOTAL (78.49 ms/f) matches the externally-measured CP total — gap-free.
+
+| CP sub-op | ms/f | % of CP |
+|---|---|---|
+| FFN gate_up (matvec) | 26.86 | **34.2%** |
+| QKV proj (matvec) | 19.25 | 24.5% |
+| FFN down (matvec) | 14.67 | 18.7% |
+| O proj (matvec) | 10.46 | 13.3% |
+| lm_head argmax (matvec) | 3.37 | 4.3% |
+| Embed+project | 2.55 | 3.2% |
+| Attention (compute) | 0.54 | 0.7% |
+| SwiGLU | 0.38 | 0.5% |
+| Resid+Norm + Q/K norm + RoPE + KV store + input norm | ~0.41 | ~0.5% |
+
+**→ matvec/GEMV = 90.7% of CP. FFN alone (gate_up+down) = 53%. All "overhead" ops
+(attention, RoPE, norm, KV store, dispatch) = <3% combined.**
+
+**This REFUTES the Phase 18.1 "CP is overhead-bound" hypothesis.** The CP is
+**matvec/bandwidth-bound**, even on 0.6B. Mechanism: CP weights (~120 MB) don't fit in
+cache (M1 L2 ~12 MB); the 15 codebooks are sequentially dependent (can't batch — why
+speculative CP was abandoned), so the CP runs **16 serial steps/frame, each re-reading all
+5 layers' weights from DRAM** → ~24 GB/s of 68 GB/s peak = the PLAN's "42% bandwidth". The
+old "INT8 0.6B = 0%" was measured on the **Talker** (not bandwidth-bound) — the CP differs.
+`matvec_bf16` is a hand-rolled NEON kernel (`bf16_matvec_fused`), NOT BLAS.
+
+Corrected levers:
+- [ ] **Both models — CP weight quantization is THE lever** (Phase 18.2). Micro-bench proves
+  91% of CP is weight reads → cutting bytes/weight attacks it directly. Blocker on 0.6B:
+  INT8-CP hangs (numerical at hidden=1024) → retry with **per-channel scales**. INT4 (which
+  LOST on the bandwidth-unbound Talker) may finally WIN on the bandwidth-bound CP — measure,
+  don't assume. 1.7B INT8 CP (hidden=2048) is the safe near-term win (~15-25%).
+- [ ] **Secondary — bf16 GEMV bandwidth saturation**: CP matvec sits at ~42% of peak DRAM
+  bandwidth → investigate dispatch granularity (small matrices called 80×/frame) + prefetch
+  to push higher. Lower ceiling than quantization but stacks with it.
+- [ ] **DO NOT pursue** the 18.1 micro-opts (inline tiny-attention, RoPE precompute, flatten
+  loop, fuse norms): measured to target <3% of CP. Fused residual+RMSNorm already landed.
+- [ ] **Both**: `make cp-microbench` gives the per-op CP breakdown to A/B each change.
+- [x] Sampling: **CONFIRMED negligible** — measured June 2026 on M1, 0.6B, Italian:
+  Codec head+sampling = 40 ms over 114 frames = **0.35 ms/f**. The old "sampling is
+  bottleneck" note is stale (predates quickselect). Do NOT optimize sampling.
+
+**Measured baseline (June 2026, M1, 0.6B, Italian, seed 42, ryan, 114 frames / 9.1s):**
+
+| Component | ms/f | Share of loop |
+|---|---|---|
+| Code Predictor | 86.6 | **74%** |
+| Talker step | 30.6 | 26% |
+| Embed | ~0.15 | ~0% |
+| Codec head + sampling | 0.35 | ~0% |
+| **Critical-path loop** | **~117.7** | RTF loop ≈ 1.47 |
+
+Prefill 1650 ms (51 tokens, one-time → all TTFA). Speech decoder overlapped (only 877 ms
+drain additive). Whole run: 9.1s audio in 16.0s → **RTF 1.76**. Confirms: CP is the
+bottleneck (even higher than the old 67% estimate); sampling/decoder are not.
+
+> Net: 0.6B → CP overhead (18.1). 1.7B → INT8 CP (18.2). Quantization is a 1.7B-only lever.
+> Sampling and decoder are confirmed non-bottlenecks. Prefill (1.65s) is pure TTFA →
+> streaming (20.1) is the latency lever.
+
+### 20.4 Makefile / binary CPU-safety — latent bug we may have missed `[HIGH]`
+
+`CFLAGS_BASE` uses **`-march=native`**. A release binary built on an AVX512/AVX2 machine
+will **SIGILL** on a CPU lacking those instructions. This bites the planned release
+binaries (Phase 9 CI/CD).
+- [ ] Add **runtime CPU feature detection (cpuid) + kernel dispatch** instead of relying
+  on compile-time `-march=native`. Today kernels are compile-time `#ifdef` inline in
+  `qwen_tts_kernels.c`; `*_avx.c`/`*_neon.c` are still empty/reserved.
+- [ ] For release builds: baseline `-mavx2 -mfma` (or runtime multiversioning) so binaries
+  run on any x86-64-v3 CPU; keep `-march=native` only for local/dev builds.
+- [ ] This runtime-dispatch work is the **prerequisite** for any future AVX512 path.
+
+### 20.5 AVX512 — feasibility & how to verify without hardware `[LOW / deferred]`
+
+User question: a user asked about AVX512 support; dev hardware is **Apple M1 (ARM)**.
+- **Blocker**: AVX512 is x86-only — can't run natively on M1.
+- **Intel SDE** (correct ISA-verification tool, `-chip-check` flags illegal instructions
+  on a target chip) runs **only on x86 hosts** → unusable on the M1 locally.
+- **QEMU user-mode on M1**: lists AVX512 features but AVX on aarch64 hosts is **known
+  buggy/unreliable** (falsely reports AVX available) → not trustworthy for verification.
+- **Realistic path**: x86 cloud box (spot Ice Lake / Sapphire Rapids) or **GitHub Actions
+  x86 runner** + **Intel SDE** for ISA correctness. Belongs in CI (Phase 9), NOT local.
+- **Is it worth implementing blind?** ROI is low:
+  1. Heavy GEMMs already go through **BLAS (Accelerate/OpenBLAS)**, which **already
+     dispatches to AVX512 at runtime** if the CPU supports it — big compute already covered
+     with zero code.
+  2. Our hand kernels (RoPE, rms_norm, snake, bf16 dequant, attention) are memory-bound;
+     AVX512 vs AVX2 gives modest gains, and AVX512 can **downclock** on older Intel.
+  3. Can verify *correctness* (SDE/CI) but **cannot tune performance without real HW**.
+- [ ] Decision: **defer AVX512 hand-kernels.** First do 20.4 (runtime dispatch) + ensure
+  x86 links an AVX512-capable BLAS. Only add `#ifdef __AVX512F__` paths (with fallback,
+  SDE-verified in CI, marked "unverified perf") if profiling on real HW shows the auxiliary
+  kernels are hot.
+
+### 20.6 Prerequisite — re-download models `[BLOCKER]`
+
+Local model dirs were **removed** and must be re-downloaded before any of the above can be
+tested/benchmarked:
+- [ ] `./download_model.sh --model small`  → `qwen3-tts-0.6b/`
+- [ ] `./download_model.sh --model large`  → `qwen3-tts-1.7b/` (for 1.7B / INT8 work)
+- [ ] base variants if voice-clone prefill work (20.2) is tackled:
+  `--model base-small` / `--model base-large`
 
 ---
 
