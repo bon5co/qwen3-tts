@@ -117,6 +117,11 @@ Two structural facts drive the map:
   create). 1.7B preset already validates the Talker int8+SDOT critical path.
 
 > **Next session (2026-06-02) — validation & release gate.** Before merging `feat/int8-sdot`:
+> 0. **FIRST — deep re-analysis of all docs/md/code to re-verify the real x86 state.** The
+>    "x86 matvec is all scalar / AVX file empty" claim came from one Explore pass + a grep; the
+>    user expected x86 support to exist and was surprised. Re-confirm THOROUGHLY whether any
+>    x86/AVX2 matvec code exists before planning the VNNI work (this repo has a history of
+>    assumptions believed-then-wrong — verify, don't trust the first pass).
 > 1. Download `qwen3-tts-1.7b-base`, create `silvio_17b.qvoice`, test custom voice on the 1.7B.
 > 2. Massive total regression: `make test-small`/`test-large`, server (bf16 + int8 + `.qvoice`),
 >    voice-clone e2e, both models, SDOT on AND off (`QWEN_NO_SDOT`).
