@@ -172,6 +172,35 @@ static int kv_cache_grow(qwen_tts_ctx_t *ctx, int required) {
  * Weight Loading
  * ======================================================================== */
 
+/* Alloc int8 buffers if absent, then (re)quantize from the current bf16 pointer.
+ * Reusing existing buffers makes this safe to call a second time (e.g. after a
+ * WDELTA voice override swaps the bf16 weights from CV to Base). */
+static void tk_qz(int8_t **dst, float **scale, const uint16_t *src, int rows, int cols) {
+    if (!*dst)   *dst   = (int8_t *)aligned_malloc((size_t)rows * cols);
+    if (!*scale) *scale = (float *)aligned_malloc((size_t)rows * sizeof(float));
+    if (*dst && *scale) qwen_quantize_bf16_to_int8(src, rows, cols, *dst, *scale);
+}
+
+/* (Re)quantize Talker weights to INT8 from the current bf16 pointers. Gated to
+ * 1.7B (hidden>=2048); the 0.6B Talker is too small to benefit. */
+void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *c = &ctx->config;
+    if (!ctx->use_int8 || c->hidden_size < 2048) return;
+    int h = c->hidden_size;
+    int q_dim = c->num_heads * c->head_dim;
+    int kv_dim = c->num_kv_heads * c->head_dim;
+    int inter = c->intermediate_size;
+    for (int i = 0; i < c->num_layers; i++) {
+        qwen_talker_layer_t *l = &ctx->layers[i];
+        tk_qz(&l->wq_int8, &l->wq_scale, l->wq_bf16, q_dim, h);
+        tk_qz(&l->wk_int8, &l->wk_scale, l->wk_bf16, kv_dim, h);
+        tk_qz(&l->wv_int8, &l->wv_scale, l->wv_bf16, kv_dim, h);
+        tk_qz(&l->wo_int8, &l->wo_scale, l->wo_bf16, h, q_dim);
+        tk_qz(&l->gate_up_fused_int8, &l->gate_up_fused_scale, l->gate_up_fused_bf16, 2 * inter, h);
+        tk_qz(&l->down_int8, &l->down_scale, l->down_bf16, h, inter);
+    }
+}
+
 int qwen_talker_load(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c = &ctx->config;
     int h = c->hidden_size;
@@ -247,46 +276,14 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
         #undef LOAD_F32
     }
 
-    /* INT8 quantization of Talker weights (optional, enabled by --int8 flag).
-     * Skip on 0.6B (hidden=1024): matrices too small to benefit from INT8
-     * bandwidth reduction, and the extra memory causes mmap pressure on 16GB. */
-    if (ctx->use_int8 && c->hidden_size >= 2048) {
-        if (!ctx->silent)
-            fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
-        int inter = c->intermediate_size;
-        for (int i = 0; i < c->num_layers; i++) {
-            qwen_talker_layer_t *l = &ctx->layers[i];
-
-            /* QKV + O projections */
-            l->wq_int8 = (int8_t *)aligned_malloc((size_t)q_dim * h);
-            l->wq_scale = (float *)aligned_malloc(q_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wq_bf16, q_dim, h, l->wq_int8, l->wq_scale);
-
-            l->wk_int8 = (int8_t *)aligned_malloc((size_t)kv_dim * h);
-            l->wk_scale = (float *)aligned_malloc(kv_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wk_bf16, kv_dim, h, l->wk_int8, l->wk_scale);
-
-            l->wv_int8 = (int8_t *)aligned_malloc((size_t)kv_dim * h);
-            l->wv_scale = (float *)aligned_malloc(kv_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wv_bf16, kv_dim, h, l->wv_int8, l->wv_scale);
-
-            l->wo_int8 = (int8_t *)aligned_malloc((size_t)h * q_dim);
-            l->wo_scale = (float *)aligned_malloc(h * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wo_bf16, h, q_dim, l->wo_int8, l->wo_scale);
-
-            /* Fused gate+up + down */
-            l->gate_up_fused_int8 = (int8_t *)aligned_malloc((size_t)2 * inter * h);
-            l->gate_up_fused_scale = (float *)aligned_malloc(2 * inter * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->gate_up_fused_bf16, 2 * inter, h,
-                                        l->gate_up_fused_int8, l->gate_up_fused_scale);
-
-            l->down_int8 = (int8_t *)aligned_malloc((size_t)h * inter);
-            l->down_scale = (float *)aligned_malloc(h * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->down_bf16, h, inter, l->down_int8, l->down_scale);
-        }
-        if (!ctx->silent)
-            fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
-    }
+    /* INT8 quantization of Talker weights (--int8; 1.7B only, hidden>=2048).
+     * Extracted into qwen_talker_quantize_int8() so it can be re-run after a
+     * WDELTA voice override (re-quantize the Base weights, not stale CV ones). */
+    if (ctx->use_int8 && c->hidden_size >= 2048 && !ctx->silent)
+        fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
+    qwen_talker_quantize_int8(ctx);
+    if (ctx->use_int8 && c->hidden_size >= 2048 && !ctx->silent)
+        fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
 
     /* Q4_0 quantization of Talker weights (optional, enabled by --int4 flag) */
     if (ctx->use_int4) {

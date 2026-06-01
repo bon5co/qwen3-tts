@@ -155,6 +155,39 @@ static void apply_rope_neox(float *x, int n_heads, int head_dim,
  * Weight Loading
  * ======================================================================== */
 
+/* Alloc int8 buffers if absent, then (re)quantize from the current bf16 pointer.
+ * Reusing buffers makes this safe to call again after a WDELTA voice override. */
+static void cp_qz(int8_t **dst, float **scale, const uint16_t *src, int rows, int cols) {
+    if (!*dst)   *dst   = (int8_t *)aligned_malloc((size_t)rows * cols);
+    if (!*scale) *scale = (float *)aligned_malloc((size_t)rows * sizeof(float));
+    if (*dst && *scale) qwen_quantize_bf16_to_int8(src, rows, cols, *dst, *scale);
+}
+
+/* (Re)quantize Code Predictor weights (+ lm_heads) to INT8 from current bf16.
+ * CP is hidden=1024 on both models; the denormal hang is fixed (FTZ + fused
+ * qkv), so this is enabled for both. */
+void qwen_cp_quantize_int8(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *c = &ctx->config;
+    if (!ctx->use_int8) return;
+    int cp_h = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
+    int cp_inter = c->cp_intermediate_size;
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        cp_qz(&l->wq_int8, &l->wq_scale, l->wq_bf16, cp_q_dim, cp_h);
+        cp_qz(&l->wk_int8, &l->wk_scale, l->wk_bf16, cp_kv_dim, cp_h);
+        cp_qz(&l->wv_int8, &l->wv_scale, l->wv_bf16, cp_kv_dim, cp_h);
+        cp_qz(&l->wo_int8, &l->wo_scale, l->wo_bf16, cp_h, cp_q_dim);
+        cp_qz(&l->gate_up_fused_int8, &l->gate_up_fused_scale, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        cp_qz(&l->down_int8, &l->down_scale, l->down_bf16, cp_h, cp_inter);
+    }
+    for (int g = 0; g < 15; g++)
+        if (ctx->cp_lm_head_bf16[g])
+            cp_qz(&ctx->cp_lm_head_int8[g], &ctx->cp_lm_head_scale[g],
+                  ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h);
+}
+
 int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
@@ -277,47 +310,7 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
     if (ctx->use_int8) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing CP weights to INT8 (per-row absmax)...\n");
-        int cp_inter = c->cp_intermediate_size;
-        for (int i = 0; i < c->cp_num_layers; i++) {
-            qwen_cp_layer_t *l = &ctx->cp_layers[i];
-
-            /* QKV + O projections */
-            l->wq_int8 = (int8_t *)aligned_malloc((size_t)cp_q_dim * cp_h);
-            l->wq_scale = (float *)aligned_malloc(cp_q_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wq_bf16, cp_q_dim, cp_h, l->wq_int8, l->wq_scale);
-
-            l->wk_int8 = (int8_t *)aligned_malloc((size_t)cp_kv_dim * cp_h);
-            l->wk_scale = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wk_bf16, cp_kv_dim, cp_h, l->wk_int8, l->wk_scale);
-
-            l->wv_int8 = (int8_t *)aligned_malloc((size_t)cp_kv_dim * cp_h);
-            l->wv_scale = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wv_bf16, cp_kv_dim, cp_h, l->wv_int8, l->wv_scale);
-
-            l->wo_int8 = (int8_t *)aligned_malloc((size_t)cp_h * cp_q_dim);
-            l->wo_scale = (float *)aligned_malloc(cp_h * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->wo_bf16, cp_h, cp_q_dim, l->wo_int8, l->wo_scale);
-
-            /* Fused gate+up + down */
-            l->gate_up_fused_int8 = (int8_t *)aligned_malloc((size_t)2 * cp_inter * cp_h);
-            l->gate_up_fused_scale = (float *)aligned_malloc(2 * cp_inter * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->gate_up_fused_bf16, 2 * cp_inter, cp_h,
-                                        l->gate_up_fused_int8, l->gate_up_fused_scale);
-
-            l->down_int8 = (int8_t *)aligned_malloc((size_t)cp_h * cp_inter);
-            l->down_scale = (float *)aligned_malloc(cp_h * sizeof(float));
-            qwen_quantize_bf16_to_int8(l->down_bf16, cp_h, cp_inter, l->down_int8, l->down_scale);
-        }
-
-        /* LM heads */
-        for (int g = 0; g < 15; g++) {
-            if (ctx->cp_lm_head_bf16[g]) {
-                ctx->cp_lm_head_int8[g] = (int8_t *)aligned_malloc((size_t)c->codebook_size * cp_h);
-                ctx->cp_lm_head_scale[g] = (float *)aligned_malloc(c->codebook_size * sizeof(float));
-                qwen_quantize_bf16_to_int8(ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h,
-                                            ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g]);
-            }
-        }
+        qwen_cp_quantize_int8(ctx);  /* extracted — re-runnable after WDELTA override */
         if (!ctx->silent)
             fprintf(stderr, "  INT8 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
     }

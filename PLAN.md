@@ -217,6 +217,14 @@ At 42% bandwidth utilization, the gap is overhead, not raw throughput.
 > `--int8` previously did NOTHING there (and CP int8 hung); now RTF 1.70→1.29. The CP is ~90%
 > matvec and identical (hidden=1024) on both models, so quantizing it pays off on both.
 > Recommend `--int8` as a default-worthy speed option on 0.6B now (verify perceptual quality).
+>
+> ✅ **`--int8` + WDELTA `.qvoice` fixed (June 2026).** Bug: a WDELTA voice overrides the bf16
+> weights (CV→Base) in `--load-voice`, which runs AFTER the load-time int8 quantization — so
+> int8 used the stale CV weights and ignored the override → degraded voice (~half volume,
+> rms 0.010 vs 0.046, 79% silence). Fix: extracted the quant into `qwen_talker_quantize_int8`/
+> `qwen_cp_quantize_int8` (alloc-if-absent so re-runnable) and re-quantize after the WDELTA
+> override in main.c. Validated (Silvio, 0.6B): int8 volume restored (rms 0.040, max 0.319 ≈
+> bf16's 0.046/0.378), voice intact, RTF 1.20.
 > Known minor: `make cp-microbench` leaves -DCP_MICROBENCH .o files that break a subsequent
 > plain `make blas` (undefined `qwen_cp_microbench_report`) → run `make clean` first.
 

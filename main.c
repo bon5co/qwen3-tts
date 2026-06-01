@@ -1112,6 +1112,20 @@ int main(int argc, char **argv) {
                             embed_one_text_token_compute(ctx, 151673, ctx->cached_tts_eos_embed);
                         }
 
+                        /* WDELTA override swapped the bf16 weights (CV -> Base).
+                         * In INT8 mode the int8 weights were quantized at load
+                         * from the CV weights, so re-quantize from the new Base
+                         * bf16 — otherwise int8 ignores the override (voice loses
+                         * fidelity / ~half volume). */
+                        if (loaded > 0 && ctx->use_int8) {
+                            extern void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx);
+                            extern void qwen_cp_quantize_int8(qwen_tts_ctx_t *ctx);
+                            if (!silent)
+                                fprintf(stderr, "  Re-quantizing INT8 from WDELTA-overridden weights...\n");
+                            qwen_talker_quantize_int8(ctx);
+                            qwen_cp_quantize_int8(ctx);
+                        }
+
                         if (!silent && loaded > 0)
                             fprintf(stderr, "  Loaded %d/%u source talker tensors (%.1f MB) — full weight override\n",
                                     loaded, n_tensors, wfull_bytes / 1024.0f / 1024.0f);
