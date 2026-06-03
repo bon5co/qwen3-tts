@@ -402,7 +402,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
-                fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model)\n");
+                fprintf(stderr, "  --ref-audio <path>         Reference audio for voice cloning (Base model; must be 24 kHz mono WAV: ffmpeg -i in -ar 24000 -ac 1 out.wav)\n");
                 fprintf(stderr, "  --xvector-only             Use speaker embedding only (no ref text/codes)\n");
                 fprintf(stderr, "  --save-voice <path>        Save voice (.qvoice = full profile, .bin = embedding only)\n");
                 fprintf(stderr, "                             Without --text: create voice profile and exit\n");

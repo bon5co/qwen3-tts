@@ -891,10 +891,14 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         }
     }
 
-    /* TODO: resample to 24kHz if needed. For now, require 24kHz input. */
+    /* By design (decided 2026-06-03; documented in docs/voice-cloning.md + --help):
+     * reference audio MUST be 24 kHz. We deliberately do NOT bundle a resampler —
+     * ffmpeg does it better and keeps this engine dependency-free. The speaker-encoder
+     * mel features are computed at 24 kHz (n_fft=1024, hop=256, 128 mels), so a wrong
+     * rate would silently corrupt the embedding; we reject it loudly instead. */
     if (sample_rate != 24000) {
         fprintf(stderr, "Error: reference audio must be 24 kHz (got %d Hz)\n", sample_rate);
-        fprintf(stderr, "Convert with: ffmpeg -i input.wav -ar 24000 output.wav\n");
+        fprintf(stderr, "Convert with: ffmpeg -i input.wav -ar 24000 -ac 1 output.wav\n");
         free(audio);
         return -1;
     }

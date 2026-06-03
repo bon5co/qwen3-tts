@@ -285,9 +285,14 @@ static bool load_vocab(qwen_tokenizer_t *tok, const char *path) {
     fseek(f, 0, SEEK_SET);
     char *json = (char *)malloc(fsize + 1);
     if (!json) { fclose(f); return false; }
-    fread(json, 1, fsize, f);
-    json[fsize] = '\0';
+    size_t rd = fread(json, 1, fsize, f);
     fclose(f);
+    if (rd != (size_t)fsize) {
+        fprintf(stderr, "tokenizer: short read on %s (%zu/%ld bytes)\n", path, rd, fsize);
+        free(json);
+        return false;
+    }
+    json[fsize] = '\0';
 
     /* Estimate vocab size: count colons (rough) */
     int est_size = 0;
@@ -374,9 +379,14 @@ static bool load_merges(qwen_tokenizer_t *tok, const char *path) {
     fseek(f, 0, SEEK_SET);
     char *data = (char *)malloc(fsize + 1);
     if (!data) { fclose(f); return false; }
-    fread(data, 1, fsize, f);
-    data[fsize] = '\0';
+    size_t rd = fread(data, 1, fsize, f);
     fclose(f);
+    if (rd != (size_t)fsize) {
+        fprintf(stderr, "tokenizer: short read on %s (%zu/%ld bytes)\n", path, rd, fsize);
+        free(data);
+        return false;
+    }
+    data[fsize] = '\0';
 
     /* Count lines */
     int n_lines = 0;
