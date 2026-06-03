@@ -334,10 +334,18 @@ PASSED. Closed the worst gaps:
 - [x] **`test-serve-repro`** — 3 identical requests bit-identical (catches cross-request state leaks).
 - [x] **`test-voice-design`** now SKIPs cleanly (was failing on absent model — double bug: dir-only
   check + per-line `exit 0` that didn't stop the recipe).
-- [ ] `[MED]` **Remaining coverage gaps:** `.qvoice`/custom-voice load (local-only, voices/ gitignored
-  → skip-if-absent test), SDOT on/off A/B not in suite, int4 not in golden, error paths (missing
-  model/bad args/truncated file — the fread fix has no test), CLI determinism not formalized, **no
-  x86/Linux inference in CI** (build-only — fix once the Ryzen box flow is set up).
+- [x] **`--caps` + `test-caps`** — the binary reports its ACTUAL compiled SIMD/threading (NEON/AVX2/
+  scalar, SDOT, GCD/single, BLAS), and the test asserts arch↔caps consistency. **This is the
+  "would-have-caught-we-thought-AVX-existed" guard**: on x86 it reports `matvec+attn: SCALAR` +
+  `SINGLE-THREAD`, impossible to hide behind docs. When AVX2 lands, flip the x86 assertion.
+- [x] **`test-errors`** — bad invocations (no --text/--serve, nonexistent model, missing .qvoice)
+  must fail cleanly (non-zero + clear message). Fast, no model.
+- [x] **Variance characterized** — quiet machine + fixed seed → mel_corr 1.00000 across det/-j1-temp0
+  AND default-4thread-temp0.5 (18 runs). So Qwen3-TTS is NOT audibly non-deterministic with a fixed
+  seed on a quiet box ("poco" = ≤±1 LSB). Golden threshold set to 0.98 (margin), cross-ISA 0.95.
+- [ ] `[LOW]` **Remaining smaller gaps:** SDOT on/off A/B not in suite, `.qvoice` load (local-only,
+  voices/ gitignored → skip-if-absent), int4 not in golden, truncated-file fread path (no test), **no
+  x86/Linux inference in CI** (build-only — add once the Ryzen/WSL2 flow is set up).
 - [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
   currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
 - [ ] `[MED, investigate]` **`-j1 --temperature 0` trajectory changed under heavy load** (seen once
