@@ -348,26 +348,22 @@ PASSED. Closed the worst gaps:
   x86/Linux inference in CI** (build-only — add once the Ryzen/WSL2 flow is set up).
 - [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
   currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
-- [ ] `[HIGH, investigate — REAL intermittent non-determinism, likely uninit/OOB memory]`
-  **`-j1 --temperature 0` is INTERMITTENTLY non-deterministic** (2026-06-03, after much false-starting).
-  Pattern: sometimes a burst is byte-identical (10×/5× == golden), sometimes EVERY run differs (4/4
-  distinct md5, different durations/trajectories). **DECISIVELY ruled out:**
-  - **NOT the decoder overlap thread / NOT concurrency** — `QWEN_NO_OVERLAP=1` (synchronous decode, no
-    pthread; knob added `qwen_tts.c`) is ALSO 4/4 distinct. So it's single-threaded non-determinism.
-  - **NOT load** — earlier "load-dependent" claim was WRONG (my own runaway busy-loops + leftover
-    procs were saturating the 4-core box and contaminating measurements; under *controlled* induced
-    load 10× was identical). Retracted.
-  - **NOT** on-disk cache (separate procs), EOS-boost (frame-based), sampling RNG (temp 0 = pure greedy
-    argmax, `qwen_tts_sampling.c:155`), matvec (single-thread deterministic).
-  - MallocPreScribble/Scribble did NOT make it consistent (argues against simple fresh-malloc uninit;
-    could be a STACK uninit or a realloc'd/reused buffer read-before-write).
-  **Conclusion:** non-determinism is in the CORE gen path (talker/CP/codec_head/decoder) with NO
-  concurrency → almost certainly an **uninitialized-memory or out-of-bounds read** that depends on heap
-  garbage. The earlier memory note "NOT uninitialized memory (MallocScribble unchanged)" is likely
-  INCOMPLETE. **Next:** ASan build (`make debug`) to catch OOB; if clean, MSan/valgrind for uninit
-  (hard on M1) or a manual buffer-init audit of the gen path. **BLOCKS reliable golden/e2e + clean
-  bench.** Could NOT trust streaming-vs-normal / SDOT-on-off comparisons (same non-determinism). The
-  user's "buffer/state not cleaned" instinct points the right way.
+- [x] **RESOLVED — there is NO engine non-determinism bug (2026-06-03).** On a clean, confirmed
+  `-O3` binary (0 ASan symbols) on a non-saturated machine, `-j1 --temperature 0` is FULLY
+  deterministic: 5/5 runs byte-identical TOKENS (82505ec4) AND audio (327ec448 = golden). The entire
+  "non-determinism" hunt was a MEASUREMENT ARTIFACT of my own making: (1) **binary mixing** — after
+  `make debug` the binary was ASan **-O0** (different FP rounding/order than `-O3 -ffast-math` → a
+  legitimately different trajectory), and `make blas` did NOT rebuild it (timestamps), so I compared
+  -O0 vs -O3 outputs and called the difference "drift"; (2) **my own runaway busy-loops + leftover
+  processes** saturating the 4-core box during other measurements. Lesson (again): verify the binary
+  + a quiet machine before trusting an A/B; `make debug` then `make blas` needs a `make clean` between
+  (timestamp trap). The QWEN_NO_OVERLAP knob (added during the hunt) is harmless + kept as a
+  decode-overlap diagnostic. **NOTE for product:** at DEFAULT (multi-thread, temp>0) output is
+  legitimately "similar not identical" (FP reduction-order across threads + sampling) — that's why the
+  golden test uses mel-corr, and that benign variation is expected, not a bug.
+- ~~`-j1 --temperature 0` intermittently non-deterministic / likely UB~~ — **WRONG, fully retracted**
+  (see the RESOLVED entry above). It was binary-mixing (ASan-O0 vs -O3) + my runaway processes, not an
+  engine bug. Kept here only as a record of the false trail so it isn't re-opened.
 
 ---
 
