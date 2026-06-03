@@ -3,6 +3,7 @@
  */
 
 #include "qwen_tts_kernels.h"
+#include "qwen_tts_thread.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,7 +32,7 @@
  * FTZ is per-thread on ARM (FPCR), so it must be set on every compute thread —
  * including each GCD worker — not just the main thread. Cheap (~1-2 cycles),
  * called once per matvec, negligible. Inaudible quality impact. */
-static inline void qwen_ftz_on(void) {
+void qwen_ftz_on(void) {
 #if defined(__aarch64__)
     uint64_t fpcr;
     __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
@@ -47,7 +48,11 @@ static inline void qwen_ftz_on(void) {
 
 /* Threading */
 static int g_n_threads = 1;
-void qwen_set_threads(int n) { g_n_threads = n > 0 ? n : 1; qwen_ftz_on(); }
+void qwen_set_threads(int n) {
+    g_n_threads = n > 0 ? n : 1;
+    qwen_ftz_on();
+    qwen_threadpool_start(g_n_threads);  /* (re)size the off-Mac worker pool */
+}
 int qwen_get_threads(void) { return g_n_threads; }
 
 int qwen_get_num_cpus(void) {
@@ -67,6 +72,7 @@ void qwen_init_threads(void) {
      * More threads add GCD dispatch overhead without bandwidth gain. */
     g_n_threads = ncpus < 4 ? ncpus : 4;
     qwen_ftz_on();  /* main thread: flush denormals (int8 activations) */
+    qwen_threadpool_start(g_n_threads);  /* spawn the off-Mac persistent pool */
 }
 
 /* Report ACTUAL compiled capabilities (mirrors the kernels' own #ifdef guards).
@@ -109,10 +115,12 @@ void qwen_caps_report(void *out) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
     fprintf(f, "  arm i8mm:         smmla AVAILABLE but UNUSED (PLAN 21.3b)\n");
 #endif
-#if defined(__APPLE__) && defined(__BLOCKS__)
+#if defined(__APPLE__) && defined(__BLOCKS__) && !defined(QWEN_FORCE_PTHREAD)
     fprintf(f, "  matvec threads:   GCD dispatch_apply (%d threads)\n", qwen_get_threads());
+#elif defined(_WIN32) && !defined(QWEN_USE_PTHREADS)
+    fprintf(f, "  matvec threads:   Win32 pool (%d threads)\n", qwen_get_threads());
 #else
-    fprintf(f, "  matvec threads:   SINGLE-THREAD  <-- no GCD/pool off macOS (PLAN 21.2)\n");
+    fprintf(f, "  matvec threads:   pthread pool (%d threads)\n", qwen_get_threads());
 #endif
 #if defined(USE_BLAS) && defined(__APPLE__)
     fprintf(f, "  BLAS (prefill):   Accelerate\n");
@@ -122,10 +130,6 @@ void qwen_caps_report(void *out) {
     fprintf(f, "  BLAS (prefill):   none\n");
 #endif
 }
-
-#if defined(__APPLE__)
-#include <dispatch/dispatch.h>
-#endif
 
 #ifdef __ARM_NEON
 #include <arm_neon.h>
@@ -471,64 +475,72 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
 }
 
 /* bf16 matvec: y[rows] = W[rows,cols] @ x[cols]
- * Multi-threaded via dispatch_apply on macOS. */
+ * Multi-threaded via qwen_parallel (GCD on macOS, pthread pool elsewhere). */
+typedef struct {
+    float *y; const uint16_t *W; const float *x; int rows, cols;
+} bf16_mv_ctx;
+static void bf16_mv_task(size_t tid, size_t nt, void *vc) {
+    bf16_mv_ctx *c = (bf16_mv_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    bf16_matvec_fused(c->y + r0, c->x, c->W + (size_t)r0 * c->cols, c->cols, r1 - r0);
+}
 void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int cols) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            qwen_ftz_on();  /* per GCD worker: flush denormals */
-            int r0 = (int)tid * rows / nt;
-            int r1 = (int)(tid + 1) * rows / nt;
-            bf16_matvec_fused(y + r0, x, W + (size_t)r0 * cols, cols, r1 - r0);
-        });
+        bf16_mv_ctx c = { y, W, x, rows, cols };
+        qwen_parallel((size_t)nt, bf16_mv_task, &c);
         return;
     }
-#endif
     bf16_matvec_fused(y, x, W, cols, rows);
 }
 
-/* Unified QKV matvec: single dispatch for Q, K, V projections.
- * Avoids 3 separate dispatch_apply barriers per layer. */
+/* Unified QKV matvec: single parallel-for for Q, K, V projections.
+ * The concatenated [Q|K|V] row space is partitioned for balance, avoiding 3
+ * separate barriers per layer. */
+typedef struct {
+    float *q, *k, *v;
+    const uint16_t *Wq, *Wk, *Wv;
+    const float *x;
+    int in_dim, q_dim, kv_dim;
+} bf16_qkv_ctx;
+static void bf16_qkv_task(size_t tid, size_t nt, void *vc) {
+    bf16_qkv_ctx *c = (bf16_qkv_ctx *)vc;
+    int total_dim = c->q_dim + 2 * c->kv_dim;
+    int r0 = (int)(tid * (size_t)total_dim / nt);
+    int r1 = (int)((tid + 1) * (size_t)total_dim / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int chunk_end = r1 < c->q_dim ? r1 : c->q_dim;
+            bf16_matvec_fused(c->q + r, c->x, c->Wq + (size_t)r * c->in_dim,
+                               c->in_dim, chunk_end - r);
+            r = chunk_end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int chunk_end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            int local_end = chunk_end - c->q_dim;
+            bf16_matvec_fused(c->k + local, c->x, c->Wk + (size_t)local * c->in_dim,
+                               c->in_dim, local_end - local);
+            r = chunk_end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            bf16_matvec_fused(c->v + local, c->x, c->Wv + (size_t)local * c->in_dim,
+                               c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
 void qwen_matvec_bf16_qkv(float *q, float *k, float *v,
                            const uint16_t *Wq, const uint16_t *Wk, const uint16_t *Wv,
                            const float *x, int in_dim, int q_dim, int kv_dim) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
     int nt = g_n_threads;
     int total_dim = q_dim + 2 * kv_dim;
     if (nt > 1 && total_dim >= 256) {
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            int r0 = (int)tid * total_dim / nt;
-            int r1 = (int)(tid + 1) * total_dim / nt;
-            for (int r = r0; r < r1; ) {
-                if (r < q_dim) {
-                    int chunk_end = r1 < q_dim ? r1 : q_dim;
-                    bf16_matvec_fused(q + r, x, Wq + (size_t)r * in_dim,
-                                       in_dim, chunk_end - r);
-                    r = chunk_end;
-                } else if (r < q_dim + kv_dim) {
-                    int local = r - q_dim;
-                    int chunk_end = r1 < q_dim + kv_dim ? r1 : q_dim + kv_dim;
-                    int local_end = chunk_end - q_dim;
-                    bf16_matvec_fused(k + local, x, Wk + (size_t)local * in_dim,
-                                       in_dim, local_end - local);
-                    r = chunk_end;
-                } else {
-                    int local = r - q_dim - kv_dim;
-                    int local_end = r1 - q_dim - kv_dim;
-                    bf16_matvec_fused(v + local, x, Wv + (size_t)local * in_dim,
-                                       in_dim, local_end - local);
-                    r = r1;
-                }
-            }
-        });
+        bf16_qkv_ctx c = { q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim };
+        qwen_parallel((size_t)nt, bf16_qkv_task, &c);
         return;
     }
-#endif
     bf16_matvec_fused(q, x, Wq, in_dim, q_dim);
     bf16_matvec_fused(k, x, Wk, in_dim, kv_dim);
     bf16_matvec_fused(v, x, Wv, in_dim, kv_dim);
@@ -780,53 +792,58 @@ static void int8_matvec_sdot(float *y, const int8_t *qx, float sx,
 }
 #endif /* __ARM_FEATURE_DOTPROD */
 
+typedef struct {
+    float *y; const float *x; const int8_t *W; const float *scale; int rows, cols;
+} int8_mv_ctx;
+static void int8_mv_task(size_t tid, size_t nt, void *vc) {
+    int8_mv_ctx *c = (int8_mv_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matvec_fused(c->y + r0, c->x, c->W + (size_t)r0 * c->cols,
+                      c->scale + r0, c->cols, r1 - r0);
+}
+#if defined(__ARM_FEATURE_DOTPROD)
+typedef struct {
+    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale; int rows, cols;
+} int8_sdot_ctx;
+static void int8_sdot_task(size_t tid, size_t nt, void *vc) {
+    int8_sdot_ctx *c = (int8_sdot_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matvec_sdot(c->y + r0, c->qx, c->sx, c->W + (size_t)r0 * c->cols,
+                     c->scale + r0, c->cols, r1 - r0);
+}
+#endif
+
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
 #if defined(__ARM_FEATURE_DOTPROD)
     /* SDOT path: quantize the shared activation x once, then int8×int8 dot.
-     * qx is a fixed-size stack buffer (GCD blocks can't capture a VLA); it lives
-     * on this (orchestration) thread's stack and dispatch_apply is synchronous,
-     * so the workers safely read it for the call's duration. cols beyond the cap
-     * (rare; only very large matrices) falls through to the f32 path. */
+     * qx is a fixed-size stack buffer; qwen_parallel is synchronous so the pool
+     * workers safely read it for the call's duration. cols beyond the cap (rare;
+     * only very large matrices) falls through to the f32 path. */
     enum { QX_MAX = 8192 };
     static int sdot_off = -1;  /* QWEN_NO_SDOT=1 forces the legacy f32 path (A/B bench) */
     if (sdot_off < 0) { const char *e = getenv("QWEN_NO_SDOT"); sdot_off = (e && e[0] == '1'); }
     if (!sdot_off && cols <= QX_MAX) {
         int8_t qx_buf[QX_MAX];
-        int8_t *qx = qx_buf;  /* capture a pointer, not the array (blocks can't capture arrays) */
-        float sx = quantize_act_int8(qx, x, cols);
-      #if defined(__APPLE__) && defined(__BLOCKS__)
+        float sx = quantize_act_int8(qx_buf, x, cols);
         int nt = g_n_threads;
         if (nt > 1 && rows >= 256) {
-            dispatch_apply((size_t)nt,
-                           dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                           ^(size_t tid) {
-                int r0 = (int)tid * rows / nt;
-                int r1 = (int)(tid + 1) * rows / nt;
-                int8_matvec_sdot(y + r0, qx, sx, W + (size_t)r0 * cols,
-                                 scale + r0, cols, r1 - r0);
-            });
+            int8_sdot_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
+            qwen_parallel((size_t)nt, int8_sdot_task, &c);
             return;
         }
-      #endif
-        int8_matvec_sdot(y, qx, sx, W, scale, cols, rows);
+        int8_matvec_sdot(y, qx_buf, sx, W, scale, cols, rows);
         return;
     }
 #endif
-  #if defined(__APPLE__) && defined(__BLOCKS__)
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            int r0 = (int)tid * rows / nt;
-            int r1 = (int)(tid + 1) * rows / nt;
-            int8_matvec_fused(y + r0, x, W + (size_t)r0 * cols,
-                               scale + r0, cols, r1 - r0);
-        });
+        int8_mv_ctx c = { y, x, W, scale, rows, cols };
+        qwen_parallel((size_t)nt, int8_mv_task, &c);
         return;
     }
-  #endif
     int8_matvec_fused(y, x, W, scale, cols, rows);
 }
 
@@ -985,109 +1002,74 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
     }
 }
 
+typedef struct {
+    float *y; const q4_0_block_t *W; const float *x; int rows, cols, blocks_per_row;
+} q4_0_mv_ctx;
+static void q4_0_mv_task(size_t tid, size_t nt, void *vc) {
+    q4_0_mv_ctx *c = (q4_0_mv_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_0_matvec_inner(c->y + r0, c->x, c->W + (size_t)r0 * c->blocks_per_row,
+                      c->cols, r1 - r0);
+}
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
-    int blocks_per_row = cols / Q4_0_BLOCK_SIZE;
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            int r0 = (int)tid * rows / nt;
-            int r1 = (int)(tid + 1) * rows / nt;
-            q4_0_matvec_inner(y + r0, x, W + (size_t)r0 * blocks_per_row,
-                               cols, r1 - r0);
-        });
+        q4_0_mv_ctx c = { y, W, x, rows, cols, cols / Q4_0_BLOCK_SIZE };
+        qwen_parallel((size_t)nt, q4_0_mv_task, &c);
         return;
     }
-#endif
     q4_0_matvec_inner(y, x, W, cols, rows);
 }
 
+/* QKV q4_0: partition the concatenated [Q|K|V] row space, reusing the inner
+ * kernel on each contiguous sub-segment (same result as the old inlined block,
+ * and now picks up any AVX2/NEON improvement to q4_0_matvec_inner for free). */
+typedef struct {
+    float *q, *k, *v;
+    const q4_0_block_t *Wq, *Wk, *Wv;
+    const float *x;
+    int in_dim, q_dim, kv_dim, blocks_per_row;
+} q4_0_qkv_ctx;
+static void q4_0_qkv_task(size_t tid, size_t nt, void *vc) {
+    q4_0_qkv_ctx *c = (q4_0_qkv_ctx *)vc;
+    int total = c->q_dim + 2 * c->kv_dim;
+    int r0 = (int)(tid * (size_t)total / nt);
+    int r1 = (int)((tid + 1) * (size_t)total / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int end = r1 < c->q_dim ? r1 : c->q_dim;
+            q4_0_matvec_inner(c->q + r, c->x, c->Wq + (size_t)r * c->blocks_per_row,
+                              c->in_dim, end - r);
+            r = end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            int local_end = end - c->q_dim;
+            q4_0_matvec_inner(c->k + local, c->x, c->Wk + (size_t)local * c->blocks_per_row,
+                              c->in_dim, local_end - local);
+            r = end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            q4_0_matvec_inner(c->v + local, c->x, c->Wv + (size_t)local * c->blocks_per_row,
+                              c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
-#if defined(__APPLE__) && defined(__BLOCKS__)
-    int blocks_per_row = in_dim / Q4_0_BLOCK_SIZE;
     int nt = g_n_threads;
     if (nt > 1) {
-        int total = q_dim + 2 * kv_dim;
-        dispatch_apply((size_t)nt,
-                       dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-                       ^(size_t tid) {
-            qwen_ftz_on();  /* per GCD worker: flush int8-induced denormals */
-            int r0 = (int)tid * total / nt;
-            int r1 = (int)(tid + 1) * total / nt;
-            for (int r = r0; r < r1; r++) {
-                float *dst;
-                const q4_0_block_t *W;
-                int orig_r = r;
-                if (r < q_dim) {
-                    dst = q; W = Wq;
-                } else if (r < q_dim + kv_dim) {
-                    dst = k; W = Wk;
-                    r -= q_dim;
-                } else {
-                    dst = v; W = Wv;
-                    r -= q_dim + kv_dim;
-                }
-                const q4_0_block_t *row = W + (size_t)r * blocks_per_row;
-                float sum = 0.0f;
-#ifdef __ARM_NEON
-                for (int b = 0; b < blocks_per_row; b++) {
-                    float scale = row[b].scale;
-                    const uint8_t *qs = row[b].qs;
-                    const float *xb = x + b * Q4_0_BLOCK_SIZE;
-
-                    uint8x16_t raw = vld1q_u8(qs);
-                    uint8x16_t lo_nibble = vandq_u8(raw, vdupq_n_u8(0x0F));
-                    uint8x16_t hi_nibble = vshrq_n_u8(raw, 4);
-
-                    int16x8_t s0 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(lo_nibble), vdup_n_u8(8)));
-                    int16x8_t s1 = vreinterpretq_s16_u16(vsubl_u8(vget_low_u8(hi_nibble), vdup_n_u8(8)));
-                    int16x8_t s2 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(lo_nibble), vdup_n_u8(8)));
-                    int16x8_t s3 = vreinterpretq_s16_u16(vsubl_u8(vget_high_u8(hi_nibble), vdup_n_u8(8)));
-
-                    int16x8x2_t z0 = vzipq_s16(s0, s1);
-                    int16x8x2_t z1 = vzipq_s16(s2, s3);
-
-                    float32x4_t vscale = vdupq_n_f32(scale);
-                    float32x4_t acc0 = vdupq_n_f32(0), acc1 = vdupq_n_f32(0);
-                    float32x4_t acc2 = vdupq_n_f32(0), acc3 = vdupq_n_f32(0);
-
-                    acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[0]))), vscale), vld1q_f32(xb));
-                    acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[0]))), vscale), vld1q_f32(xb + 4));
-                    acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z0.val[1]))), vscale), vld1q_f32(xb + 8));
-                    acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z0.val[1]))), vscale), vld1q_f32(xb + 12));
-                    acc0 = vfmaq_f32(acc0, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[0]))), vscale), vld1q_f32(xb + 16));
-                    acc1 = vfmaq_f32(acc1, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[0]))), vscale), vld1q_f32(xb + 20));
-                    acc2 = vfmaq_f32(acc2, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(z1.val[1]))), vscale), vld1q_f32(xb + 24));
-                    acc3 = vfmaq_f32(acc3, vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(z1.val[1]))), vscale), vld1q_f32(xb + 28));
-
-                    sum += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
-                }
-#else
-                for (int b = 0; b < blocks_per_row; b++) {
-                    float scale = row[b].scale;
-                    const uint8_t *qs = row[b].qs;
-                    const float *xb = x + b * Q4_0_BLOCK_SIZE;
-                    for (int i = 0; i < 16; i++) {
-                        int lo = (int)(qs[i] & 0x0F) - 8;
-                        int hi = (int)(qs[i] >> 4) - 8;
-                        sum += scale * (float)lo * xb[2*i];
-                        sum += scale * (float)hi * xb[2*i+1];
-                    }
-                }
-#endif
-                dst[r] = sum;
-                r = orig_r;  /* restore for loop */
-            }
-        });
+        q4_0_qkv_ctx c = { q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim,
+                           in_dim / Q4_0_BLOCK_SIZE };
+        qwen_parallel((size_t)nt, q4_0_qkv_task, &c);
         return;
     }
-#endif
     q4_0_matvec_inner(q, x, Wq, in_dim, q_dim);
     q4_0_matvec_inner(k, x, Wk, in_dim, kv_dim);
     q4_0_matvec_inner(v, x, Wv, in_dim, kv_dim);

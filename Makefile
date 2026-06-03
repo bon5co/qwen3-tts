@@ -26,6 +26,7 @@ SRCS = main.c \
        qwen_tts_code_predictor.c \
        qwen_tts_speech_decoder.c \
        qwen_tts_kernels.c \
+       qwen_tts_thread.c \
        qwen_tts_kernels_generic.c \
        qwen_tts_kernels_neon.c \
        qwen_tts_kernels_avx.c \

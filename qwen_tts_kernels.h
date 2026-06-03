@@ -40,6 +40,11 @@ int qwen_get_threads(void);
 int qwen_get_num_cpus(void);
 void qwen_init_threads(void);
 
+/* Enable flush-to-zero / denormals-are-zero on the CURRENT thread (FPCR on ARM,
+ * MXCSR on x86). Per-thread state, so every compute thread — including pool
+ * workers — must call it. Cheap (~1-2 cycles); inaudible quality impact. */
+void qwen_ftz_on(void);
+
 /* Print the ACTUAL compiled SIMD/threading capabilities of this binary to `out`
  * (derived from the same #ifdef guards the kernels use). Makes the real state
  * visible + testable so a "we thought AVX existed" gap can't hide behind docs.
