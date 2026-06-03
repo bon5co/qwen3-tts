@@ -2,7 +2,9 @@
 *.wav
 !samples/*.wav
 !samples/voice_clone_refs/**
+!tests/golden/*.wav
 *.py
+!tests/*.py
 qwen_tts
 qwen_tts_py/
 venv/
