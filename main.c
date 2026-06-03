@@ -286,6 +286,7 @@ int main(int argc, char **argv) {
     int do_stdout = 0;
     int stream_chunk = 10;
     int serve_port = 0;  /* 0 = not serving */
+    int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -337,6 +338,7 @@ int main(int argc, char **argv) {
         {"voice-name",    required_argument, 0, 1022},
         {"greedy-warmup", required_argument, 0, 1023},
         {"target-cv",     required_argument, 0, 1024},
+        {"caps",          no_argument,       0, 1025},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -374,6 +376,7 @@ int main(int argc, char **argv) {
             case 1022: voice_name = optarg; break;
             case 1023: { int gw = atoi(optarg); ctx_greedy_warmup = gw; } break;
             case 1024: target_cv_dir = optarg; break;
+            case 1025: show_caps = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -415,8 +418,18 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
+                fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
                 return opt == 'h' ? 0 : 1;
         }
+    }
+
+    /* --caps: report the binary's ACTUAL compiled SIMD/threading capabilities and exit
+     * (no model needed). Honest, testable source of truth — catches "we thought AVX
+     * existed" regressions that docs/comments can hide. */
+    if (show_caps) {
+        qwen_init_threads();
+        qwen_caps_report(stdout);
+        return 0;
     }
 
     /* Voice library management (no model loading needed) */

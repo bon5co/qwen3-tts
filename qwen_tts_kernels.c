@@ -69,6 +69,60 @@ void qwen_init_threads(void) {
     qwen_ftz_on();  /* main thread: flush denormals (int8 activations) */
 }
 
+/* Report ACTUAL compiled capabilities (mirrors the kernels' own #ifdef guards).
+ * Run `./qwen_tts --caps`. Makes the real SIMD/threading state visible + testable so
+ * a false "we have AVX2/threading" claim can't survive — the binary tells the truth. */
+void qwen_caps_report(void *out) {
+    FILE *f = out ? (FILE *)out : stderr;
+    fprintf(f, "qwen-tts compiled capabilities:\n");
+#if defined(__aarch64__)
+    fprintf(f, "  arch:             arm64\n");
+#elif defined(__x86_64__)
+    fprintf(f, "  arch:             x86-64\n");
+#else
+    fprintf(f, "  arch:             (other)\n");
+#endif
+    /* Hot path: bf16/int8/q4 matvecs + attention (~90%% of decode). NEON-or-scalar —
+     * there is NO AVX2 branch for these today (only rms_norm + bf16 conv have AVX2). */
+#ifdef __ARM_NEON
+    fprintf(f, "  matvec + attn:    NEON (2-row fused)\n");
+#elif defined(__AVX2__)
+    fprintf(f, "  matvec + attn:    SCALAR  <-- AVX2 present but NOT wired for matvec/attn (PLAN 21.3)\n");
+#else
+    fprintf(f, "  matvec + attn:    scalar\n");
+#endif
+#if defined(__ARM_FEATURE_DOTPROD)
+    fprintf(f, "  int8 dot:         SDOT vdotq_s32 (native)\n");
+#else
+    fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
+#endif
+#if defined(__AVX2__)
+    fprintf(f, "  rms/bf16-conv:    AVX2\n");
+#elif defined(__ARM_NEON)
+    fprintf(f, "  rms/bf16-conv:    NEON\n");
+#else
+    fprintf(f, "  rms/bf16-conv:    scalar\n");
+#endif
+#if defined(__ARM_FEATURE_BF16)
+    fprintf(f, "  arm bf16 matmul:  bfdot/bfmmla AVAILABLE but UNUSED (PLAN 21.3b)\n");
+#endif
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    fprintf(f, "  arm i8mm:         smmla AVAILABLE but UNUSED (PLAN 21.3b)\n");
+#endif
+#if defined(__APPLE__) && defined(__BLOCKS__)
+    fprintf(f, "  matvec threads:   GCD dispatch_apply (%d threads)\n", qwen_get_threads());
+#else
+    fprintf(f, "  matvec threads:   SINGLE-THREAD  <-- no GCD/pool off macOS (PLAN 21.2)\n");
+#endif
+#if defined(USE_BLAS) && defined(__APPLE__)
+    fprintf(f, "  BLAS (prefill):   Accelerate\n");
+#elif defined(USE_BLAS)
+    fprintf(f, "  BLAS (prefill):   OpenBLAS\n");
+#else
+    fprintf(f, "  BLAS (prefill):   none\n");
+#endif
+}
+
 #if defined(__APPLE__)
 #include <dispatch/dispatch.h>
 #endif

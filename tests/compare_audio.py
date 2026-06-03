@@ -39,7 +39,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("golden")
     ap.add_argument("output")
-    ap.add_argument("--min-corr", type=float, default=0.99)
+    # Empirical basis (2026-06-03, quiet machine, fixed seed): run-to-run mel_corr is
+    # 1.00000 across det/-j1-temp0 AND default-4thread-temp0.5 (Qwen3-TTS is NOT audibly
+    # non-deterministic with a fixed seed on a quiet box — "poco" = <=±1 LSB). A real
+    # regression / under-load token-flip drops it hard (seen: 0.62). So 0.98 tolerates
+    # benign variation ("poco sì") with huge margin to catch "tanto". CROSS-ISA (x86 build
+    # vs ARM golden) won't be bit-identical — use --min-corr 0.95 there.
+    ap.add_argument("--min-corr", type=float, default=0.98)
     ap.add_argument("--dur-tol", type=float, default=0.05)
     ap.add_argument("--label", default="")
     a = ap.parse_args()

@@ -313,11 +313,33 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-golden
+test-all: test-small test-large test-regression test-caps test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
 	@echo "========================================="
+
+# ── Capability self-report regression (catches "we thought AVX existed") ──
+# Asserts the binary's --caps report is internally consistent with the build arch, so a
+# false "we have AVX2/threading" belief can't survive: the binary states the truth and this
+# test enforces it. On ARM it MUST report NEON; on x86 it MUST currently report SCALAR for
+# matvec (no AVX2 yet) — when the AVX2 path lands, flip this expectation so a regression to
+# scalar fails loudly. Pure introspection, no model needed.
+
+test-caps: $(TARGET)
+	@echo "=== Capability report test ==="
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) --caps | tee $(TEST_DIR)/caps.txt
+	@grep -q "matvec + attn:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing matvec line"; exit 1; }
+	@grep -q "matvec threads:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing threads line"; exit 1; }
+	@grep -q "int8 dot:" $(TEST_DIR)/caps.txt || { echo "FAIL: --caps missing int8 dot line"; exit 1; }
+	@if grep -q "arch:.*arm64" $(TEST_DIR)/caps.txt; then \
+	   grep -q "matvec + attn:    NEON" $(TEST_DIR)/caps.txt || { echo "FAIL: arm64 build must report NEON matvec"; exit 1; }; \
+	 elif grep -q "arch:.*x86-64" $(TEST_DIR)/caps.txt; then \
+	   grep -q "matvec + attn:    SCALAR" $(TEST_DIR)/caps.txt || { echo "NOTE: x86 matvec no longer SCALAR — if AVX2 landed, update this assertion"; exit 1; }; \
+	 fi
+	@echo "PASS: --caps report consistent with build arch"
+	@echo ""
 
 # ── Golden-reference correctness (mel-correlation + duration) ──
 # Regenerates output deterministically (-j1 --temperature 0 --seed 42) and compares to the
@@ -643,7 +665,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-golden golden-update \
+.PHONY: all help blas clean debug info serve cp-microbench test-caps test-golden golden-update \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
