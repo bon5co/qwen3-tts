@@ -319,6 +319,32 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
 **DEBUNKED agent claims (do NOT propagate):** "int4 loaded but never used" (FALSE — int4 wired in
 talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `needs-verify` before acting.
 
+### 21.7 Test coverage — hardened 2026-06-03 (safety net BEFORE the AVX2 work)
+
+The old suite only proved the pipeline RUNS (`validate_wav` = non-empty WAV + ≥1 frame + no MISSING
+weights) — it never checked the audio was CORRECT. A numerically-broken kernel that still emits audio
+PASSED. Closed the worst gaps:
+- [x] **`test-golden`** (commit d987c4b/d987... + gitignore fix) — regen deterministically (`-j1
+  temp0 seed42`) and compare to committed `tests/golden/*.wav` via **mel-spectrogram correlation
+  (≥0.99) + duration (≤5%)** (`tests/compare_audio.py`, librosa). Covers 0.6B en/it/int8 + 1.7B en.
+  Wired into `test-all`. `make golden-update` regenerates after an intended change. **mel-corr (not
+  md5)**: md5 flakes even at `-j1 temp0` (±1 LSB decoder noise, verified) AND mel-corr is the correct
+  cross-ISA check for AVX2/x86 (won't be bit-identical, must stay ~0.99+). This is THE safety net for
+  the kernel work — a wrong AVX2 kernel now fails here instead of silently shipping.
+- [x] **`test-serve-repro`** — 3 identical requests bit-identical (catches cross-request state leaks).
+- [x] **`test-voice-design`** now SKIPs cleanly (was failing on absent model — double bug: dir-only
+  check + per-line `exit 0` that didn't stop the recipe).
+- [ ] `[MED]` **Remaining coverage gaps:** `.qvoice`/custom-voice load (local-only, voices/ gitignored
+  → skip-if-absent test), SDOT on/off A/B not in suite, int4 not in golden, error paths (missing
+  model/bad args/truncated file — the fread fix has no test), CLI determinism not formalized, **no
+  x86/Linux inference in CI** (build-only — fix once the Ryzen box flow is set up).
+- [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
+  currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
+- [ ] `[MED, investigate]` **`-j1 --temperature 0` trajectory changed under heavy load** (seen once
+  during golden-gen while the bg suite contended: 234884 B vs the stable 291884 B — a token flip, NOT
+  ±1 LSB). Greedy single-thread should be load-independent. Possibly the always-on decoder pthread or
+  an uninit/race. `test-golden` (mel-corr, quiet machine) catches it; root-cause later. Run tests quiet.
+
 ---
 
 ## OPEN FUTURE TASKS (compact — nothing dropped)
