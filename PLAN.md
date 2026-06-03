@@ -289,11 +289,13 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   the "1 GB text → OOM" claim is bounded away. `error-path n_prev_tokens dirty` is also a non-issue
   (reset per request, qwen_tts.c:1167). Agent claims OVERSTATED. (Only nicety left: an explicit
   friendly 413 for >1 MB bodies — cosmetic.)
-- [ ] `[MED]` **Voice-clone ref audio resampling is a STUB** — `qwen_tts_voice_clone.c:894` requires
-  exactly 24 kHz (TODO never shipped); README implies "clone from any WAV". Hit empirically (b1.wav
-  44.1kHz rejected). Fix: built-in resample, or document the 24kHz requirement honestly.
-- [ ] `[LOW]` **Robustness** — `qwen_tts_tokenizer.c` `fread()` returns unchecked (×2);
-  `(size_t)rows*cols` allocs without overflow guard (low risk). `needs-verify` but plausible.
+- [x] **Voice-clone 24kHz ref audio — RESOLVED as documented-by-design 2026-06-03 (commit 33c11a0).**
+  Decision (user): do NOT bundle a resampler (ffmpeg does it better, keeps zero-dep; mel features need
+  24kHz). The requirement is now documented in docs/voice-cloning.md + `--help` + a clear runtime error
+  (`ffmpeg -i in -ar 24000 -ac 1 out.wav`). The misleading "TODO: resample" comment was rewritten.
+- [x] **Robustness: tokenizer `fread()` — FIXED 2026-06-03 (commit 33c11a0).** Both vocab.json +
+  merges.txt loads now check the read length (short read → error + free, was silently ignored).
+  `(size_t)rows*cols` overflow: low risk, cast present; left as-is (would need absurd config dims).
 
 **PERFORMANCE / PORTABILITY (the big gap — see 21.2/21.3/21.3b):**
 - [ ] All 8 hot matvec/attention kernels scalar on x86; matvec threading GCD/Apple-only; SwiGLU exp
