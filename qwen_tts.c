@@ -1187,13 +1187,20 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * In normal mode, it accumulates audio to a buffer. */
     decoder_thread_t dt_state;
     pthread_t dt_thread;
+    /* DIAGNOSTIC: QWEN_NO_OVERLAP=1 runs the speech decoder SYNCHRONOUSLY (no overlap
+     * pthread) — used to test whether the decoder thread is the source of the intermittent
+     * -j1 temp0 non-determinism. With it set, the thread is never spawned; frames buffer
+     * into dt->codes during generation and are drained by a single synchronous
+     * decoder_thread_fn() call at the end (done=1 → it processes all and returns). */
+    int dt_no_overlap = (getenv("QWEN_NO_OVERLAP") != NULL);
     qwen_sd_stream_init(&ctx->sd_stream);
     dt_init(&dt_state, ctx, max_frames);
     if (ctx->stream && ctx->audio_cb) {
         dt_state.audio_cb = ctx->audio_cb;
         dt_state.audio_cb_userdata = ctx->audio_cb_userdata;
     }
-    pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);
+    if (!dt_no_overlap)
+        pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);
 
     for (int frame = 0; frame < max_frames; frame++) {
         /* Codec head: logits = codec_head @ last_hidden */
@@ -1341,7 +1348,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     /* Speech decoder */
     if (ctx->codec_frames == 0) {
-        dt_finish(&dt_state); pthread_join(dt_thread, NULL);
+        dt_finish(&dt_state);
+        if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
         qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
         *out_samples = NULL; *out_n_samples = 0;
         return 0;
@@ -1352,7 +1360,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     double t_dec_start = time_ms();
 
     dt_finish(&dt_state);
-    pthread_join(dt_thread, NULL);
+    if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
     qwen_sd_stream_free(&ctx->sd_stream);
 
     double dt_decode_ms = dt_state.decode_ms;

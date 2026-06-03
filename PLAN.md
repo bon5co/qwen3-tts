@@ -348,20 +348,26 @@ PASSED. Closed the worst gaps:
   x86/Linux inference in CI** (build-only — add once the Ryzen/WSL2 flow is set up).
 - [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
   currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
-- [ ] `[HIGH, investigate — likely the real "tanto" non-determinism]` **`-j1 --temperature 0` output
-  is LOAD-DEPENDENT** (confirmed repeatedly 2026-06-03). On a QUIET machine it's byte-deterministic
-  (10× bursts md5-identical, == golden, 6.08 s). Under CPU load (WindowServer/RDP ~44%, load 2.4–4) it
-  intermittently drifts to a DIFFERENT, usually SHORTER trajectory (5.1–5.4 s; mel-corr 0.3–0.7 vs
-  golden) — a token flip, NOT ±1 LSB. Greedy single-thread MUST be load-invariant, so this is a real
-  bug. **Ruled out:** on-disk cache/state (separate processes, none); EOS-boost timing (it's FRAME-count
-  based, `qwen_tts.c:1219`, deterministic). **Prime suspect:** a race between the always-on decoder
-  overlap pthread and the main gen loop over a shared `ctx` scratch buffer (the code comment claims
-  clean Talker/CP-vs-decoder separation — verify it; if a kernel/ctx scratch is shared, the decoder
-  clobbers a logit mid-frame under unlucky timing → token flip). Next: read the decoder path for shared
-  buffers; test with overlap disabled (add a QWEN_NO_OVERLAP knob) — if load-invariant, decoder thread
-  is the cause. **BLOCKS:** reliable golden/e2e tests AND clean AVX2 benchmarking → fix before perf.
-  **Consequence:** could NOT cleanly measure streaming-vs-normal or SDOT-on-vs-off (those 0.3–0.7
-  numbers were load-contaminated — do NOT conclude "streaming/SDOT broken"; re-measure on an idle box).
+- [ ] `[HIGH, investigate — REAL intermittent non-determinism, likely uninit/OOB memory]`
+  **`-j1 --temperature 0` is INTERMITTENTLY non-deterministic** (2026-06-03, after much false-starting).
+  Pattern: sometimes a burst is byte-identical (10×/5× == golden), sometimes EVERY run differs (4/4
+  distinct md5, different durations/trajectories). **DECISIVELY ruled out:**
+  - **NOT the decoder overlap thread / NOT concurrency** — `QWEN_NO_OVERLAP=1` (synchronous decode, no
+    pthread; knob added `qwen_tts.c`) is ALSO 4/4 distinct. So it's single-threaded non-determinism.
+  - **NOT load** — earlier "load-dependent" claim was WRONG (my own runaway busy-loops + leftover
+    procs were saturating the 4-core box and contaminating measurements; under *controlled* induced
+    load 10× was identical). Retracted.
+  - **NOT** on-disk cache (separate procs), EOS-boost (frame-based), sampling RNG (temp 0 = pure greedy
+    argmax, `qwen_tts_sampling.c:155`), matvec (single-thread deterministic).
+  - MallocPreScribble/Scribble did NOT make it consistent (argues against simple fresh-malloc uninit;
+    could be a STACK uninit or a realloc'd/reused buffer read-before-write).
+  **Conclusion:** non-determinism is in the CORE gen path (talker/CP/codec_head/decoder) with NO
+  concurrency → almost certainly an **uninitialized-memory or out-of-bounds read** that depends on heap
+  garbage. The earlier memory note "NOT uninitialized memory (MallocScribble unchanged)" is likely
+  INCOMPLETE. **Next:** ASan build (`make debug`) to catch OOB; if clean, MSan/valgrind for uninit
+  (hard on M1) or a manual buffer-init audit of the gen path. **BLOCKS reliable golden/e2e + clean
+  bench.** Could NOT trust streaming-vs-normal / SDOT-on-off comparisons (same non-determinism). The
+  user's "buffer/state not cleaned" instinct points the right way.
 
 ---
 
