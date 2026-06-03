@@ -398,6 +398,52 @@ golden-update: $(TARGET)
 	@if [ -d $(MODEL_LARGE) ]; then ./$(TARGET) -d $(MODEL_LARGE) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o tests/golden/golden_17b_en.wav; fi
 	@echo "Done. git diff tests/golden/ and commit if intended."
 
+# ── Mode matrix: quant × delivery (the combinations real usage hits) ──
+# Each combination must RUN and produce coherent audio (non-empty + frames). Numeric
+# correctness for the deterministic configs is covered by test-golden; here we assert the
+# CROSS-PRODUCT works: int8/bf16 × normal/stream, plus SDOT on/off. One shell so a failure
+# stops cleanly. Reloads the model each run (natural gap → reliable, unlike rapid-fire).
+test-modes: $(TARGET)
+	@echo "=== Mode matrix (quant × delivery) 0.6B ==="
+	@mkdir -p $(TEST_DIR)
+	@chk() { sz=$$(stat -f%z "$$1" 2>/dev/null || stat -c%s "$$1" 2>/dev/null || echo 0); \
+	   if [ "$$sz" -le 44 ] || ! grep -q "Generated [1-9]" "$$1.log"; then echo "FAIL: $$2"; exit 1; fi; \
+	   if grep -qi "nan" "$$1.log"; then echo "FAIL: $$2 (NaN)"; exit 1; fi; \
+	   echo "  PASS: $$2 ($$sz B)"; }; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -s ryan -l English --text "$(GOLDEN_EN)" -o $(TEST_DIR)/m_bf.wav >$(TEST_DIR)/m_bf.wav.log 2>&1; chk $(TEST_DIR)/m_bf.wav "bf16 normal"; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -s ryan -l English --stream --text "$(GOLDEN_EN)" -o $(TEST_DIR)/m_bfs.wav >$(TEST_DIR)/m_bfs.wav.log 2>&1; chk $(TEST_DIR)/m_bfs.wav "bf16 stream"; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o $(TEST_DIR)/m_i8.wav >$(TEST_DIR)/m_i8.wav.log 2>&1; chk $(TEST_DIR)/m_i8.wav "int8 normal (SDOT)"; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -s ryan -l English --int8 --stream --text "$(GOLDEN_EN)" -o $(TEST_DIR)/m_i8s.wav >$(TEST_DIR)/m_i8s.wav.log 2>&1; chk $(TEST_DIR)/m_i8s.wav "int8 stream"; \
+	 QWEN_NO_SDOT=1 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -s ryan -l English --int8 --text "$(GOLDEN_EN)" -o $(TEST_DIR)/m_i8n.wav >$(TEST_DIR)/m_i8n.wav.log 2>&1; chk $(TEST_DIR)/m_i8n.wav "int8 normal (SDOT off)"; \
+	 echo "PASS: mode matrix (5 combinations)"
+	@echo ""
+
+# ── Custom voice (.qvoice) — skip-if-absent (voices/ is gitignored / local-only) ──
+test-qvoice: $(TARGET)
+	@echo "=== Custom voice (.qvoice) test ==="
+	@if [ ! -f voices/silvio_06b.qvoice ]; then echo "SKIP: voices/silvio_06b.qvoice not present (local-only)"; exit 0; fi; \
+	 mkdir -p $(TEST_DIR); \
+	 chk() { sz=$$(stat -f%z "$$1" 2>/dev/null || stat -c%s "$$1" 2>/dev/null || echo 0); \
+	   if [ "$$sz" -le 44 ] || ! grep -q "Generated [1-9]" "$$1.log"; then echo "FAIL: $$2"; exit 1; fi; echo "  PASS: $$2 ($$sz B)"; }; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 -l Italian --load-voice voices/silvio_06b.qvoice --text "Buongiorno, questo e un test della voce." -o $(TEST_DIR)/qv.wav >$(TEST_DIR)/qv.wav.log 2>&1; chk $(TEST_DIR)/qv.wav "qvoice bf16"; \
+	 ./$(TARGET) -d $(MODEL_SMALL) -j1 --seed 42 --int8 -l Italian --load-voice voices/silvio_06b.qvoice --text "Buongiorno, questo e un test della voce." -o $(TEST_DIR)/qvi.wav >$(TEST_DIR)/qvi.wav.log 2>&1; chk $(TEST_DIR)/qvi.wav "qvoice int8"; \
+	 echo "PASS: custom voice (bf16 + int8)"
+	@echo ""
+
+# ── E2E: ONE command that runs EVERYTHING available (skips missing models/voices) ──
+# This is the comprehensive regression: small/large/regression/errors/caps/golden +
+# quant (int8/int4) + mode matrix + custom voice + clone + voice-design + server suite.
+e2e: $(TARGET)
+	@echo "######################## E2E FULL REGRESSION ########################"
+	@$(MAKE) --no-print-directory test-all
+	@$(MAKE) --no-print-directory test-large-quant
+	@$(MAKE) --no-print-directory test-modes
+	@$(MAKE) --no-print-directory test-qvoice
+	@$(MAKE) --no-print-directory test-clone
+	@$(MAKE) --no-print-directory test-voice-design
+	@$(MAKE) --no-print-directory test-serve-all
+	@echo "######################## E2E COMPLETE — all green ########################"
+
 # ── HTTP Server ──
 
 serve: $(TARGET)
@@ -680,7 +726,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
