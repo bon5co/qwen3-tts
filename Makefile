@@ -434,9 +434,36 @@ test-serve-parallel: $(TARGET)
 	 echo "PASS: 2 parallel requests served"
 	@echo ""
 
+# ── Server reproducibility regression (delta-prefill stale dec_x bug, fixed cbfa979) ──
+# Two+ IDENTICAL consecutive requests MUST produce bit-identical output. Runs -j1
+# --temperature 0 for full determinism (no threading FP noise / no sampling butterfly),
+# so any difference is a real state-leak bug, not benign +-1 LSB.
+
+test-serve-repro: $(TARGET)
+	@echo "=== Server Reproducibility test (3 identical requests, -j1 temp0) ==="
+	@mkdir -p $(TEST_DIR)
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 --serve 8094 &>/dev/null & SERVER_PID=$$!; \
+	 sleep 4; \
+	 REQ='{"text":"The quick brown fox jumps over the lazy dog on a sunny afternoon.","speaker":"ryan","language":"English","seed":42,"temperature":0}'; \
+	 for n in 1 2 3; do \
+	   curl -s -X POST http://localhost:8094/v1/tts -H "Content-Type: application/json" \
+	     -d "$$REQ" -o $(TEST_DIR)/repro_$$n.wav; \
+	 done; \
+	 kill $$SERVER_PID 2>/dev/null; \
+	 M1=$$(md5sum $(TEST_DIR)/repro_1.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_1.wav 2>/dev/null); \
+	 M2=$$(md5sum $(TEST_DIR)/repro_2.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_2.wav 2>/dev/null); \
+	 M3=$$(md5sum $(TEST_DIR)/repro_3.wav 2>/dev/null | cut -d' ' -f1 || md5 -q $(TEST_DIR)/repro_3.wav 2>/dev/null); \
+	 S1=$$(stat -f%z $(TEST_DIR)/repro_1.wav 2>/dev/null || stat -c%s $(TEST_DIR)/repro_1.wav 2>/dev/null); \
+	 echo "  run1=$$M1 ($$S1 B)  run2=$$M2  run3=$$M3"; \
+	 if [ "$$S1" -le 44 ]; then echo "FAIL: empty WAV"; exit 1; fi; \
+	 if [ "$$M1" != "$$M2" ] || [ "$$M2" != "$$M3" ]; then \
+	   echo "FAIL: identical requests produced DIFFERENT output (state leaks between requests)"; exit 1; fi; \
+	 echo "PASS: 3 identical requests are bit-identical"
+	@echo ""
+
 # ── Combined server tests ──
 
-test-serve-all: test-serve test-serve-bench test-serve-openai test-serve-parallel
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -573,7 +600,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench \
-        test-serve test-serve-bench test-serve-openai test-serve-parallel test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
