@@ -560,29 +560,31 @@ test-clone: $(TARGET)
 
 # ── VoiceDesign test ──
 
+# NOTE: the whole body runs in ONE shell (\ continuations) so the SKIP `exit 0`
+# actually stops the recipe — a per-line `@if ...; exit 0; fi` only exits its own
+# sub-shell and the following model-run lines would still execute (the old bug).
 test-voice-design: $(TARGET)
 	@echo "=== VoiceDesign test ==="
-	@if [ ! -d $(MODEL_VOICE_DESIGN) ]; then echo "SKIP: $(MODEL_VOICE_DESIGN) not found (run ./download_model.sh --model voice-design)"; exit 0; fi
-	@mkdir -p $(TEST_DIR)
-	@echo ""
-	@echo "--- VoiceDesign: British male ---"
-	./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English \
-		--voice-design \
-		--instruct "A deep male voice with a British accent, speaking slowly and calmly" \
-		--text "Good evening, welcome to the broadcast." \
-		-o $(TEST_DIR)/vd_british.wav 2>&1 | tee $(TEST_DIR)/vd_british.wav.log
-	$(call validate_wav,$(TEST_DIR)/vd_british.wav,VoiceDesign: British male)
-	@echo "--- VoiceDesign: energetic female ---"
-	./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English \
-		--voice-design \
-		--instruct "Young energetic female, cheerful and fast-paced" \
-		--text "Oh my gosh, this is so exciting!" \
-		-o $(TEST_DIR)/vd_cheerful.wav 2>&1 | tee $(TEST_DIR)/vd_cheerful.wav.log
-	$(call validate_wav,$(TEST_DIR)/vd_cheerful.wav,VoiceDesign: energetic female)
-	@echo "=== VoiceDesign test passed ==="
-	@echo "Listen:"
-	@echo "  British:   afplay $(TEST_DIR)/vd_british.wav"
-	@echo "  Cheerful:  afplay $(TEST_DIR)/vd_cheerful.wav"
+	@if [ ! -f $(MODEL_VOICE_DESIGN)/model.safetensors ]; then \
+	   echo "SKIP: $(MODEL_VOICE_DESIGN) not found or incomplete (run ./download_model.sh --model voice-design)"; \
+	   exit 0; \
+	 fi; \
+	 mkdir -p $(TEST_DIR); \
+	 echo "--- VoiceDesign: British male ---"; \
+	 ./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English --voice-design \
+	   --instruct "A deep male voice with a British accent, speaking slowly and calmly" \
+	   --text "Good evening, welcome to the broadcast." \
+	   -o $(TEST_DIR)/vd_british.wav 2>&1 | tee $(TEST_DIR)/vd_british.wav.log; \
+	 if [ ! -s $(TEST_DIR)/vd_british.wav ] || ! grep -q "Generated [1-9]" $(TEST_DIR)/vd_british.wav.log; then echo "FAIL: VoiceDesign British male"; exit 1; fi; \
+	 echo "PASS: VoiceDesign British male"; \
+	 echo "--- VoiceDesign: energetic female ---"; \
+	 ./$(TARGET) -d $(MODEL_VOICE_DESIGN) -l English --voice-design \
+	   --instruct "Young energetic female, cheerful and fast-paced" \
+	   --text "Oh my gosh, this is so exciting!" \
+	   -o $(TEST_DIR)/vd_cheerful.wav 2>&1 | tee $(TEST_DIR)/vd_cheerful.wav.log; \
+	 if [ ! -s $(TEST_DIR)/vd_cheerful.wav ] || ! grep -q "Generated [1-9]" $(TEST_DIR)/vd_cheerful.wav.log; then echo "FAIL: VoiceDesign energetic female"; exit 1; fi; \
+	 echo "PASS: VoiceDesign energetic female"; \
+	 echo "=== VoiceDesign test passed ==="
 
 # ── Voice Clone Demo ──
 # Uses an existing sample WAV as reference to clone a voice with new text.
