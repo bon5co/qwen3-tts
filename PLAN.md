@@ -265,6 +265,15 @@ Until then, all RTF numbers are **Apple-M1-only**.
 
 ## OPEN FUTURE TASKS (compact — nothing dropped)
 
+- [ ] `[MED]` **Server warm-request reproducibility bug (found 2026-06-03).** `make test-serve-bench`
+  fails its bit-identical assertion: two IDENTICAL consecutive requests (seed 42, same text) produce
+  DIFFERENT output — run1 291884 B, run2 311084 B (~400 ms longer), even at `-j1 --temperature 0`.
+  PROVEN **pre-existing & NOT SDOT** (fails identically with `QWEN_NO_SDOT=1`; engine itself is
+  bit-deterministic — CLI `-j1 temp0` is bit-identical, and the server's COLD run1 == CLI output).
+  Cause = server **delta-prefill / KV-reuse across requests**: the warm 2nd request doesn't get a
+  clean state, so it diverges. Contradicts the "delta prefill = bit-identical" belief. Fix: reset KV
+  state between unrelated requests OR only reuse on a verified-matching prefix. The `test-serve-bench`
+  md5 assertion is also too strict (should compare cold-vs-cold, or mel-corr, not warm-vs-cold md5).
 - **CP sliding window attention** (old 18.3): config has `sliding_window=72`; verify CP attention
   caps at it. `[MED]`, only matters for 200+ frame sequences.
 - **Long-form / audiobook mode** (old Phase 19): chapter/batch mode, progress indicator + ETA/RTF,
