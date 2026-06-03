@@ -278,11 +278,17 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   server case: shared prefix, different text) untouched → delta-prefill optimization preserved.
   Verified: 3 identical reqs now bit-identical AND == CLI (327ec448); `test-serve-bench` PASSES (was
   FAIL); test-small 5/5. Remaining server hardening (below) still open.
-- [ ] `[HIGH]` **Server not thread-safe** — single shared `qwen_tts_ctx_t`, no lock, requests
-  serialized; 2 concurrent curls corrupt state. Decide: document single-flight + add a mutex, or
-  per-connection ctx. (`qwen_tts_server.c` accept loop.)
-- [ ] `[MED]` **Server input validation** — no cap on `text` length (OOM), no speaker/lang ID bounds
-  check before embedding lookup (OOB). Add limits + validation.
+- [~] **Server thread-safety — VERIFIED NOT A BUG (2026-06-03).** The server is genuinely
+  single-threaded: one `while(server_running)` loop, `accept()` → `handle_*()` inline → close, NO
+  `pthread_create`/fork (`qwen_tts_server.c:476-537`). Requests are serialized by design; a 2nd
+  concurrent curl just waits in the listen backlog. The audit agent's "parallel curls corrupt state"
+  was OVERSTATED. (Future: concurrent serving = a throughput *feature*, not a correctness fix.)
+- [~] **Server input validation — VERIFIED mostly NOT A BUG (2026-06-03).** Invalid speaker/language
+  are **safely ignored** (`if (sid>=0)`/`if (lid>=0)`, server.c:283-294) — no OOB. Request body is
+  capped at **1 MB** (`malloc(1024*1024)`, server.c:487) and generation at `max_tokens` (8192) — so
+  the "1 GB text → OOM" claim is bounded away. `error-path n_prev_tokens dirty` is also a non-issue
+  (reset per request, qwen_tts.c:1167). Agent claims OVERSTATED. (Only nicety left: an explicit
+  friendly 413 for >1 MB bodies — cosmetic.)
 - [ ] `[MED]` **Voice-clone ref audio resampling is a STUB** — `qwen_tts_voice_clone.c:894` requires
   exactly 24 kHz (TODO never shipped); README implies "clone from any WAV". Hit empirically (b1.wav
   44.1kHz rejected). Fix: built-in resample, or document the 24kHz requirement honestly.
