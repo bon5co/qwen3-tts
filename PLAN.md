@@ -523,9 +523,17 @@ read → bandwidth win, single-stream. Needs a cheap predictor of which neurons 
 **FIRST STEP = MEASURE viability before building either (cheap instrumentation):**
 1. FFN activation sparsity: what % of the 3072 intermediate neurons exceed an activation
    threshold per token? (<~30% → C2 promising.)
-2. Draft acceptance: how often does CP-q2 argmax == CP-int4 argmax across the 15 codebooks?
-   (>~70% → C1 promising.)
-These two numbers decide which (if any) to build. Don't implement blind.
+2. **Quant-ladder argmax-agreement matrix** across the 15 codebooks per frame, ALL pairs of
+   {bf16, int8, int4, q2}. int8 is the GOLD (== bf16, no artefacts); int4 added the slight
+   "anger". So measure not just q2-vs-int4 but the full ladder — especially:
+   - int8 vs bf16 (expect ~100% — confirms gold)
+   - **int4 vs int8** (quantifies WHERE/how-much int4 drifts → explains the slight aggression,
+     and tells us if int8 is a better speculative target than bf16)
+   - q2 vs int4, q2 vs int8 (draft acceptance for C1; >~70% → promising)
+   The agreement % per codebook index also shows WHICH of the 15 residuals drift first (the
+   later/finer ones likely), informing both the draft design and the prosody track (A).
+These numbers decide which (if any) to build, and pick the draft/target precision pair.
+Don't implement blind.
 
 ---
 
