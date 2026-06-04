@@ -415,6 +415,13 @@ static inline __m256 qwen_loadu_bf16_8(const uint16_t *p) {
 static inline __m256 qwen_loadu_s8_8(const int8_t *p) {
     return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)p)));
 }
+#if defined(__AVX512F__)
+/* Load 16 bf16 (uint16) and widen to 16×f32 (shift into the high half). */
+static inline __m512 qwen_loadu_bf16_16(const uint16_t *p) {
+    __m256i b = _mm256_loadu_si256((const __m256i *)p);
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(b), 16));
+}
+#endif
 /* f32 dot product, AVX2/FMA with scalar tail (attention score).
  * 4 accumulators (32 elem/iter) so the FMA reduction isn't latency-bound. */
 static inline float qwen_dot_f32_avx2(const float *a, const float *b, int n) {
@@ -489,7 +496,59 @@ static inline void qwen_acc_wt_bf16_avx2(float *o, const uint16_t *v, float w, i
 static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
                                int in_dim, int out_dim) {
     int o = 0;
-#ifdef __ARM_NEON
+#if defined(__AVX512F__)
+    /* AVX-512: 2 rows, 4 __m512 accumulators/row (8 chains), 64 f32/iter, + prefetch.
+     * Genuinely 16-wide on the hot path; helps where the working set fits in cache
+     * (e.g. 3D V-Cache chips) and the matvec turns compute-bound. */
+    for (; o + 1 < out_dim; o += 2) {
+        const uint16_t *w0 = W + (size_t)o * in_dim;
+        const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
+        if (o + 5 < out_dim) {
+            __builtin_prefetch(W + (size_t)(o + 4) * in_dim, 0, 0);
+            __builtin_prefetch(W + (size_t)(o + 5) * in_dim, 0, 0);
+        }
+        __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(),
+               a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
+        __m512 b0 = _mm512_setzero_ps(), b1 = _mm512_setzero_ps(),
+               b2 = _mm512_setzero_ps(), b3 = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512 x0 = _mm512_loadu_ps(x + k);
+            __m512 x1 = _mm512_loadu_ps(x + k + 16);
+            __m512 x2 = _mm512_loadu_ps(x + k + 32);
+            __m512 x3 = _mm512_loadu_ps(x + k + 48);
+            a0 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w0 + k),      x0, a0);
+            a1 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w0 + k + 16), x1, a1);
+            a2 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w0 + k + 32), x2, a2);
+            a3 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w0 + k + 48), x3, a3);
+            b0 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w1 + k),      x0, b0);
+            b1 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w1 + k + 16), x1, b1);
+            b2 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w1 + k + 32), x2, b2);
+            b3 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w1 + k + 48), x3, b3);
+        }
+        for (; k + 16 <= in_dim; k += 16) {
+            __m512 xv = _mm512_loadu_ps(x + k);
+            a0 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w0 + k), xv, a0);
+            b0 = _mm512_fmadd_ps(qwen_loadu_bf16_16(w1 + k), xv, b0);
+        }
+        a0 = _mm512_add_ps(_mm512_add_ps(a0, a2), _mm512_add_ps(a1, a3));
+        b0 = _mm512_add_ps(_mm512_add_ps(b0, b2), _mm512_add_ps(b1, b3));
+        float s0 = _mm512_reduce_add_ps(a0), s1 = _mm512_reduce_add_ps(b0);
+        for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
+        y[o] = s0;
+        y[o + 1] = s1;
+    }
+    if (o < out_dim) {
+        const uint16_t *w_row = W + (size_t)o * in_dim;
+        __m512 acc = _mm512_setzero_ps();
+        int k = 0;
+        for (; k + 16 <= in_dim; k += 16)
+            acc = _mm512_fmadd_ps(qwen_loadu_bf16_16(w_row + k), _mm512_loadu_ps(x + k), acc);
+        float sum = _mm512_reduce_add_ps(acc);
+        for (; k < in_dim; k++) sum += bf16_to_f32(w_row[k]) * x[k];
+        y[o] = sum;
+    }
+#elif defined(__ARM_NEON)
     /* Process 2 output rows at a time — x loaded once, reused for both rows */
     for (; o + 1 < out_dim; o += 2) {
         const uint16_t *w0 = W + (size_t)o * in_dim;
