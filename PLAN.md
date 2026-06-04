@@ -504,6 +504,29 @@ batch N requests -> each weight read is reused across all N (weight-stationary a
 ~Nx throughput. This is standard LLM continuous-batching. **Not a single-file latency win; a big
 multi-request server throughput win.** Re-analyze when optimizing the HTTP server for concurrency.
 
+### C. Break the single-stream autoregressive wall — speculative decode + contextual sparsity
+The status-quo breakers used by DeepSeek/Qwen3.6 MTP etc., applied to the CP. Both could win
+SINGLE-STREAM (unlike B which needs concurrent requests). Both gated on an empirical measurement.
+
+**C1. Self-speculative decoding on the CP.** A cheap DRAFT predicts all 15 codebooks fast (e.g.
+the CP run at q2 — the "death metal" build — or a tiny head); the real CP (int4/bf16) VERIFIES all
+15 in ONE batched pass (parallel over positions, like prefill — machinery already exists). Weight
+read amortized over 15 positions instead of 15 sequential reads = the cache/bandwidth win, on a
+single stream. Speedup = f(acceptance rate). Greedy needs exact argmax match; if the q2 draft
+diverges too much (we saw it does for audio quality) acceptance may be low. (NB: the CP is named
+"MTP" in-code but that's the residual predictor, NOT a spec-decode draft head — don't conflate.)
+
+**C2. Contextual sparsity (Deja Vu / PowerInfer style).** If only a fraction of the 3072 FFN
+intermediate neurons meaningfully fire per token, compute only those rows → fewer weight bytes
+read → bandwidth win, single-stream. Needs a cheap predictor of which neurons fire.
+
+**FIRST STEP = MEASURE viability before building either (cheap instrumentation):**
+1. FFN activation sparsity: what % of the 3072 intermediate neurons exceed an activation
+   threshold per token? (<~30% → C2 promising.)
+2. Draft acceptance: how often does CP-q2 argmax == CP-int4 argmax across the 15 codebooks?
+   (>~70% → C1 promising.)
+These two numbers decide which (if any) to build. Don't implement blind.
+
 ---
 
 ## References
