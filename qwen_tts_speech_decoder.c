@@ -35,6 +35,9 @@
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 /* aligned_malloc/aligned_calloc now in qwen_tts_kernels.h */
 
@@ -729,6 +732,25 @@ int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_fram
                     vst1q_f32(qh + i + half_hd, vmlaq_f32(vmulq_f32(q2, c), q1, si));
                     vst1q_f32(kh + i,           vmlsq_f32(vmulq_f32(k1, c), k2, si));
                     vst1q_f32(kh + i + half_hd, vmlaq_f32(vmulq_f32(k2, c), k1, si));
+                }
+                for (; i < half_hd; i++) {
+                    float qv1 = qh[i], qv2 = qh[i + half_hd];
+                    float kv1 = kh[i], kv2 = kh[i + half_hd];
+                    float co = cos_ptr[i], sn = sin_ptr[i];
+                    qh[i] = qv1 * co - qv2 * sn; qh[i + half_hd] = qv2 * co + qv1 * sn;
+                    kh[i] = kv1 * co - kv2 * sn; kh[i + half_hd] = kv2 * co + kv1 * sn;
+                }
+#elif defined(__AVX2__)
+                int i = 0;
+                for (; i + 8 <= half_hd; i += 8) {
+                    __m256 c = _mm256_loadu_ps(cos_ptr + i);
+                    __m256 si = _mm256_loadu_ps(sin_ptr + i);
+                    __m256 q1 = _mm256_loadu_ps(qh + i), q2 = _mm256_loadu_ps(qh + i + half_hd);
+                    __m256 k1 = _mm256_loadu_ps(kh + i), k2 = _mm256_loadu_ps(kh + i + half_hd);
+                    _mm256_storeu_ps(qh + i,           _mm256_fmsub_ps(q1, c, _mm256_mul_ps(q2, si)));
+                    _mm256_storeu_ps(qh + i + half_hd, _mm256_fmadd_ps(q2, c, _mm256_mul_ps(q1, si)));
+                    _mm256_storeu_ps(kh + i,           _mm256_fmsub_ps(k1, c, _mm256_mul_ps(k2, si)));
+                    _mm256_storeu_ps(kh + i + half_hd, _mm256_fmadd_ps(k2, c, _mm256_mul_ps(k1, si)));
                 }
                 for (; i < half_hd; i++) {
                     float qv1 = qh[i], qv2 = qh[i + half_hd];

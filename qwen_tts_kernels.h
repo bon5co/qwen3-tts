@@ -214,6 +214,7 @@ void qwen_snake_activation(float *data, int channels, int length,
  * ======================================================================== */
 
 int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, int out_dim);
+int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, int out_dim);
 
 #ifdef __cplusplus
 }

@@ -20,6 +20,9 @@
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 /* ========================================================================
  * CP micro-benchmark (compile with -DCP_MICROBENCH, e.g. `make cp-microbench`)
@@ -94,6 +97,15 @@ static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
         vst1q_u16(dst + i, vcombine_u16(lo, hi));
     }
     for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#elif defined(__AVX2__)
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m256i u = _mm256_srli_epi32(_mm256_castps_si256(_mm256_loadu_ps(src + i)), 16);
+        __m128i packed = _mm_packus_epi32(_mm256_castsi256_si128(u),
+                                          _mm256_extracti128_si256(u, 1));
+        _mm_storeu_si128((__m128i *)(dst + i), packed);
+    }
+    for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
 #else
     for (int64_t i = 0; i < n; i++) dst[i] = f32_to_bf16(src[i]);
 #endif
@@ -134,6 +146,21 @@ static void apply_rope_neox(float *x, int n_heads, int head_dim,
             float32x4_t v2 = vld1q_f32(xh + i + half);
             vst1q_f32(xh + i,        vmlsq_f32(vmulq_f32(v1, c), v2, s));
             vst1q_f32(xh + i + half, vmlaq_f32(vmulq_f32(v2, c), v1, s));
+        }
+        for (; i < half; i++) {
+            float x1 = xh[i], x2 = xh[i + half];
+            xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+            xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+        }
+#elif defined(__AVX2__)
+        int i = 0;
+        for (; i + 8 <= half; i += 8) {
+            __m256 c = _mm256_loadu_ps(cos_ptr + i);
+            __m256 s = _mm256_loadu_ps(sin_ptr + i);
+            __m256 v1 = _mm256_loadu_ps(xh + i);
+            __m256 v2 = _mm256_loadu_ps(xh + i + half);
+            _mm256_storeu_ps(xh + i,        _mm256_fmsub_ps(v1, c, _mm256_mul_ps(v2, s)));
+            _mm256_storeu_ps(xh + i + half, _mm256_fmadd_ps(v2, c, _mm256_mul_ps(v1, s)));
         }
         for (; i < half; i++) {
             float x1 = xh[i], x2 = xh[i + half];
@@ -186,6 +213,37 @@ void qwen_cp_quantize_int8(qwen_tts_ctx_t *ctx) {
         if (ctx->cp_lm_head_bf16[g])
             cp_qz(&ctx->cp_lm_head_int8[g], &ctx->cp_lm_head_scale[g],
                   ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h);
+}
+
+/* Alloc Q4_0 buffer if absent, then (re)quantize from the current bf16 pointer. */
+static void cp_qz_q4(q4_0_block_t **dst, const uint16_t *src, int rows, int cols) {
+    int bpr = cols / Q4_0_BLOCK_SIZE;
+    if (!*dst) *dst = (q4_0_block_t *)aligned_malloc((size_t)rows * bpr * sizeof(q4_0_block_t));
+    if (*dst) qwen_quantize_bf16_to_q4_0(src, rows, cols, *dst);
+}
+
+/* (Re)quantize Code Predictor weights (+ lm_heads) to Q4_0 from current bf16.
+ * This is THE bandwidth lever on memory-bound CPUs: q4 weights are ¼ the bytes of
+ * bf16, halving DRAM traffic vs int8 on the CP (re-read 16×/frame). --int4 only. */
+void qwen_cp_quantize_q4(qwen_tts_ctx_t *ctx) {
+    qwen_tts_config_t *c = &ctx->config;
+    if (!ctx->use_int4) return;
+    int cp_h = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
+    int cp_inter = c->cp_intermediate_size;
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        cp_qz_q4(&l->wq_q4, l->wq_bf16, cp_q_dim, cp_h);
+        cp_qz_q4(&l->wk_q4, l->wk_bf16, cp_kv_dim, cp_h);
+        cp_qz_q4(&l->wv_q4, l->wv_bf16, cp_kv_dim, cp_h);
+        cp_qz_q4(&l->wo_q4, l->wo_bf16, cp_h, cp_q_dim);
+        cp_qz_q4(&l->gate_up_fused_q4, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        cp_qz_q4(&l->down_q4, l->down_bf16, cp_h, cp_inter);
+    }
+    for (int g = 0; g < 15; g++)
+        if (ctx->cp_lm_head_bf16[g])
+            cp_qz_q4(&ctx->cp_lm_head_q4[g], ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h);
 }
 
 int qwen_cp_load(qwen_tts_ctx_t *ctx) {
@@ -315,10 +373,20 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
             fprintf(stderr, "  INT8 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
     }
 
+    /* Q4_0 quantization of CP weights (--int4). CP is the memory-bound bottleneck;
+     * q4 (¼ the bytes of bf16) is the biggest bandwidth lever on x86/CPU. */
+    if (ctx->use_int4) {
+        if (!ctx->silent)
+            fprintf(stderr, "  Quantizing CP weights to Q4_0 (--int4)...\n");
+        qwen_cp_quantize_q4(ctx);
+        if (!ctx->silent)
+            fprintf(stderr, "  Q4_0 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
+    }
+
     if (!ctx->silent)
         fprintf(stderr, "  Code Predictor: %d layers loaded, q_dim=%d kv_dim=%d%s\n",
                 c->cp_num_layers, cp_q_dim, cp_kv_dim,
-                ctx->use_int8 ? " [INT8]" : "");
+                ctx->use_int4 ? " [INT4]" : (ctx->use_int8 ? " [INT8]" : ""));
 
     return 0;
 }
@@ -341,7 +409,11 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     /* x_norm already contains RMSNorm(x) on entry */
 
     /* QKV projections (unified dispatch — single barrier for all 3) */
-    if (l->wq_int8) {
+    if (l->wq_q4) {
+        qwen_matvec_q4_0_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
+                              l->wq_q4, l->wk_q4, l->wv_q4,
+                              x_norm, cp_h, cp_q_dim, cp_kv_dim);
+    } else if (l->wq_int8) {
         qwen_matvec_int8_qkv(ctx->cp_dec_q, ctx->cp_dec_k, ctx->cp_dec_v,
                               l->wq_int8, l->wq_scale,
                               l->wk_int8, l->wk_scale,
@@ -381,7 +453,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_ATTN);
 
     /* Output projection */
-    if (l->wo_int8)
+    if (l->wo_q4)
+        qwen_matvec_q4_0(proj, l->wo_q4, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
+    else if (l->wo_int8)
         qwen_matvec_int8(proj, l->wo_int8, l->wo_scale, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
     else
         matvec_bf16(proj, l->wo_bf16, ctx->cp_dec_attn_out, cp_h, cp_q_dim);
@@ -392,7 +466,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_RESNORM);
 
     /* Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-    if (l->gate_up_fused_int8)
+    if (l->gate_up_fused_q4)
+        qwen_matvec_q4_0(ctx->cp_dec_gate, l->gate_up_fused_q4, x_norm, 2 * cp_inter, cp_h);
+    else if (l->gate_up_fused_int8)
         qwen_matvec_int8(ctx->cp_dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
                           x_norm, 2 * cp_inter, cp_h);
     else
@@ -402,7 +478,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_SWIGLU);
 
     /* Down projection */
-    if (l->down_int8)
+    if (l->down_q4)
+        qwen_matvec_q4_0(proj, l->down_q4, ctx->cp_dec_gate, cp_h, cp_inter);
+    else if (l->down_int8)
         qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
     else
         matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
@@ -490,7 +568,9 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
     /* Predict codebook 1: fused argmax+matvec (greedy — avoids writing 2048 logits) */
     qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-    if (ctx->cp_lm_head_int8[0])
+    if (ctx->cp_lm_head_q4[0])
+        out_codes[0] = qwen_argmax_matvec_q4_0(cp_normed, ctx->cp_lm_head_q4[0], cp_h, c->codebook_size);
+    else if (ctx->cp_lm_head_int8[0])
         out_codes[0] = qwen_argmax_matvec_int8(cp_normed, ctx->cp_lm_head_int8[0],
                                                 ctx->cp_lm_head_scale[0], cp_h, c->codebook_size);
     else
@@ -518,7 +598,9 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
         /* Fused argmax+matvec (greedy) */
         qwen_rms_norm(cp_normed, cp_x, ctx->cp_norm, 1, cp_h, c->rms_norm_eps);
-        if (ctx->cp_lm_head_int8[g])
+        if (ctx->cp_lm_head_q4[g])
+            out_codes[g] = qwen_argmax_matvec_q4_0(cp_normed, ctx->cp_lm_head_q4[g], cp_h, c->codebook_size);
+        else if (ctx->cp_lm_head_int8[g])
             out_codes[g] = qwen_argmax_matvec_int8(cp_normed, ctx->cp_lm_head_int8[g],
                                                     ctx->cp_lm_head_scale[g], cp_h, c->codebook_size);
         else

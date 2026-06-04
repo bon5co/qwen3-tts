@@ -88,8 +88,8 @@ void qwen_caps_report(void *out) {
 #else
     fprintf(f, "  arch:             (other)\n");
 #endif
-    /* Hot path: bf16/int8/q4 matvecs + attention (~90%% of decode). NEON-or-scalar —
-     * there is NO AVX2 branch for these today (only rms_norm + bf16 conv have AVX2). */
+    /* Hot path: bf16/int8/q4 matvecs + attention (~90%% of decode). Both NEON and
+     * AVX2 are full 2-row, multi-accumulator, prefetching kernels (PLAN 21.3). */
 #ifdef __ARM_NEON
     fprintf(f, "  matvec + attn:    NEON (2-row fused)\n");
 #elif defined(__AVX2__)
@@ -409,23 +409,42 @@ static inline __m256 qwen_loadu_bf16_8(const uint16_t *p) {
     __m128i b = _mm_loadu_si128((const __m128i *)p);
     return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(b), 16));
 }
-/* f32 dot product, AVX2/FMA with scalar tail (attention score). */
+/* Load 8 int8 and widen to f32 (sign-extended). */
+static inline __m256 qwen_loadu_s8_8(const int8_t *p) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)p)));
+}
+/* f32 dot product, AVX2/FMA with scalar tail (attention score).
+ * 4 accumulators (32 elem/iter) so the FMA reduction isn't latency-bound. */
 static inline float qwen_dot_f32_avx2(const float *a, const float *b, int n) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps(),
+           c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
     int d = 0;
+    for (; d + 32 <= n; d += 32) {
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d),      _mm256_loadu_ps(b + d),      c0);
+        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d + 8),  _mm256_loadu_ps(b + d + 8),  c1);
+        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d + 16), _mm256_loadu_ps(b + d + 16), c2);
+        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d + 24), _mm256_loadu_ps(b + d + 24), c3);
+    }
     for (; d + 8 <= n; d += 8)
-        acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), acc);
-    float s = qwen_hsum256_ps(acc);
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), c0);
+    float s = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(c0, c2), _mm256_add_ps(c1, c3)));
     for (; d < n; d++) s += a[d] * b[d];
     return s;
 }
 /* q·(bf16 k) dot product, AVX2/FMA with scalar tail (bf16-KV attention score). */
 static inline float qwen_dot_f32_bf16_avx2(const float *q, const uint16_t *k, int n) {
-    __m256 acc = _mm256_setzero_ps();
+    __m256 c0 = _mm256_setzero_ps(), c1 = _mm256_setzero_ps(),
+           c2 = _mm256_setzero_ps(), c3 = _mm256_setzero_ps();
     int d = 0;
+    for (; d + 32 <= n; d += 32) {
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(q + d),      qwen_loadu_bf16_8(k + d),      c0);
+        c1 = _mm256_fmadd_ps(_mm256_loadu_ps(q + d + 8),  qwen_loadu_bf16_8(k + d + 8),  c1);
+        c2 = _mm256_fmadd_ps(_mm256_loadu_ps(q + d + 16), qwen_loadu_bf16_8(k + d + 16), c2);
+        c3 = _mm256_fmadd_ps(_mm256_loadu_ps(q + d + 24), qwen_loadu_bf16_8(k + d + 24), c3);
+    }
     for (; d + 8 <= n; d += 8)
-        acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + d), qwen_loadu_bf16_8(k + d), acc);
-    float s = qwen_hsum256_ps(acc);
+        c0 = _mm256_fmadd_ps(_mm256_loadu_ps(q + d), qwen_loadu_bf16_8(k + d), c0);
+    float s = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(c0, c2), _mm256_add_ps(c1, c3)));
     for (; d < n; d++) s += q[d] * bf16_to_f32(k[d]);
     return s;
 }
@@ -563,29 +582,63 @@ static void bf16_matvec_fused(float *y, const float *x, const uint16_t *W,
         y[o] = sum;
     }
 #elif defined(__AVX2__)
-    /* AVX2: 2 output rows at a time, 8 f32 elements/iter, FMA */
+    /* AVX2: 2 output rows at a time, 32 f32 elem/iter, 4 __m256 accumulators per
+     * row (8 independent FMA chains) to hide the ~4-cycle FMA latency, + prefetch.
+     * Mirrors the NEON path above — a single accumulator chain is latency-bound. */
     for (; o + 1 < out_dim; o += 2) {
         const uint16_t *w0 = W + (size_t)o * in_dim;
         const uint16_t *w1 = W + (size_t)(o + 1) * in_dim;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        /* Prefetch next 2 rows well ahead for the memory controller */
+        if (o + 5 < out_dim) {
+            const uint16_t *pf0 = W + (size_t)(o + 4) * in_dim;
+            const uint16_t *pf1 = W + (size_t)(o + 5) * in_dim;
+            __builtin_prefetch(pf0, 0, 0);
+            __builtin_prefetch(pf0 + 64, 0, 0);
+            __builtin_prefetch(pf1, 0, 0);
+            __builtin_prefetch(pf1 + 64, 0, 0);
+        }
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
+               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps(),
+               b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 32 <= in_dim; k += 32) {
+            __m256 x0 = _mm256_loadu_ps(x + k);
+            __m256 x1 = _mm256_loadu_ps(x + k + 8);
+            __m256 x2 = _mm256_loadu_ps(x + k + 16);
+            __m256 x3 = _mm256_loadu_ps(x + k + 24);
+            a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k),      x0, a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 8),  x1, a1);
+            a2 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 16), x2, a2);
+            a3 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 24), x3, a3);
+            b0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k),      x0, b0);
+            b1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 8),  x1, b1);
+            b2 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 16), x2, b2);
+            b3 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 24), x3, b3);
+        }
         for (; k + 8 <= in_dim; k += 8) {
             __m256 xv = _mm256_loadu_ps(x + k);
             a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k), xv, a0);
-            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, a1);
+            b0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, b0);
         }
-        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        a0 = _mm256_add_ps(_mm256_add_ps(a0, a2), _mm256_add_ps(a1, a3));
+        b0 = _mm256_add_ps(_mm256_add_ps(b0, b2), _mm256_add_ps(b1, b3));
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(b0);
         for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
         y[o] = s0;
         y[o + 1] = s1;
     }
     if (o < out_dim) {
         const uint16_t *w_row = W + (size_t)o * in_dim;
-        __m256 acc = _mm256_setzero_ps();
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 16 <= in_dim; k += 16) {
+            acc0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w_row + k),     _mm256_loadu_ps(x + k),     acc0);
+            acc1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w_row + k + 8), _mm256_loadu_ps(x + k + 8), acc1);
+        }
         for (; k + 8 <= in_dim; k += 8)
-            acc = _mm256_fmadd_ps(qwen_loadu_bf16_8(w_row + k), _mm256_loadu_ps(x + k), acc);
-        float sum = qwen_hsum256_ps(acc);
+            acc0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w_row + k), _mm256_loadu_ps(x + k), acc0);
+        float sum = qwen_hsum256_ps(_mm256_add_ps(acc0, acc1));
         for (; k < in_dim; k++) sum += bf16_to_f32(w_row[k]) * x[k];
         y[o] = sum;
     }
@@ -870,32 +923,57 @@ static void int8_matvec_fused(float *y, const float *x, const int8_t *W,
         y[o] = sum * scale[o];
     }
 #elif defined(__AVX2__)
-    /* AVX2: 2 rows at a time, 8 int8 widened to f32/iter, FMA */
+    /* AVX2: 2 rows at a time, 32 int8/iter, 4 __m256 accumulators per row (8 chains)
+     * + prefetch — mirrors the NEON path so x86 hides FMA latency too. */
     for (; o + 1 < out_dim; o += 2) {
         const int8_t *w0 = W + (size_t)o * in_dim;
         const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        if (o + 5 < out_dim) {
+            __builtin_prefetch(W + (size_t)(o + 4) * in_dim, 0, 0);
+            __builtin_prefetch(W + (size_t)(o + 5) * in_dim, 0, 0);
+        }
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
+               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps(),
+               b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 32 <= in_dim; k += 32) {
+            __m256 x0 = _mm256_loadu_ps(x + k);
+            __m256 x1 = _mm256_loadu_ps(x + k + 8);
+            __m256 x2 = _mm256_loadu_ps(x + k + 16);
+            __m256 x3 = _mm256_loadu_ps(x + k + 24);
+            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w0 + k),      x0, a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_s8_8(w0 + k + 8),  x1, a1);
+            a2 = _mm256_fmadd_ps(qwen_loadu_s8_8(w0 + k + 16), x2, a2);
+            a3 = _mm256_fmadd_ps(qwen_loadu_s8_8(w0 + k + 24), x3, a3);
+            b0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w1 + k),      x0, b0);
+            b1 = _mm256_fmadd_ps(qwen_loadu_s8_8(w1 + k + 8),  x1, b1);
+            b2 = _mm256_fmadd_ps(qwen_loadu_s8_8(w1 + k + 16), x2, b2);
+            b3 = _mm256_fmadd_ps(qwen_loadu_s8_8(w1 + k + 24), x3, b3);
+        }
         for (; k + 8 <= in_dim; k += 8) {
             __m256 xv = _mm256_loadu_ps(x + k);
-            __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(w0 + k))));
-            __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64((const __m128i *)(w1 + k))));
-            a0 = _mm256_fmadd_ps(f0, xv, a0);
-            a1 = _mm256_fmadd_ps(f1, xv, a1);
+            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w0 + k), xv, a0);
+            b0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w1 + k), xv, b0);
         }
-        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        a0 = _mm256_add_ps(_mm256_add_ps(a0, a2), _mm256_add_ps(a1, a3));
+        b0 = _mm256_add_ps(_mm256_add_ps(b0, b2), _mm256_add_ps(b1, b3));
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(b0);
         for (; k < in_dim; k++) { s0 += (float)w0[k] * x[k]; s1 += (float)w1[k] * x[k]; }
         y[o] = s0 * scale[o];
         y[o + 1] = s1 * scale[o + 1];
     }
     if (o < out_dim) {
         const int8_t *w_row = W + (size_t)o * in_dim;
-        __m256 acc = _mm256_setzero_ps();
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 16 <= in_dim; k += 16) {
+            acc0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w_row + k),     _mm256_loadu_ps(x + k),     acc0);
+            acc1 = _mm256_fmadd_ps(qwen_loadu_s8_8(w_row + k + 8), _mm256_loadu_ps(x + k + 8), acc1);
+        }
         for (; k + 8 <= in_dim; k += 8)
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                      _mm_loadl_epi64((const __m128i *)(w_row + k)))), _mm256_loadu_ps(x + k), acc);
-        float sum = qwen_hsum256_ps(acc);
+            acc0 = _mm256_fmadd_ps(qwen_loadu_s8_8(w_row + k), _mm256_loadu_ps(x + k), acc0);
+        float sum = qwen_hsum256_ps(_mm256_add_ps(acc0, acc1));
         for (; k < in_dim; k++) sum += (float)w_row[k] * x[k];
         y[o] = sum * scale[o];
     }
@@ -1067,12 +1145,18 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
         sum = vaddvq_f32(vaddq_f32(a0, a1));
         for (; k < in_dim; k++) sum += (float)row[k] * x[k];
 #elif defined(__AVX2__)
-        __m256 acc = _mm256_setzero_ps();
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
+               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 32 <= in_dim; k += 32) {
+            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k),      _mm256_loadu_ps(x + k),      a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 8),  _mm256_loadu_ps(x + k + 8),  a1);
+            a2 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 16), _mm256_loadu_ps(x + k + 16), a2);
+            a3 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k + 24), _mm256_loadu_ps(x + k + 24), a3);
+        }
         for (; k + 8 <= in_dim; k += 8)
-            acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
-                      _mm_loadl_epi64((const __m128i *)(row + k)))), _mm256_loadu_ps(x + k), acc);
-        sum = qwen_hsum256_ps(acc);
+            a0 = _mm256_fmadd_ps(qwen_loadu_s8_8(row + k), _mm256_loadu_ps(x + k), a0);
+        sum = qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(a0, a2), _mm256_add_ps(a1, a3)));
         for (; k < in_dim; k++) sum += (float)row[k] * x[k];
 #else
         for (int k = 0; k < in_dim; k++) sum += (float)row[k] * x[k];
@@ -1080,6 +1164,21 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
         sum *= scale[o];
         if (sum > best_val) { best_val = sum; best = o; }
     }
+    return best;
+}
+
+/* Argmax over a Q4_0 matvec (CP lm_head with --int4). Reuses the optimized
+ * (multi-threaded, SIMD) q4_0 matvec into a small scratch buffer, then argmaxes.
+ * The scratch malloc (codebook_size floats, ~8KB) is negligible vs the matvec. */
+int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, int out_dim) {
+    float *y = (float *)malloc((size_t)out_dim * sizeof(float));
+    if (!y) return 0;
+    qwen_matvec_q4_0(y, W, x, out_dim, in_dim);
+    int best = 0;
+    float best_val = y[0];
+    for (int o = 1; o < out_dim; o++)
+        if (y[o] > best_val) { best_val = y[o]; best = o; }
+    free(y);
     return best;
 }
 
@@ -1179,6 +1278,10 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             sum += vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
         }
 #elif defined(__AVX2__)
+        /* 4 independent accumulators across the whole row (one per quarter-block)
+         * so the FMAs aren't serialized into one latency-bound chain. */
+        __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps(),
+               acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
         for (int b = 0; b < blocks_per_row; b++) {
             float scale = row[b].scale;
             const uint8_t *qs = row[b].qs;
@@ -1194,12 +1297,12 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
             __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(il0, 8)));
             __m256 f2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(il1));
             __m256 f3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(il1, 8)));
-            __m256 acc = _mm256_mul_ps(_mm256_mul_ps(f0, vs), _mm256_loadu_ps(xb));
-            acc = _mm256_fmadd_ps(_mm256_mul_ps(f1, vs), _mm256_loadu_ps(xb + 8), acc);
-            acc = _mm256_fmadd_ps(_mm256_mul_ps(f2, vs), _mm256_loadu_ps(xb + 16), acc);
-            acc = _mm256_fmadd_ps(_mm256_mul_ps(f3, vs), _mm256_loadu_ps(xb + 24), acc);
-            sum += qwen_hsum256_ps(acc);
+            acc0 = _mm256_fmadd_ps(_mm256_mul_ps(f0, vs), _mm256_loadu_ps(xb),      acc0);
+            acc1 = _mm256_fmadd_ps(_mm256_mul_ps(f1, vs), _mm256_loadu_ps(xb + 8),  acc1);
+            acc2 = _mm256_fmadd_ps(_mm256_mul_ps(f2, vs), _mm256_loadu_ps(xb + 16), acc2);
+            acc3 = _mm256_fmadd_ps(_mm256_mul_ps(f3, vs), _mm256_loadu_ps(xb + 24), acc3);
         }
+        sum += qwen_hsum256_ps(_mm256_add_ps(_mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3)));
 #else
         for (int b = 0; b < blocks_per_row; b++) {
             float scale = row[b].scale;
@@ -1844,6 +1947,28 @@ void qwen_snake_activation(float *data, int channels, int length,
                 row[t] += inv_b * s * s;
             }
         }
+#elif defined(__AVX2__)
+        {
+            __m256 va = _mm256_set1_ps(a);
+            __m256 vinv_b = _mm256_set1_ps(inv_b);
+            int t = 0;
+            for (; t + 8 <= length; t += 8) {
+                __m256 x = _mm256_loadu_ps(row + t);
+                __m256 ax = _mm256_mul_ps(va, x);
+                /* Scalar sinf per lane (no AVX2 sin intrinsic), vectorize the rest */
+                float ax_s[8]; _mm256_storeu_ps(ax_s, ax);
+                float s_arr[8] = { sinf(ax_s[0]), sinf(ax_s[1]), sinf(ax_s[2]), sinf(ax_s[3]),
+                                   sinf(ax_s[4]), sinf(ax_s[5]), sinf(ax_s[6]), sinf(ax_s[7]) };
+                __m256 s = _mm256_loadu_ps(s_arr);
+                __m256 s2 = _mm256_mul_ps(s, s);
+                x = _mm256_fmadd_ps(vinv_b, s2, x);
+                _mm256_storeu_ps(row + t, x);
+            }
+            for (; t < length; t++) {
+                float s = sinf(a * row[t]);
+                row[t] += inv_b * s * s;
+            }
+        }
 #else
         for (int t = 0; t < length; t++) {
             float s = sinf(a * row[t]);
@@ -1954,17 +2079,41 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, 
         if (s1 > best_val) { best_val = s1; best_idx = o + 1; }
     }
 #elif defined(__AVX2__)
+    /* 2 rows × 4 __m256 accumulators (8 chains), 32 elem/iter, + prefetch — NEON parity. */
     for (; o + 1 < out_dim; o += 2) {
         const uint16_t *w0 = W_bf16 + (size_t)o * in_dim;
         const uint16_t *w1 = W_bf16 + (size_t)(o + 1) * in_dim;
-        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+        if (o + 5 < out_dim) {
+            __builtin_prefetch(W_bf16 + (size_t)(o + 4) * in_dim, 0, 0);
+            __builtin_prefetch(W_bf16 + (size_t)(o + 5) * in_dim, 0, 0);
+        }
+        __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps(),
+               a2 = _mm256_setzero_ps(), a3 = _mm256_setzero_ps();
+        __m256 b0 = _mm256_setzero_ps(), b1 = _mm256_setzero_ps(),
+               b2 = _mm256_setzero_ps(), b3 = _mm256_setzero_ps();
         int k = 0;
+        for (; k + 32 <= in_dim; k += 32) {
+            __m256 x0 = _mm256_loadu_ps(x + k);
+            __m256 x1 = _mm256_loadu_ps(x + k + 8);
+            __m256 x2 = _mm256_loadu_ps(x + k + 16);
+            __m256 x3 = _mm256_loadu_ps(x + k + 24);
+            a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k),      x0, a0);
+            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 8),  x1, a1);
+            a2 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 16), x2, a2);
+            a3 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k + 24), x3, a3);
+            b0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k),      x0, b0);
+            b1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 8),  x1, b1);
+            b2 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 16), x2, b2);
+            b3 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k + 24), x3, b3);
+        }
         for (; k + 8 <= in_dim; k += 8) {
             __m256 xv = _mm256_loadu_ps(x + k);
             a0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w0 + k), xv, a0);
-            a1 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, a1);
+            b0 = _mm256_fmadd_ps(qwen_loadu_bf16_8(w1 + k), xv, b0);
         }
-        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(a1);
+        a0 = _mm256_add_ps(_mm256_add_ps(a0, a2), _mm256_add_ps(a1, a3));
+        b0 = _mm256_add_ps(_mm256_add_ps(b0, b2), _mm256_add_ps(b1, b3));
+        float s0 = qwen_hsum256_ps(a0), s1 = qwen_hsum256_ps(b0);
         for (; k < in_dim; k++) { s0 += bf16_to_f32(w0[k]) * x[k]; s1 += bf16_to_f32(w1[k]) * x[k]; }
         if (s0 > best_val) { best_val = s0; best_idx = o; }
         if (s1 > best_val) { best_val = s1; best_idx = o + 1; }

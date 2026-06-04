@@ -21,6 +21,9 @@
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 
 #ifdef USE_BLAS
 #ifdef __APPLE__
@@ -73,6 +76,16 @@ static void f32_to_bf16_vec(uint16_t *dst, const float *src, int64_t n) {
         vst1q_u16(dst + i, vcombine_u16(lo, hi));
     }
     for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
+#elif defined(__AVX2__)
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        /* Truncate each f32 to its top 16 bits (bf16), then pack 8×u32 -> 8×u16 */
+        __m256i u = _mm256_srli_epi32(_mm256_castps_si256(_mm256_loadu_ps(src + i)), 16);
+        __m128i packed = _mm_packus_epi32(_mm256_castsi256_si128(u),
+                                          _mm256_extracti128_si256(u, 1));
+        _mm_storeu_si128((__m128i *)(dst + i), packed);
+    }
+    for (; i < n; i++) dst[i] = f32_to_bf16(src[i]);
 #else
     for (int64_t i = 0; i < n; i++) dst[i] = f32_to_bf16(src[i]);
 #endif
@@ -88,6 +101,14 @@ static void bf16_to_f32_matrix(float *dst, const uint16_t *src, int64_t n) {
         uint32x4_t hi = vshll_n_u16(vget_high_u16(v), 16);
         vst1q_f32(dst + i,     vreinterpretq_f32_u32(lo));
         vst1q_f32(dst + i + 4, vreinterpretq_f32_u32(hi));
+    }
+    for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
+#elif defined(__AVX2__)
+    int64_t i = 0;
+    for (; i + 7 < n; i += 8) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
+        __m256i w = _mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16);
+        _mm256_storeu_ps(dst + i, _mm256_castsi256_ps(w));
     }
     for (; i < n; i++) dst[i] = bf16_to_f32(src[i]);
 #else
@@ -122,6 +143,21 @@ static void apply_rope_neox_inplace(float *x, int n_heads, int head_dim,
             float32x4_t v2 = vld1q_f32(xh + i + half);
             vst1q_f32(xh + i,        vmlsq_f32(vmulq_f32(v1, c), v2, s));
             vst1q_f32(xh + i + half, vmlaq_f32(vmulq_f32(v2, c), v1, s));
+        }
+        for (; i < half; i++) {
+            float x1 = xh[i], x2 = xh[i + half];
+            xh[i]        = x1 * cos_ptr[i] - x2 * sin_ptr[i];
+            xh[i + half] = x2 * cos_ptr[i] + x1 * sin_ptr[i];
+        }
+#elif defined(__AVX2__)
+        int i = 0;
+        for (; i + 8 <= half; i += 8) {
+            __m256 c = _mm256_loadu_ps(cos_ptr + i);
+            __m256 s = _mm256_loadu_ps(sin_ptr + i);
+            __m256 v1 = _mm256_loadu_ps(xh + i);
+            __m256 v2 = _mm256_loadu_ps(xh + i + half);
+            _mm256_storeu_ps(xh + i,        _mm256_fmsub_ps(v1, c, _mm256_mul_ps(v2, s)));
+            _mm256_storeu_ps(xh + i + half, _mm256_fmadd_ps(v2, c, _mm256_mul_ps(v1, s)));
         }
         for (; i < half; i++) {
             float x1 = xh[i], x2 = xh[i + half];

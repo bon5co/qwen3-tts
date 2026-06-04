@@ -208,6 +208,14 @@ typedef struct {
     float  *gate_up_fused_scale; /* [2*inter] */
     int8_t *down_int8;         /* [hidden, inter] */
     float  *down_scale;        /* [hidden] */
+
+    /* Q4_0 quantized weights (optional, allocated if --int4 flag is set) */
+    q4_0_block_t *wq_q4;              /* [q_dim, hidden/32 blocks] */
+    q4_0_block_t *wk_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wv_q4;              /* [kv_dim, hidden/32 blocks] */
+    q4_0_block_t *wo_q4;              /* [hidden, q_dim/32 blocks] */
+    q4_0_block_t *gate_up_fused_q4;   /* [2*inter, hidden/32 blocks] */
+    q4_0_block_t *down_q4;            /* [hidden, inter/32 blocks] */
 } qwen_cp_layer_t;
 
 /* ========================================================================
@@ -431,6 +439,7 @@ typedef struct qwen_tts_ctx {
     uint16_t *cp_lm_head_bf16[15];    /* 15 × [codebook_size, cp_hidden] */
     int8_t   *cp_lm_head_int8[15];   /* INT8 quantized lm_head (optional) */
     float    *cp_lm_head_scale[15];  /* per-row scales for INT8 lm_head */
+    q4_0_block_t *cp_lm_head_q4[15]; /* Q4_0 quantized lm_head (optional, --int4) */
     int cp_emb_dim;                   /* embedding dim: talker_hidden for 1.7B, cp_hidden for 0.6B */
     uint16_t *cp_mtp_proj_bf16;       /* [cp_hidden, talker_hidden] or NULL if same size */
     float *cp_mtp_proj_bias;          /* [cp_hidden] or NULL */

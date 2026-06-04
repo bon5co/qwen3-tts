@@ -272,7 +272,7 @@ make bench-full    # Full: + server, instruct, INT8, .qvoice (if available)
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
 | [Performance](docs/performance.md) | RTF benchmarks, component breakdown, CPU vs GPU, optimization history |
-| [Building](docs/building.md) | All platforms, build targets, testing |
+| [Building](docs/building.md) | All platforms, build targets, testing (golden-reference test needs Python + `librosa`) |
 
 ### Blog Posts
 
