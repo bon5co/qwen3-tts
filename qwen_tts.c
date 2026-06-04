@@ -1192,6 +1192,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * a free-running comparison meaningless; this isolates it. NULL → normal synth. */
     int   *tf_codes = NULL;     /* nframes × 16 reference codes */
     int    tf_nframes = 0;
+    FILE  *code0_fp = NULL;     /* QWEN_DUMP_CODE0: Talker's greedy code0 prediction per frame */
+    {
+        const char *c0p = getenv("QWEN_DUMP_CODE0");
+        if (c0p && *c0p) code0_fp = fopen(c0p, "w");
+    }
     {
         const char *tfp = getenv("QWEN_TF_CODES");
         if (tfp && *tfp) {
@@ -1293,6 +1298,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                                      frame_temp, frame_top_k, ctx->top_p,
                                      ctx->rep_penalty, ctx->prev_tokens, ctx->n_prev_tokens);
 
+        /* Quant-ladder: record the Talker's would-be code0 prediction (greedy, this is
+         * pre-override). vs the bf16 reference code0 column → Talker quant sensitivity on
+         * the WORDS. In TF mode last_hidden is on the bf16 rails, so this isolates it. */
+        if (code0_fp) fprintf(code0_fp, "%d\n", code0);
+
         /* Teacher-forcing replay: ride the reference rails (code0 + CP feedback). */
         if (tf_codes) {
             if (frame >= tf_nframes) break;
@@ -1386,6 +1396,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     free(step_embed);
     free(last_hidden);
     if (tf_codes) { free(tf_codes); ctx->tf_ref_codes = NULL; }
+    if (code0_fp) fclose(code0_fp);
 
     double t_talker_end = time_ms();
     double t_total_gen = t_talker_end - t_prefill - prefill_ms;

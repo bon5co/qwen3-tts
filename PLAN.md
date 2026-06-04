@@ -570,6 +570,76 @@ Caveat: teacher-forcing fixes the TOKEN feedback but each precision still builds
 KV cache, so per-codebook drift conflates step sensitivity + intra-frame KV accumulation (realistic,
 but not a pure per-step isolate). Good enough for the decisions above.
 
+**DECOMPOSITION EXPERIMENTS — ✅ DONE 2026-06-04 (commit pending; env knobs QWEN_TALKER_PREC /
+QWEN_CP_LMHEAD_PREC / QWEN_CP_LAYER_PREC / QWEN_DUMP_CODE0; script `/tmp/ql_decomp.sh`).**
+Tested the user's "low-bit early codebooks / high-bit late delicate ones" hybrid hypothesis. Verdict:
+**the hybrid has NO sweet spot — the int4 cost is in the SHARED transformer, spread evenly.**
+
+- **Talker int4 → code0 (= the WORDS) agreement 92.97% vs bf16** (teacher-forced). int4 on the Talker
+  FLIPS ~7% of word tokens → confirms the workflow's #1 blind spot: **keep the Talker ≥ int8 for
+  intelligibility.** (int8 on the 0.6B Talker is gated off at hidden<2048; needs 1.7B or gate bypass.)
+- **Exp1 — drift is in the shared transformer, NOT the lm_heads.** Full int4 = 46%; int4-transformer +
+  bf16-lm_heads = 48% (keeping heads precise recovers only +2%); **bf16-transformer + int4-lm_heads =
+  84%** (the 15 lm_heads TOLERATE int4 fine). So the ONLY per-codebook weights (the heads) are not the
+  problem → "keep late codebooks precise" = keep late heads precise = +2%, useless.
+- **Exp2 — all 5 CP layers contribute ~equally** (one-layer-int4: L0 72%, L1 72%, L2 71%, L3 71%,
+  L4 69%). No sacrificial layer; degradation compounds ≈multiplicatively (5 layers → 46%). Per-layer
+  mix = smooth linear speed/quality trade, not a win.
+
+**Consequences for the quant roadmap:**
+- **int8 is the quality floor.** int4 on the CP transformer is unrecoverable via per-codebook (heads
+  aren't the driver) or per-layer (all equal) tricks. DeepSeek-style per-tensor mix has no obvious
+  CP sweet spot — the cost is in the shared FFN/attn.
+- **Only safe low-bit hybrid: int4 on the 15 lm_heads** (84% agreement) → memory saving (60→15 MB),
+  but heads are 4.3% of CP time → negligible speed. Marginal, clean, optional.
+- **Speed must come from compute throughput, not byte-cutting:** the CP is COMPUTE-bound after
+  SDOT (the workflow corrected our "bandwidth-bound" framing — int8 weight → one vdotq_s32 vs
+  dequant+FMA×8, so the FMA reduction is the limiter; int4's 1-row q4 kernel made x-loads the new
+  bottleneck = why int4 lost). Levers: SDOT (done, ARM), VNNI (x86, written/unvalidated), SDOT on
+  `argmax_matvec_int8` (CP lm_heads still on f32 dequant → easy ~−20% on the 4.3% slice), 2-row-fuse
+  the q4_0 kernel (separate the architecture penalty from the −26% true quality floor).
+
+---
+
+## End-to-end leverage map (workflow `qwen-tts-flow-map`, 6 agents, 2026-06-04)
+
+A multi-agent static map of the whole pipeline (Talker / CP / decoder / conditioning / kernels),
+spot-verified against source. Condensed; full synthesis in session transcript.
+
+**Byte & time budget per frame (12.5 Hz → 80 ms audio/frame, 0.6B/M1):**
+| Stage | re-reads/frame | time share | bound |
+|---|---|---|---|
+| **Code Predictor** | 30 MB transformer re-read **15×** + 15 lm_heads 1× | **74–90% (~76 ms/f)** | bandwidth at bf16 → **compute at int8+SDOT** |
+| Talker (code0=words) | 28 layers 1×; codec_head 1×; KV pos+1 | 9–15% (~25 ms/f) | compute |
+| Speech decoder | conv ~80 MB f32 1× on drain | 5–8% non-stream, ~0% streamed (overlapped pthread) | conv-bound, off critical path |
+| Conditioning/prompt | prefill-amortized | negligible/frame | — |
+
+**Quant-sensitivity ranking (most → least fragile):** (1) Talker code0 path (codec_head bf16 but its
+input quantized — HIGH, now measured: int4 flips ~7% words); (2) CP late codebooks c11-15 (HIGH,
+measured); (3) CP FFN gate_up/down = 53% of CP time + the causal driver of per-codebook drift + the
+q2 "roughness" effect (HIGH); (4) CP attn q/k/v/o (MEDIUM); (5) Talker bf16 KV (MEDIUM); (6) decoder
+ConvNeXt pw1/pw2 if ever quantized (MEDIUM-HIGH, currently f32); (7) embeddings + all norms (LOW —
+keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligibility.**
+
+**Speed levers (ranked):** SDOT (validated, ARM) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
+x86 is scalar+single-thread today, the #1 unblock)** · 2-row-fuse q4_0 · SDOT on argmax_matvec_int8 ·
+fuse codec_head into final Talker wo · vectorize RoPE + online-softmax attn accumulators (scalar today)
+· server continuous-batching (throughput only). **Refuted:** int4-Q4_0 global on CP, self-speculative
+(marginal), contextual sparsity (CP FFN dense).
+
+**Prosody/instruct knobs (ranked, concrete):** (1) `--roughness` = bf16↔q2 blend on CP `down`
+(code_predictor.c FFN); (2) steerable prosody vector added to `cp_x` BEFORE CP layer 0 (the single
+Talker→CP injection point, `cp_mtp_project`); (3) instruct→CP control vector `diff(neutral−angry)`
+injected scaled (amplifies the architecturally-weak instruct); (4) per-codebook weights on the CP-code
+feedback sum into the next Talker step (`qwen_tts.c:1300`, currently flat sum); (5) speaker_scale on the
+voice-clone ECAPA norm-match; (6) per-step instruct re-injection decayed across codebook steps.
+
+**Open questions still needing measurement:** intrinsic-vs-KV-accumulation isolate (bf16 KV +
+quantized matvec only); `--roughness`/q2 generalization across speakers×langs×models;
+do CP layer-wise emotion directions exist (dump neutral-vs-angry activations); x86/VNNI runtime
+correctness + RTF (Ryzen box); 2-row q4_0 true quality floor; decoder bf16 (cheapest unmeasured
+DRAM saving, 80 MB f32 → no quant infra yet).
+
 ---
 
 ## References

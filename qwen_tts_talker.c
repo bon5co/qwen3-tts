@@ -312,17 +312,35 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
         #undef LOAD_F32
     }
 
+    /* Talker precision normally follows --int8/--int4. QWEN_TALKER_PREC={bf16|int8|int4}
+     * DECOUPLES it from the CP so the quant-ladder can hold the CP at bf16 and vary ONLY
+     * the Talker — measuring how much Talker quant moves code0 (= the WORDS). No env →
+     * unchanged behavior. (int8 still no-ops on 0.6B per the hidden>=2048 gate below.) */
+    int tk_do_int8 = ctx->use_int8;
+    int tk_do_int4 = ctx->use_int4;
+    const char *tk_prec = getenv("QWEN_TALKER_PREC");
+    if (tk_prec && *tk_prec) {
+        tk_do_int8 = !strcmp(tk_prec, "int8");
+        tk_do_int4 = !strcmp(tk_prec, "int4");
+        if (!ctx->silent)
+            fprintf(stderr, "  [QWEN_TALKER_PREC=%s] Talker precision decoupled from CP\n", tk_prec);
+    }
+
     /* INT8 quantization of Talker weights (--int8; 1.7B only, hidden>=2048).
      * Extracted into qwen_talker_quantize_int8() so it can be re-run after a
      * WDELTA voice override (re-quantize the Base weights, not stale CV ones). */
-    if (ctx->use_int8 && c->hidden_size >= 2048 && !ctx->silent)
-        fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
-    qwen_talker_quantize_int8(ctx);
-    if (ctx->use_int8 && c->hidden_size >= 2048 && !ctx->silent)
-        fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
+    if (tk_do_int8) {
+        int save = ctx->use_int8; ctx->use_int8 = 1;
+        if (c->hidden_size >= 2048 && !ctx->silent)
+            fprintf(stderr, "  Quantizing Talker weights to INT8 (per-row absmax)...\n");
+        qwen_talker_quantize_int8(ctx);
+        ctx->use_int8 = save;
+        if (c->hidden_size >= 2048 && !ctx->silent)
+            fprintf(stderr, "  Talker INT8 quantization done (%d layers)\n", c->num_layers);
+    }
 
     /* Q4_0 quantization of Talker weights (optional, enabled by --int4 flag) */
-    if (ctx->use_int4) {
+    if (tk_do_int4) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing Talker weights to Q4_0 (4-bit)...\n");
         int inter = c->intermediate_size;

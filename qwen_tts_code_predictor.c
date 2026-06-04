@@ -274,6 +274,69 @@ static void cp_qz_q2(q2_0_block_t **dst, const uint16_t *src, int rows, int cols
     if (*dst) qwen_quantize_bf16_to_q2_0(src, rows, cols, *dst);
 }
 
+/* ---- Quant-ladder decomposition knobs (env-gated; reset-then-quantize fix-ups
+ * applied AFTER the uniform QWEN_CP_PREC pass). Let us answer "is the late-codebook
+ * drift in the shared transformer or the per-codebook lm_heads?" (QWEN_CP_LMHEAD_PREC)
+ * and "which LAYERS tolerate low bits?" (QWEN_CP_LAYER_PREC) — the per-tensor/per-layer
+ * mixed-precision (DeepSeek-style) feasibility test. ---- */
+#define CP_FREE(p) do { if (p) { free(p); (p) = NULL; } } while (0)
+
+/* Reset one CP layer's quant buffers → bf16 dispatch (frees q4/q2/int8 + scales). */
+static void cp_layer_to_bf16(qwen_cp_layer_t *l) {
+    CP_FREE(l->wq_q4); CP_FREE(l->wk_q4); CP_FREE(l->wv_q4); CP_FREE(l->wo_q4);
+    CP_FREE(l->gate_up_fused_q4); CP_FREE(l->down_q4);
+    CP_FREE(l->gate_up_fused_q2); CP_FREE(l->down_q2);
+    CP_FREE(l->wq_int8); CP_FREE(l->wq_scale);
+    CP_FREE(l->wk_int8); CP_FREE(l->wk_scale);
+    CP_FREE(l->wv_int8); CP_FREE(l->wv_scale);
+    CP_FREE(l->wo_int8); CP_FREE(l->wo_scale);
+    CP_FREE(l->gate_up_fused_int8); CP_FREE(l->gate_up_fused_scale);
+    CP_FREE(l->down_int8); CP_FREE(l->down_scale);
+}
+
+/* (Re)quantize one CP layer to a named precision {bf16|int8|int4}. */
+static void cp_layer_quantize(qwen_tts_ctx_t *ctx, int layer, const char *prec) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
+    int cp_inter = c->cp_intermediate_size;
+    qwen_cp_layer_t *l = &ctx->cp_layers[layer];
+    cp_layer_to_bf16(l);
+    if (!strcmp(prec, "int4")) {
+        cp_qz_q4(&l->wq_q4, l->wq_bf16, cp_q_dim, cp_h);
+        cp_qz_q4(&l->wk_q4, l->wk_bf16, cp_kv_dim, cp_h);
+        cp_qz_q4(&l->wv_q4, l->wv_bf16, cp_kv_dim, cp_h);
+        cp_qz_q4(&l->wo_q4, l->wo_bf16, cp_h, cp_q_dim);
+        cp_qz_q4(&l->gate_up_fused_q4, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        cp_qz_q4(&l->down_q4, l->down_bf16, cp_h, cp_inter);
+    } else if (!strcmp(prec, "int8")) {
+        cp_qz(&l->wq_int8, &l->wq_scale, l->wq_bf16, cp_q_dim, cp_h);
+        cp_qz(&l->wk_int8, &l->wk_scale, l->wk_bf16, cp_kv_dim, cp_h);
+        cp_qz(&l->wv_int8, &l->wv_scale, l->wv_bf16, cp_kv_dim, cp_h);
+        cp_qz(&l->wo_int8, &l->wo_scale, l->wo_bf16, cp_h, cp_q_dim);
+        cp_qz(&l->gate_up_fused_int8, &l->gate_up_fused_scale, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        cp_qz(&l->down_int8, &l->down_scale, l->down_bf16, cp_h, cp_inter);
+    } /* "bf16" → leave reset */
+}
+
+/* (Re)quantize all 15 lm_heads to a named precision {bf16|int8|int4}. */
+static void cp_lmhead_quantize(qwen_tts_ctx_t *ctx, const char *prec) {
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size;
+    for (int g = 0; g < 15; g++) {
+        CP_FREE(ctx->cp_lm_head_q4[g]);
+        CP_FREE(ctx->cp_lm_head_int8[g]);
+        CP_FREE(ctx->cp_lm_head_scale[g]);
+        if (!ctx->cp_lm_head_bf16[g]) continue;
+        if (!strcmp(prec, "int4"))
+            cp_qz_q4(&ctx->cp_lm_head_q4[g], ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h);
+        else if (!strcmp(prec, "int8"))
+            cp_qz(&ctx->cp_lm_head_int8[g], &ctx->cp_lm_head_scale[g],
+                  ctx->cp_lm_head_bf16[g], c->codebook_size, cp_h);
+    }
+}
+
 /* (Re)quantize Code Predictor weights (+ lm_heads) to Q4_0 from current bf16.
  * This is THE bandwidth lever on memory-bound CPUs: q4 weights are ¼ the bytes of
  * bf16, halving DRAM traffic vs int8 on the CP (re-read 16×/frame). --int4 only. */
@@ -460,6 +523,29 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
         ctx->use_int4 = save;
         if (!ctx->silent)
             fprintf(stderr, "  Q4_0 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
+    }
+
+    /* Decomposition fix-ups (applied after the uniform pass above). Exp 1: override
+     * lm_head precision independently of the shared transformer (QWEN_CP_LMHEAD_PREC).
+     * Exp 2: per-layer precision (QWEN_CP_LAYER_PREC=p0,p1,p2,p3,p4). Both {bf16|int8|int4}. */
+    {
+        const char *lmh = getenv("QWEN_CP_LMHEAD_PREC");
+        if (lmh && *lmh) {
+            if (!ctx->silent)
+                fprintf(stderr, "  [QWEN_CP_LMHEAD_PREC=%s] lm_head precision decoupled from transformer\n", lmh);
+            cp_lmhead_quantize(ctx, lmh);
+        }
+        const char *lp = getenv("QWEN_CP_LAYER_PREC");
+        if (lp && *lp) {
+            char buf[256];
+            strncpy(buf, lp, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+            int li = 0;
+            for (char *tok = strtok(buf, ","); tok && li < c->cp_num_layers; tok = strtok(NULL, ","), li++) {
+                if (!ctx->silent)
+                    fprintf(stderr, "  [QWEN_CP_LAYER_PREC] layer %d -> %s\n", li, tok);
+                cp_layer_quantize(ctx, li, tok);
+            }
+        }
     }
 
     if (!ctx->silent)
