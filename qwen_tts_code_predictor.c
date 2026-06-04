@@ -70,6 +70,51 @@ void qwen_cp_microbench_report(int frames) {
 #endif
 
 /* ========================================================================
+ * Quant-ladder instrumentation (env-gated; truly zero overhead when off).
+ *
+ *   QWEN_DUMP_CODES=<path>  append one line "code0 c1 c2 ... c15" per frame
+ *                           (the 16 codebook tokens). Run the synth at each
+ *                           CP precision (see QWEN_CP_PREC) → one file each →
+ *                           tests/quant_ladder.py computes the per-codebook
+ *                           argmax-agreement matrix across {bf16,int8,int4,q2}.
+ *   QWEN_FFN_SPARSITY[=eps]  count post-SwiGLU activations with |x| < eps
+ *                           (default 1e-4) → contextual-sparsity headroom %.
+ *                           Reported to stderr at process exit.
+ *
+ * This is the cheap "measure first" instrument behind PLAN.md future-research C:
+ * it tells us WHERE and HOW MUCH int4 drifts vs int8/bf16 before we build any
+ * speculative-decode / sparsity / roughness machinery.
+ * ======================================================================== */
+static FILE  *ql_codes_fp   = NULL;
+static int    ql_init_done  = 0;
+static int    ql_ffn_on     = 0;
+static float  ql_ffn_eps    = 1e-4f;
+static long   ql_ffn_total  = 0;
+static long   ql_ffn_zero   = 0;
+
+static void ql_report_atexit(void) {
+    if (ql_codes_fp) { fclose(ql_codes_fp); ql_codes_fp = NULL; }
+    if (ql_ffn_on && ql_ffn_total > 0)
+        fprintf(stderr, "  [QWEN_FFN_SPARSITY] post-SwiGLU |x|<%.0e: %ld/%ld = %.2f%% (sparsity headroom)\n",
+                (double)ql_ffn_eps, ql_ffn_zero, ql_ffn_total,
+                100.0 * (double)ql_ffn_zero / (double)ql_ffn_total);
+}
+
+static void ql_init(void) {
+    if (ql_init_done) return;
+    ql_init_done = 1;
+    const char *p = getenv("QWEN_DUMP_CODES");
+    if (p && *p) ql_codes_fp = fopen(p, "w");
+    const char *s = getenv("QWEN_FFN_SPARSITY");
+    if (s) {
+        ql_ffn_on = 1;
+        double e = atof(s);
+        if (e > 0) ql_ffn_eps = (float)e;
+    }
+    if (ql_codes_fp || ql_ffn_on) atexit(ql_report_atexit);
+}
+
+/* ========================================================================
  * bf16 helpers
  * ======================================================================== */
 
@@ -222,6 +267,13 @@ static void cp_qz_q4(q4_0_block_t **dst, const uint16_t *src, int rows, int cols
     if (*dst) qwen_quantize_bf16_to_q4_0(src, rows, cols, *dst);
 }
 
+/* Q2_0 variant for the hybrid FFN path (QWEN_CP_Q2_FFN=1). */
+static void cp_qz_q2(q2_0_block_t **dst, const uint16_t *src, int rows, int cols) {
+    int bpr = cols / Q2_0_BLOCK_SIZE;
+    if (!*dst) *dst = (q2_0_block_t *)aligned_malloc((size_t)rows * bpr * sizeof(q2_0_block_t));
+    if (*dst) qwen_quantize_bf16_to_q2_0(src, rows, cols, *dst);
+}
+
 /* (Re)quantize Code Predictor weights (+ lm_heads) to Q4_0 from current bf16.
  * This is THE bandwidth lever on memory-bound CPUs: q4 weights are ¼ the bytes of
  * bf16, halving DRAM traffic vs int8 on the CP (re-read 16×/frame). --int4 only. */
@@ -232,14 +284,22 @@ void qwen_cp_quantize_q4(qwen_tts_ctx_t *ctx) {
     int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
     int cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim;
     int cp_inter = c->cp_intermediate_size;
+    /* Hybrid: optionally drop the big FFN matrices to 2-bit to shrink the working set
+     * below int4. Granular & experimental: QWEN_CP_Q2_FFN = both|1 / gateup / down —
+     * lets us find WHICH matrix tolerates q2 (they have different sensitivity). */
+    const char *e = getenv("QWEN_CP_Q2_FFN");
+    int q2_gateup = e && (!strcmp(e, "1") || !strcmp(e, "both") || !strcmp(e, "gateup"));
+    int q2_down   = e && (!strcmp(e, "1") || !strcmp(e, "both") || !strcmp(e, "down"));
     for (int i = 0; i < c->cp_num_layers; i++) {
         qwen_cp_layer_t *l = &ctx->cp_layers[i];
         cp_qz_q4(&l->wq_q4, l->wq_bf16, cp_q_dim, cp_h);
         cp_qz_q4(&l->wk_q4, l->wk_bf16, cp_kv_dim, cp_h);
         cp_qz_q4(&l->wv_q4, l->wv_bf16, cp_kv_dim, cp_h);
         cp_qz_q4(&l->wo_q4, l->wo_bf16, cp_h, cp_q_dim);
-        cp_qz_q4(&l->gate_up_fused_q4, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
-        cp_qz_q4(&l->down_q4, l->down_bf16, cp_h, cp_inter);
+        if (q2_gateup) cp_qz_q2(&l->gate_up_fused_q2, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        else           cp_qz_q4(&l->gate_up_fused_q4, l->gate_up_fused_bf16, 2 * cp_inter, cp_h);
+        if (q2_down)   cp_qz_q2(&l->down_q2, l->down_bf16, cp_h, cp_inter);
+        else           cp_qz_q4(&l->down_q4, l->down_bf16, cp_h, cp_inter);
     }
     for (int g = 0; g < 15; g++)
         if (ctx->cp_lm_head_bf16[g])
@@ -365,20 +425,39 @@ int qwen_cp_load(qwen_tts_ctx_t *ctx) {
      * The old cp_h>=2048 gate was a workaround for the denormal hang (fixed June
      * 2026 via FTZ + fused int8 qkv). CP is hidden=1024 on BOTH models and is the
      * per-frame bottleneck (~90% matvec), so quantizing it helps 0.6B and 1.7B. */
-    if (ctx->use_int8) {
+    /* CP precision normally follows --int8/--int4, which ALSO quantize the Talker.
+     * QWEN_CP_PREC={bf16|int8|int4} DECOUPLES the CP precision from the Talker so the
+     * quant-ladder measurement can hold the Talker (hence code0) fixed and vary ONLY
+     * the CP — otherwise code0 drifts run-to-run and the per-codebook agreement is
+     * contaminated by Talker quantization. No env → unchanged --int8/--int4 behavior. */
+    int cp_do_int8 = ctx->use_int8;
+    int cp_do_int4 = ctx->use_int4;
+    const char *cp_prec = getenv("QWEN_CP_PREC");
+    if (cp_prec && *cp_prec) {
+        cp_do_int8 = !strcmp(cp_prec, "int8");
+        cp_do_int4 = !strcmp(cp_prec, "int4");
+        if (!ctx->silent)
+            fprintf(stderr, "  [QWEN_CP_PREC=%s] CP precision decoupled from Talker\n", cp_prec);
+    }
+
+    if (cp_do_int8) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing CP weights to INT8 (per-row absmax)...\n");
+        int save = ctx->use_int8; ctx->use_int8 = 1;   /* force CP int8 even if Talker isn't */
         qwen_cp_quantize_int8(ctx);  /* extracted — re-runnable after WDELTA override */
+        ctx->use_int8 = save;
         if (!ctx->silent)
             fprintf(stderr, "  INT8 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
     }
 
     /* Q4_0 quantization of CP weights (--int4). CP is the memory-bound bottleneck;
      * q4 (¼ the bytes of bf16) is the biggest bandwidth lever on x86/CPU. */
-    if (ctx->use_int4) {
+    if (cp_do_int4) {
         if (!ctx->silent)
             fprintf(stderr, "  Quantizing CP weights to Q4_0 (--int4)...\n");
+        int save = ctx->use_int4; ctx->use_int4 = 1;   /* force CP int4 even if Talker isn't */
         qwen_cp_quantize_q4(ctx);
+        ctx->use_int4 = save;
         if (!ctx->silent)
             fprintf(stderr, "  Q4_0 quantization done (%d layers + 15 lm_heads)\n", c->cp_num_layers);
     }
@@ -466,7 +545,9 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_RESNORM);
 
     /* Fused gate+up SwiGLU FFN (single matvec, x loaded once) */
-    if (l->gate_up_fused_q4)
+    if (l->gate_up_fused_q2)
+        qwen_matvec_q2_0(ctx->cp_dec_gate, l->gate_up_fused_q2, x_norm, 2 * cp_inter, cp_h);
+    else if (l->gate_up_fused_q4)
         qwen_matvec_q4_0(ctx->cp_dec_gate, l->gate_up_fused_q4, x_norm, 2 * cp_inter, cp_h);
     else if (l->gate_up_fused_int8)
         qwen_matvec_int8(ctx->cp_dec_gate, l->gate_up_fused_int8, l->gate_up_fused_scale,
@@ -477,8 +558,20 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     qwen_swiglu_inplace(ctx->cp_dec_gate, ctx->swiglu_tmp, cp_inter);
     CPB_MARK(CPB_SWIGLU);
 
+    /* Contextual-sparsity probe: how many FFN activations are ~0 (would let us
+     * skip the matching down-proj columns). Env-gated, off the hot path. */
+    if (ql_ffn_on) {
+        long z = 0;
+        for (int i = 0; i < cp_inter; i++)
+            if (fabsf(ctx->cp_dec_gate[i]) < ql_ffn_eps) z++;
+        ql_ffn_zero  += z;
+        ql_ffn_total += cp_inter;
+    }
+
     /* Down projection */
-    if (l->down_q4)
+    if (l->down_q2)
+        qwen_matvec_q2_0(proj, l->down_q2, ctx->cp_dec_gate, cp_h, cp_inter);
+    else if (l->down_q4)
         qwen_matvec_q4_0(proj, l->down_q4, ctx->cp_dec_gate, cp_h, cp_inter);
     else if (l->down_int8)
         qwen_matvec_int8(proj, l->down_int8, l->down_scale, ctx->cp_dec_gate, cp_h, cp_inter);
@@ -537,6 +630,8 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     int cp_h = c->cp_hidden_size;
     int emb_dim = ctx->cp_emb_dim;  /* talker_hidden for 1.7B, cp_hidden for 0.6B */
 
+    ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY) */
+
     /* Reset CP KV cache for this frame */
     ctx->cp_kv_len = 0;
 
@@ -579,7 +674,10 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
 
     /* Steps 2-15: generate codebooks 2-15. */
     for (int g = 1; g < 15; g++) {
-        int prev_code = out_codes[g - 1];
+        /* Teacher-forcing (quant-ladder): feed the REFERENCE prev code, not this
+         * precision's own prediction, so step g sees identical inputs across all
+         * precisions → its disagreement is pure step-g quant drift. */
+        int prev_code = ctx->tf_ref_codes ? ctx->tf_ref_codes[g - 1] : out_codes[g - 1];
         int pos = g + 1;
 
         /* Embed previous code using CP codec_emb[g-1] (NOT [g]).
@@ -606,6 +704,14 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
         else
             out_codes[g] = qwen_argmax_matvec_bf16(cp_normed, ctx->cp_lm_head_bf16[g], cp_h, c->codebook_size);
         CPB_MARK(CPB_LMHEAD);
+    }
+
+    /* Quant-ladder dump: the 16 codebook tokens for this frame (code0 from the
+     * Talker — held fixed across precisions — then the 15 CP codes). */
+    if (ql_codes_fp) {
+        fprintf(ql_codes_fp, "%d", code0);
+        for (int g = 0; g < 15; g++) fprintf(ql_codes_fp, " %d", out_codes[g]);
+        fputc('\n', ql_codes_fp);
     }
 
     return 0;

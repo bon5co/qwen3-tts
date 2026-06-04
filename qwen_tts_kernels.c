@@ -1554,6 +1554,56 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
 }
 
 /* ========================================================================
+ * Q2_0 (2-bit) — EXPERIMENTAL hybrid lever for the quant-tolerant FFN matrices.
+ * Scalar only for now (quality-first; SIMD added if it sounds OK). 4 symmetric
+ * levels {-1.5,-0.5,0.5,1.5}×scale, scale = absmax/1.5.
+ * ======================================================================== */
+void qwen_quantize_bf16_to_q2_0(const uint16_t *src_bf16, int rows, int cols,
+                                 q2_0_block_t *dst) {
+    int bpr = cols / Q2_0_BLOCK_SIZE;
+    for (int r = 0; r < rows; r++) {
+        const uint16_t *row = src_bf16 + (size_t)r * cols;
+        q2_0_block_t *drow = dst + (size_t)r * bpr;
+        for (int b = 0; b < bpr; b++) {
+            const uint16_t *blk = row + b * Q2_0_BLOCK_SIZE;
+            float vals[Q2_0_BLOCK_SIZE], amax = 0.0f;
+            for (int i = 0; i < Q2_0_BLOCK_SIZE; i++) {
+                vals[i] = bf16_to_f32(blk[i]);
+                float a = fabsf(vals[i]); if (a > amax) amax = a;
+            }
+            float scale = amax / 1.5f;
+            drow[b].scale = scale;
+            float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+            for (int i = 0; i < 8; i++) drow[b].qs[i] = 0;
+            for (int i = 0; i < Q2_0_BLOCK_SIZE; i++) {
+                int code = (int)lrintf(vals[i] * inv + 1.5f);  /* {-1.5..1.5}/scale -> {0..3} */
+                code = code < 0 ? 0 : (code > 3 ? 3 : code);
+                drow[b].qs[i >> 2] |= (uint8_t)(code << ((i & 3) * 2));
+            }
+        }
+    }
+}
+
+void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
+                      int rows, int cols) {
+    int bpr = cols / Q2_0_BLOCK_SIZE;
+    for (int o = 0; o < rows; o++) {
+        const q2_0_block_t *wr = W + (size_t)o * bpr;
+        float sum = 0.0f;
+        for (int b = 0; b < bpr; b++) {
+            float scale = wr[b].scale;
+            const uint8_t *qs = wr[b].qs;
+            const float *xb = x + b * Q2_0_BLOCK_SIZE;
+            for (int i = 0; i < Q2_0_BLOCK_SIZE; i++) {
+                int code = (qs[i >> 2] >> ((i & 3) * 2)) & 0x3;
+                sum += ((float)code - 1.5f) * scale * xb[i];
+            }
+        }
+        y[o] = sum;
+    }
+}
+
+/* ========================================================================
  * Attention
  * ======================================================================== */
 

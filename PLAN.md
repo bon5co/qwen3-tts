@@ -520,20 +520,55 @@ diverges too much (we saw it does for audio quality) acceptance may be low. (NB:
 intermediate neurons meaningfully fire per token, compute only those rows → fewer weight bytes
 read → bandwidth win, single-stream. Needs a cheap predictor of which neurons fire.
 
-**FIRST STEP = MEASURE viability before building either (cheap instrumentation):**
-1. FFN activation sparsity: what % of the 3072 intermediate neurons exceed an activation
-   threshold per token? (<~30% → C2 promising.)
-2. **Quant-ladder argmax-agreement matrix** across the 15 codebooks per frame, ALL pairs of
-   {bf16, int8, int4, q2}. int8 is the GOLD (== bf16, no artefacts); int4 added the slight
-   "anger". So measure not just q2-vs-int4 but the full ladder — especially:
-   - int8 vs bf16 (expect ~100% — confirms gold)
-   - **int4 vs int8** (quantifies WHERE/how-much int4 drifts → explains the slight aggression,
-     and tells us if int8 is a better speculative target than bf16)
-   - q2 vs int4, q2 vs int8 (draft acceptance for C1; >~70% → promising)
-   The agreement % per codebook index also shows WHICH of the 15 residuals drift first (the
-   later/finer ones likely), informing both the draft design and the prosody track (A).
-These numbers decide which (if any) to build, and pick the draft/target precision pair.
-Don't implement blind.
+**FIRST STEP = MEASURE — ✅ DONE 2026-06-04 (`make quant-ladder` + `tests/quant_ladder.py`).**
+
+**⚠ Architectural finding that reshaped the measurement:** the CP output (codebooks 1-15)
+FEEDS BACK into the Talker's next-step input embedding (`qwen_tts.c:1300-1310`:
+`step_embed = codec_embed(code0) + Σ cp_codec_embed(codes 1-15) + tts_pad`). So changing CP
+precision forks the ENTIRE autoregressive trajectory — different `code0`, different LENGTH
+(free-running q2 ran 190 frames vs bf16's 128). A naive free-running precision sweep therefore
+measures NOTHING (≈1-8% agreement = pure trajectory decorrelation, near random). **This feedback
+coupling is also the mechanistic reason int4/q2 audibly change prosody AND duration, not just
+texture.** → measurement must TEACHER-FORCE: lay bf16 "rails" (the 16-codes/frame stream), then
+replay them (`QWEN_TF_CODES`) at each CP precision (`QWEN_CP_PREC`, Talker held bf16) so every
+precision sees bit-identical per-step inputs. Implemented; bf16-TF == rails = 100% (harness valid).
+
+**Quant-ladder results (0.6B, 128 frames, teacher-forced, argmax agreement vs bf16):**
+
+| codebook | int8 | int4 | q2(down) |
+|---|---|---|---|
+| c1 (coarsest residual) | 90% | 77% | 33% |
+| c5  | 80% | 57% | 12% |
+| c10 | 77% | 45% | 5% |
+| c15 (finest) | 73% | 23% | 8% |
+| **overall** | **78%** | **46%** | **9%** |
+
+- **Drift GROWS with codebook index** — the late/fine RVQ residuals (c11-c15) are the most
+  quant-sensitive. int4 holds the early residuals (c1-c5: 57-77%) but collapses on late ones
+  (c12-c15: 23-27%). int8 degrades gently and uniformly (≈73-90%). q2 destroys everything past c5.
+- **int4-vs-int8 = 44% overall, worst at c11-c15 (20-35%)** → int8 IS the artifact-free gold;
+  int4's "slight aggression" lives in the late/fine codebooks where it diverges most from int8.
+- **FFN activation sparsity (post-SwiGLU |x|<eps): 0.28% @1e-4, 2.25% @1e-3, 14% @1e-2, 59% @1e-1.**
+  The CP FFN is essentially DENSE — NOT the 80-90% sparsity big LLMs show. **→ C2 (contextual
+  sparsity) is NOT worth building for the CP: even an optimistic 1e-2 threshold skips only ~14%,
+  and that's before verifying it doesn't flip argmax. Negative result, settled.**
+
+**Verdict (data-driven):**
+- **C2 contextual sparsity — DROP.** CP FFN is dense; no exploitable sparsity.
+- **C1 self-speculative — MARGINAL, conditionally.** Greedy spec-decode needs exact argmax match.
+  q2 draft acceptance is hopeless (9%). int4 draft → int8/bf16 verify would accept ~the early
+  codebooks (c1-c5, 57-77%) but reject the late ones, and you pay a full verify pass anyway, so
+  net win is small and fragile. Best framing if pursued: int8 draft (78% vs bf16) with a single
+  batched bf16 verify, accepting the common prefix of codebooks — but 78% per-codebook compounds
+  to a low whole-frame acceptance. Re-derive expected speedup from these numbers before building.
+- **A prosody knob — STRONGEST lead.** The late codebooks (c11-c15) ARE the texture/prosody
+  control surface, and the Talker-feedback coupling means perturbing them shifts delivery
+  globally. The q2-on-`down` "death metal" finding sits exactly here. A controllable strength
+  knob on late-codebook CP precision is the most promising thing this measurement surfaced.
+
+Caveat: teacher-forcing fixes the TOKEN feedback but each precision still builds its own intra-frame
+KV cache, so per-codebook drift conflates step sensitivity + intra-frame KV accumulation (realistic,
+but not a pure per-step isolate). Good enough for the decisions above.
 
 ---
 

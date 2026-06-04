@@ -139,6 +139,21 @@ void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim);
 
+/* Q2_0 block: 32 weights at 2 bits each (8 bytes) + fp32 scale = 12 bytes.
+ * 4 symmetric levels: dequant(code) = (code - 1.5) * scale, code in {0,1,2,3}
+ * -> {-1.5,-0.5,0.5,1.5}*scale, scale = absmax/1.5. EXPERIMENTAL hybrid lever:
+ * used on the quant-tolerant FFN matrices to shrink the CP working set below int4. */
+#define Q2_0_BLOCK_SIZE 32
+typedef struct {
+    float scale;           /* per-block scale factor */
+    uint8_t qs[8];         /* 32 codes × 2 bits, 4 codes per byte (idx i -> byte i/4, bits (i%4)*2) */
+} q2_0_block_t;            /* 12 bytes per 32 weights */
+
+void qwen_quantize_bf16_to_q2_0(const uint16_t *src_bf16, int rows, int cols,
+                                 q2_0_block_t *dst);
+void qwen_matvec_q2_0(float *y, const q2_0_block_t *W, const float *x,
+                       int rows, int cols);
+
 /* ========================================================================
  * Attention
  * ======================================================================== */

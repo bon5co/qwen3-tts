@@ -1182,6 +1182,47 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     double t_cp_total = 0, t_talker_step_total = 0, t_embed_total = 0;
     float *step_embed = (float *)malloc(h * sizeof(float));
 
+    /* Quant-ladder teacher-forcing (QWEN_TF_CODES=<bf16-reference>.codes): REPLAY
+     * the reference 16-codes-per-frame stream — override code0 and feed the
+     * reference codebook-1..15 back into the Talker (rails identical to bf16) while
+     * the CP at the current precision RECORDS what it WOULD predict. Every precision
+     * then sees bit-identical Talker hidden states and CP inputs → the per-codebook
+     * disagreement vs reference is PURE CP quant drift, free of trajectory fork.
+     * Only the autoregressive feedback coupling (CP codes → next Talker step) makes
+     * a free-running comparison meaningless; this isolates it. NULL → normal synth. */
+    int   *tf_codes = NULL;     /* nframes × 16 reference codes */
+    int    tf_nframes = 0;
+    {
+        const char *tfp = getenv("QWEN_TF_CODES");
+        if (tfp && *tfp) {
+            FILE *tf = fopen(tfp, "r");
+            if (tf) {
+                int cap = 256;
+                tf_codes = (int *)malloc((size_t)cap * 16 * sizeof(int));
+                char line[1024];
+                while (fgets(line, sizeof(line), tf)) {
+                    int c[16], n = 0;
+                    char *p = line;
+                    while (n < 16) {
+                        char *end; long v = strtol(p, &end, 10);
+                        if (end == p) break;
+                        c[n++] = (int)v; p = end;
+                    }
+                    if (n < 16) continue;
+                    if (tf_nframes >= cap) {
+                        cap *= 2;
+                        tf_codes = (int *)realloc(tf_codes, (size_t)cap * 16 * sizeof(int));
+                    }
+                    memcpy(tf_codes + (size_t)tf_nframes * 16, c, 16 * sizeof(int));
+                    tf_nframes++;
+                }
+                fclose(tf);
+                if (!ctx->silent)
+                    fprintf(stderr, "  [QWEN_TF_CODES] teacher-forcing replay: %d reference frames\n", tf_nframes);
+            }
+        }
+    }
+
     /* Launch decoder thread for pipeline overlap (always — both streaming and normal).
      * In streaming mode, the decoder thread calls audio_cb directly.
      * In normal mode, it accumulates audio to a buffer. */
@@ -1252,6 +1293,13 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                                      frame_temp, frame_top_k, ctx->top_p,
                                      ctx->rep_penalty, ctx->prev_tokens, ctx->n_prev_tokens);
 
+        /* Teacher-forcing replay: ride the reference rails (code0 + CP feedback). */
+        if (tf_codes) {
+            if (frame >= tf_nframes) break;
+            code0 = tf_codes[(int64_t)frame * 16 + 0];
+            ctx->tf_ref_codes = tf_codes + (int64_t)frame * 16 + 1;
+        }
+
         if (code0 == QWEN_TTS_CODEC_EOS) {
             if (!ctx->silent) fprintf(stderr, "  EOS at frame %d\n", frame);
             break;
@@ -1264,6 +1312,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         double t_cp_start = time_ms();
         qwen_cp_predict(ctx, last_hidden, code0, codes + 1);
         t_cp_total += time_ms() - t_cp_start;
+
+        /* TF replay: the CP just RECORDED its predictions (via QWEN_DUMP_CODES); now
+         * overwrite with the reference so the Talker's next input stays on the bf16
+         * rails (identical hidden states for every precision). */
+        if (tf_codes)
+            memcpy(codes, tf_codes + (int64_t)frame * 16, 16 * sizeof(int));
 
         memcpy(ctx->codec_codes + (int64_t)ctx->codec_frames * 16, codes, 16 * sizeof(int));
         ctx->codec_frames++;
@@ -1331,6 +1385,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     free(step_embed);
     free(last_hidden);
+    if (tf_codes) { free(tf_codes); ctx->tf_ref_codes = NULL; }
 
     double t_talker_end = time_ms();
     double t_total_gen = t_talker_end - t_prefill - prefill_ms;

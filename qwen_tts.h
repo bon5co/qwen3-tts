@@ -216,6 +216,11 @@ typedef struct {
     q4_0_block_t *wo_q4;              /* [hidden, q_dim/32 blocks] */
     q4_0_block_t *gate_up_fused_q4;   /* [2*inter, hidden/32 blocks] */
     q4_0_block_t *down_q4;            /* [hidden, inter/32 blocks] */
+
+    /* Q2_0 FFN (EXPERIMENTAL hybrid: --int4 + QWEN_CP_Q2_FFN=1). Shrinks the
+     * biggest, most quant-tolerant matrices below int4 to reduce DRAM bytes. */
+    q2_0_block_t *gate_up_fused_q2;   /* [2*inter, hidden/32 blocks] */
+    q2_0_block_t *down_q2;            /* [hidden, inter/32 blocks] */
 } qwen_cp_layer_t;
 
 /* ========================================================================
@@ -528,7 +533,13 @@ typedef struct qwen_tts_ctx {
     int *prev_tokens;
     int n_prev_tokens;
     int prev_tokens_cap;
-    
+
+    /* Quant-ladder teacher-forcing: when non-NULL, the CP autoregression feeds
+     * these reference codebook-1..15 codes (instead of its own predictions) so
+     * every precision sees identical per-step inputs → isolates CP quant drift.
+     * Set per-frame by the generation loop in QWEN_TF_CODES replay mode; else NULL. */
+    const int *tf_ref_codes;
+
     /* Audio output buffer */
     float *audio_buf;
     int audio_samples;

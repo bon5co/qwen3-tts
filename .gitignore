@@ -27,3 +27,7 @@ server_stderr.log
 qwen_tts_cpbench
 voices/
 *.qvoice
+
+# local bench scaffolds / archives (not part of the repo)
+ab_*.sh
+*.zip

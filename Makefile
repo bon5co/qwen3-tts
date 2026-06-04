@@ -431,6 +431,31 @@ golden-update: $(TARGET)
 	@if [ -d $(MODEL_LARGE) ]; then ./$(TARGET) -d $(MODEL_LARGE) $(GOLDEN_DET) -s ryan -l English --text "$(GOLDEN_EN)" -o tests/golden/golden_17b_en.wav; fi
 	@echo "Done. git diff tests/golden/ and commit if intended."
 
+# ── Quant-ladder: per-codebook argmax-agreement across CP precisions ──
+# The cheap "measure first" instrument (PLAN.md future-research C). The CP output
+# (codebooks 1-15) FEEDS BACK into the Talker, so a free-running precision sweep
+# forks the whole trajectory (different code0, different length) and measures
+# nothing. So this TEACHER-FORCES: phase A runs bf16 to lay down reference "rails"
+# (the 16-codes-per-frame stream); phase B replays those rails (QWEN_TF_CODES) at
+# each CP precision (QWEN_CP_PREC, Talker stays bf16) so every precision sees
+# bit-identical per-step inputs → the recorded argmax disagreement is PURE CP quant
+# drift. quant_ladder.py then reports WHERE and HOW MUCH int4 drifts vs int8/bf16
+# (per codebook index). Phase A also prints FFN activation sparsity %.
+QL_DIR  = /tmp/qwen_qladder
+QL_TEXT = The quick brown fox jumps over the lazy dog on a sunny afternoon, and then it ran across the wide green field without stopping.
+quant-ladder: $(TARGET)
+	@echo "=== Quant-ladder: teacher-forced CP precision sweep (Talker bf16) ==="
+	@mkdir -p $(QL_DIR)
+	@echo "  phase A: bf16 reference rails (+ FFN sparsity)"
+	@QWEN_CP_PREC=bf16 QWEN_FFN_SPARSITY=1e-4 QWEN_DUMP_CODES=$(QL_DIR)/ref.codes ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(QL_TEXT)" -o $(QL_DIR)/ref.wav 2>&1 | grep -i "sparsity" || true
+	@echo "  phase B: teacher-forced replay at each CP precision"
+	@QWEN_TF_CODES=$(QL_DIR)/ref.codes QWEN_CP_PREC=bf16 QWEN_DUMP_CODES=$(QL_DIR)/bf16.codes ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(QL_TEXT)" -o $(QL_DIR)/bf16.wav --silent
+	@QWEN_TF_CODES=$(QL_DIR)/ref.codes QWEN_CP_PREC=int8 QWEN_DUMP_CODES=$(QL_DIR)/int8.codes ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(QL_TEXT)" -o $(QL_DIR)/int8.wav --silent
+	@QWEN_TF_CODES=$(QL_DIR)/ref.codes QWEN_CP_PREC=int4 QWEN_DUMP_CODES=$(QL_DIR)/int4.codes ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(QL_TEXT)" -o $(QL_DIR)/int4.wav --silent
+	@QWEN_TF_CODES=$(QL_DIR)/ref.codes QWEN_CP_PREC=int4 QWEN_CP_Q2_FFN=down QWEN_DUMP_CODES=$(QL_DIR)/q2down.codes ./$(TARGET) -d $(MODEL_SMALL) $(GOLDEN_DET) -s ryan -l English --text "$(QL_TEXT)" -o $(QL_DIR)/q2down.wav --silent
+	@echo ""
+	@python3 tests/quant_ladder.py ref:$(QL_DIR)/ref.codes bf16:$(QL_DIR)/bf16.codes int8:$(QL_DIR)/int8.codes int4:$(QL_DIR)/int4.codes q2:$(QL_DIR)/q2down.codes
+
 # ── Mode matrix: quant × delivery (the combinations real usage hits) ──
 # Each combination must RUN and produce coherent audio (non-empty + frames). Numeric
 # correctness for the deterministic configs is covered by test-golden; here we assert the
@@ -759,7 +784,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
         test-clone test-voice-design \
         demo-clone \
