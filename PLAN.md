@@ -303,17 +303,20 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   server case: shared prefix, different text) untouched → delta-prefill optimization preserved.
   Verified: 3 identical reqs now bit-identical AND == CLI (327ec448); `test-serve-bench` PASSES (was
   FAIL); test-small 5/5. Remaining server hardening (below) still open.
-- [~] **Server thread-safety — VERIFIED NOT A BUG (2026-06-03).** The server is genuinely
-  single-threaded: one `while(server_running)` loop, `accept()` → `handle_*()` inline → close, NO
-  `pthread_create`/fork (`qwen_tts_server.c:476-537`). Requests are serialized by design; a 2nd
-  concurrent curl just waits in the listen backlog. The audit agent's "parallel curls corrupt state"
-  was OVERSTATED. (Future: concurrent serving = a throughput *feature*, not a correctness fix.)
-- [~] **Server input validation — VERIFIED mostly NOT A BUG (2026-06-03).** Invalid speaker/language
-  are **safely ignored** (`if (sid>=0)`/`if (lid>=0)`, server.c:283-294) — no OOB. Request body is
-  capped at **1 MB** (`malloc(1024*1024)`, server.c:487) and generation at `max_tokens` (8192) — so
-  the "1 GB text → OOM" claim is bounded away. `error-path n_prev_tokens dirty` is also a non-issue
-  (reset per request, qwen_tts.c:1167). Agent claims OVERSTATED. (Only nicety left: an explicit
-  friendly 413 for >1 MB bodies — cosmetic.)
+- [x] **Server thread-safety — single-threaded by design; mutex added as foundation (2026-06-04,
+  commit a3819a2).** The server is genuinely single-threaded: one `while(server_running)` loop,
+  `accept()` → `handle_*()` inline → close, NO `pthread_create`/fork. Requests are serialized; a 2nd
+  concurrent curl waits in the listen backlog → no live race. Added `g_synth_lock` around the 3
+  synthesis handlers anyway: UNCONTENDED today, but the correct foundation for the future
+  concurrent-serving throughput feature (synthesis mutates the shared ctx).
+- [x] **Server input validation — HARDENED (2026-06-04, commit a3819a2).** Added: text length cap
+  (`MAX_TTS_TEXT` 8192 chars → clean 400, finer than the existing 1 MB raw-body cap) + empty-text 400;
+  **sampling-param clamping** (temperature [0,**2.0**], top_k [0,vocab], top_p [0,1], rep_penalty
+  [0.5,2]). The clamp is NOT cosmetic: a degenerate `temperature:99`+`top_k:0`+`top_p:1` makes
+  sampling so flat the model never emits EOS and runs to `max_frames` (caught a 43-min orphaned-server
+  runaway during testing). Invalid speaker/language still safely ignored; `max_frames` is the hard cap.
+  ⚠ TEST-HARNESS LESSON: always `timeout` server curls + `pkill -f qwen_tts.*--serve` by name (never
+  rely on `$!`/`wait` — a blocked curl hangs the script and orphans the server).
 - [x] **Voice-clone 24kHz ref audio — RESOLVED as documented-by-design 2026-06-03 (commit 33c11a0).**
   Decision (user): do NOT bundle a resampler (ffmpeg does it better, keeps zero-dep; mel features need
   24kHz). The requirement is now documented in docs/voice-cloning.md + `--help` + a clear runtime error
