@@ -23,6 +23,22 @@
 #include <signal.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <pthread.h>
+
+/* Max accepted request text length (chars). Guards against a single huge body
+ * blowing up the tokenizer / generation time / memory. ~1500 words of TTS is
+ * already far beyond any reasonable single request. */
+#define MAX_TTS_TEXT 8192
+
+/* Serializes synthesis on the shared ctx. The accept loop is single-threaded today
+ * (one request at a time), so this is UNCONTENDED — it's the correctness foundation
+ * for when the server gains per-connection concurrency (continuous batching). With a
+ * shared mutable ctx, any future threading MUST hold this around parse+generate. */
+static pthread_mutex_t g_synth_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
 
 /* ── Simple JSON helpers ─────────────────────────────────────────────── */
 
@@ -277,6 +293,10 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
         free(text);
         return NULL;
     }
+    if (strlen(text) > MAX_TTS_TEXT) {   /* reject oversized input (DoS / OOM guard) */
+        free(text);
+        return NULL;
+    }
 
     char *speaker = json_extract_string(body, "speaker");
     if (!speaker) speaker = json_extract_string(body, "voice");
@@ -304,11 +324,18 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body) {
         free(vd);
     }
 
-    /* Sampling params (override defaults only if provided) */
-    ctx->temperature = (float)json_extract_number(body, "temperature", ctx->temperature);
-    ctx->top_k = (int)json_extract_number(body, "top_k", ctx->top_k);
-    ctx->top_p = (float)json_extract_number(body, "top_p", ctx->top_p);
-    ctx->rep_penalty = (float)json_extract_number(body, "rep_penalty", ctx->rep_penalty);
+    /* Sampling params (override defaults only if provided), clamped to sane ranges so
+     * a bad client value can't crash sampling or produce garbage (e.g. negative top_k,
+     * top_p outside [0,1], runaway temperature). */
+    /* Cap temperature at 2.0: above that (with top_p=1/top_k=0) sampling is so flat the
+     * model may never emit EOS and runs to max_frames — a degenerate near-runaway. 2.0 is
+     * already far past the 0.5 default. */
+    ctx->temperature = clampf((float)json_extract_number(body, "temperature", ctx->temperature), 0.0f, 2.0f);
+    ctx->top_k       = (int)json_extract_number(body, "top_k", ctx->top_k);
+    if (ctx->top_k < 0) ctx->top_k = 0;
+    if (ctx->top_k > ctx->config.codec_vocab_size) ctx->top_k = ctx->config.codec_vocab_size;
+    ctx->top_p       = clampf((float)json_extract_number(body, "top_p", ctx->top_p), 0.0f, 1.0f);
+    ctx->rep_penalty = clampf((float)json_extract_number(body, "rep_penalty", ctx->rep_penalty), 0.5f, 2.0f);
 
     /* Seed (optional: 0 or negative = keep time-based from reset) */
     int seed = (int)json_extract_number(body, "seed", -1);
@@ -326,7 +353,7 @@ static double server_time_ms(void) {
 static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     char *text = parse_tts_request(ctx, body);
     if (!text) {
-        send_error(fd, 400, "missing 'text' field");
+        send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
         return;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
@@ -370,7 +397,7 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     char *text = parse_tts_request(ctx, body);
     if (!text) {
-        send_error(fd, 400, "missing 'text' field");
+        send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)");
         return;
     }
     if (ctx->voice_design && ctx->config.hidden_size < 2048) {
@@ -518,15 +545,23 @@ int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
         else if (strcmp(path, "/v1/speakers") == 0 && strcmp(method, "GET") == 0) {
             handle_speakers(client_fd);
         }
+        /* Synthesis handlers mutate the shared ctx → serialize them under g_synth_lock
+         * (uncontended while the accept loop is single-threaded; correct if it isn't). */
         else if (strcmp(path, "/v1/tts") == 0 && strcmp(method, "POST") == 0) {
+            pthread_mutex_lock(&g_synth_lock);
             handle_tts(ctx, client_fd, body);
+            pthread_mutex_unlock(&g_synth_lock);
         }
         else if (strcmp(path, "/v1/tts/stream") == 0 && strcmp(method, "POST") == 0) {
+            pthread_mutex_lock(&g_synth_lock);
             handle_tts_stream(ctx, client_fd, body);
+            pthread_mutex_unlock(&g_synth_lock);
         }
         else if (strcmp(path, "/v1/audio/speech") == 0 && strcmp(method, "POST") == 0) {
             /* OpenAI-compatible: same as /v1/tts */
+            pthread_mutex_lock(&g_synth_lock);
             handle_tts(ctx, client_fd, body);
+            pthread_mutex_unlock(&g_synth_lock);
         }
         else {
             send_error(client_fd, 404, "not found");
