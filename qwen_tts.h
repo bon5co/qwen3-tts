@@ -586,6 +586,13 @@ qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8
 /* Unload model and free resources */
 void qwen_tts_unload(qwen_tts_ctx_t *ctx);
 
+/* Concurrent server support: clone a loaded context into an independent worker
+ * context that SHARES read-only weights/voice/RoPE but owns fresh per-request
+ * mutable buffers (KV caches, work buffers, caches). Free with
+ * qwen_tts_free_clone — NEVER qwen_tts_unload (that frees shared weights). */
+qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base);
+void qwen_tts_free_clone(qwen_tts_ctx_t *ctx);
+
 /* Set speaker ID */
 void qwen_tts_set_speaker(qwen_tts_ctx_t *ctx, int speaker_id);
 

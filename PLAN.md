@@ -325,6 +325,28 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   merges.txt loads now check the read length (short read → error + free, was silently ignored).
   `(size_t)rows*cols` overflow: low risk, cast present; left as-is (would need absurd config dims).
 
+- [x] **Concurrent server worker pool — IMPLEMENTED (2026-06-04, branch feat/avx2-xos-threading).**
+  The first real step of the "batching" feature: request-level parallelism (NOT yet continuous
+  batching of matvecs — see §B). `--workers N` (default 1 = unchanged behavior). For N≥2:
+  acceptor thread + bounded connection queue (256) + N worker threads; worker 0 reuses the base
+  ctx, the rest are **`qwen_tts_clone_for_worker()`** clones that SHARE the read-only weights +
+  loaded voice + RoPE (weight memory paid once) but own FRESH per-request mutable buffers (KV
+  caches, dec_*/cp_dec_*/pref_*, emb LRU cache, delta-prefill cache). Freed with
+  `qwen_tts_free_clone` (never `qwen_tts_unload` — that would free the shared weights).
+  THREE shared-mutable hazards found + fixed: (1) the synthesis ctx → per-worker clones;
+  (2) the kernel thread pool has a single global job slot → added `qwen_parallel_is_reentrant()`
+  (**GCD = safe** for concurrent `dispatch_apply`; **pthread/Win32 = NOT** — one `P.job`), so the
+  server serializes synthesis under `g_synth_lock` ONLY when the pool is non-reentrant
+  (`g_serialize_synth`); on GCD it runs fully parallel; (3) the RNG `g_seed` was a global →
+  made `__thread` (was a cross-request race + broke per-request seed reproducibility). Also
+  `inet_ntop` replaces thread-unsafe `inet_ntoa`. **VALIDATED on M1 (GCD): 2 workers, 2 concurrent
+  requests, both bit-identical to the single-worker reference (mel-corr 1.00000) across
+  {bf16, int8, int4, voice silvio_06b+int8}; concurrent timing ~equal (true overlap, not
+  serialized); clean kill-by-name teardown, no orphans.** `make test-serve-concurrent` +
+  `tests/test_parallel.sh`. ⚠ On the pthread/Win32 backend (the VPS) concurrent synthesis is
+  CORRECT but serialized (no overlap) until the pool is made reentrant — tracked below.
+  ⚠ Memory: clones share weights, so extra cost ≈ N×(KV + work buffers), NOT N×model.
+
 **TEST & VALIDATION BACKLOG (added 2026-06-04 — quant × voice × delivery cross-product + concurrency):**
 - [ ] **Re-run the FULL test matrix with `.qvoice` AFTER clone, crossed with quants.** The 0.6B-Talker
   int8 change (commit 12b73d7) + WDELTA re-quant path means voice-clone × {bf16, int8, int4} must all be
@@ -338,12 +360,21 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   becomes the default, B (save-quantized) gets more attractive.
 - [ ] **Re-run ALL server RTF benchmarks** (cold/warm, bf16/int8/int4, `.qvoice`) now that the 0.6B Talker
   is int8 under `--int8` — the README server RTF table (1.33/1.34) predates this and is stale.
-- [ ] **NEW concurrency tests (for the batching work):** (a) parallel-request test — N concurrent curls,
-  assert all return valid distinct WAVs (today serialized by `g_synth_lock`; this test must stay green
-  when concurrency is added); (b) race detector — build a `make test-serve-race` that runs the server
-  under TSan (`-fsanitize=thread`) + concurrent load to prove `g_synth_lock` actually guards the shared
-  ctx (and catch any unlocked shared state when batching lands); (c) streaming RTF test + verify streaming
-  works under int8/int4 (TTFA + RTF per quant). All must use the timeout+pkill harness (runaway lesson).
+- **NEW concurrency tests (for the batching work):**
+  - [x] (a) **parallel-request test — DONE** (`make test-serve-concurrent`, `tests/test_parallel.sh`):
+    2 concurrent curls at a `--workers 2` server, each output compared to a single-worker reference via
+    mel-corr (≥0.98), across {bf16, int8, int4, voice+int8}. All corr=1.00000 on M1. Timeout+pkill harness.
+  - [ ] (b) **race detector — `make test-serve-race` under TSan** (`-fsanitize=thread`) + concurrent load.
+    Now MORE valuable: with the worker pool live there IS real concurrency to instrument. Must confirm
+    (i) per-worker clones never alias, (ii) on GCD the no-lock path is genuinely race-free, (iii) the
+    `g_serialize_synth` lock path is correct on the pthread backend. Build a TSan target (ASan/TSan are
+    mutually exclusive — separate build).
+  - [ ] (c) **streaming RTF + verify under int8/int4** (TTFA + RTF per quant), AND streaming under
+    `--workers ≥2` (the chunked-stream path holds the connection open longer → exercises the queue/worker
+    lifecycle differently than full-WAV). All must use the timeout+pkill harness (runaway lesson).
+- [ ] **Make the pthread/Win32 kernel pool reentrant** so off-Mac servers get TRUE `--workers` parallelism
+  (today serialized via `g_serialize_synth`). Options: per-submitter job slots, or a pool-of-pools. Verify
+  on the Ryzen VPS. Until then x86 concurrent serving is correct-but-serial.
 
 **PERFORMANCE / PORTABILITY (the big gap — see 21.2/21.3/21.3b):**
 - [ ] All 8 hot matvec/attention kernels scalar on x86; matvec threading GCD/Apple-only; SwiGLU exp

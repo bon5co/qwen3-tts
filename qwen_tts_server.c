@@ -12,6 +12,7 @@
 
 #include "qwen_tts_server.h"
 #include "qwen_tts.h"
+#include "qwen_tts_thread.h"   /* qwen_parallel_is_reentrant() */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,14 @@
  * for when the server gains per-connection concurrency (continuous batching). With a
  * shared mutable ctx, any future threading MUST hold this around parse+generate. */
 static pthread_mutex_t g_synth_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* When 1, synthesis is serialized under g_synth_lock even across worker threads.
+ * Set at startup iff (n_workers >= 2 AND the kernel thread pool is NOT reentrant):
+ * on the pthread/Win32 backend two workers calling qwen_parallel at once would
+ * corrupt the single global job slot, so we must serialize. On GCD it stays 0
+ * (dispatch_apply is concurrent-safe) → true request-level parallelism. With a
+ * single worker (or inline mode) there is no concurrency, so it also stays 0. */
+static int g_serialize_synth = 0;
 
 static inline float clampf(float v, float lo, float hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -438,6 +447,149 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
             state.total_samples, audio_secs, elapsed / 1000.0, (elapsed / 1000.0) / audio_secs);
 }
 
+/* ── Per-connection handling ─────────────────────────────────────────────
+ *
+ * Reads + routes + responds on one connection, then closes it. Runs either on
+ * the acceptor thread (single-worker inline mode) or on a worker thread (pool
+ * mode). It only ever touches its OWN `ctx` — in pool mode each worker has an
+ * independent clone, so there is no shared mutable state EXCEPT the kernel
+ * thread pool: when that backend is not concurrent-safe, g_serialize_synth is
+ * set and the synthesis dispatch is wrapped in g_synth_lock. */
+static void handle_connection(qwen_tts_ctx_t *ctx, int client_fd,
+                              struct sockaddr_in client_addr) {
+    char *buf = (char *)malloc(1024 * 1024); /* 1MB max request */
+    if (!buf) { close(client_fd); return; }
+    int total = read_request(client_fd, buf, 1024 * 1024);
+    if (total <= 0) { free(buf); close(client_fd); return; }
+
+    /* Parse method and path */
+    char method[16] = {0}, path[256] = {0};
+    sscanf(buf, "%15s %255s", method, path);
+
+    /* Find body (after \r\n\r\n) */
+    const char *body = strstr(buf, "\r\n\r\n");
+    if (body) body += 4;
+    else body = "";
+
+    /* inet_ntop into a local buffer (inet_ntoa's static buffer is not
+     * thread-safe across concurrent workers). */
+    char client_ip[INET_ADDRSTRLEN] = {0};
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+    fprintf(stderr, "[HTTP] %s %s %s from %s\n", method, path,
+            (strcmp(method, "POST") == 0 && body[0]) ? "(has body)" : "", client_ip);
+
+    /* Handle CORS preflight */
+    if (strcmp(method, "OPTIONS") == 0) {
+        const char *cors =
+            "HTTP/1.1 204 No Content\r\n"
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type\r\n"
+            "Connection: close\r\n\r\n";
+        write(client_fd, cors, strlen(cors));
+    }
+    else if (strcmp(path, "/v1/health") == 0 && strcmp(method, "GET") == 0) {
+        handle_health(client_fd);
+    }
+    else if (strcmp(path, "/v1/speakers") == 0 && strcmp(method, "GET") == 0) {
+        handle_speakers(client_fd);
+    }
+    /* Synthesis: per-worker ctx makes these independent; only serialize when the
+     * kernel thread pool itself is not concurrent-safe (g_serialize_synth). */
+    else if (strcmp(path, "/v1/tts") == 0 && strcmp(method, "POST") == 0) {
+        if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
+        handle_tts(ctx, client_fd, body);
+        if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
+    }
+    else if (strcmp(path, "/v1/tts/stream") == 0 && strcmp(method, "POST") == 0) {
+        if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
+        handle_tts_stream(ctx, client_fd, body);
+        if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
+    }
+    else if (strcmp(path, "/v1/audio/speech") == 0 && strcmp(method, "POST") == 0) {
+        if (g_serialize_synth) pthread_mutex_lock(&g_synth_lock);
+        handle_tts(ctx, client_fd, body);   /* OpenAI-compatible: same as /v1/tts */
+        if (g_serialize_synth) pthread_mutex_unlock(&g_synth_lock);
+    }
+    else {
+        send_error(client_fd, 404, "not found");
+    }
+
+    free(buf);
+    close(client_fd);
+}
+
+/* ── Connection queue (acceptor → worker pool) ───────────────────────────── */
+
+#define CONN_QUEUE_CAP 256
+
+typedef struct {
+    int fds[CONN_QUEUE_CAP];
+    int head, tail, count;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    int shutdown;            /* 1 = no more work; workers drain then exit */
+} conn_queue_t;
+
+static void cq_init(conn_queue_t *q) {
+    q->head = q->tail = q->count = 0;
+    q->shutdown = 0;
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+}
+
+static void cq_push(conn_queue_t *q, int fd) {
+    pthread_mutex_lock(&q->mtx);
+    while (q->count == CONN_QUEUE_CAP && !q->shutdown)
+        pthread_cond_wait(&q->not_full, &q->mtx);   /* backpressure */
+    if (q->shutdown) { pthread_mutex_unlock(&q->mtx); close(fd); return; }
+    q->fds[q->tail] = fd;
+    q->tail = (q->tail + 1) % CONN_QUEUE_CAP;
+    q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+/* Returns a client fd, or -1 when the queue is shut down and drained. */
+static int cq_pop(conn_queue_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    while (q->count == 0 && !q->shutdown)
+        pthread_cond_wait(&q->not_empty, &q->mtx);
+    if (q->count == 0 && q->shutdown) { pthread_mutex_unlock(&q->mtx); return -1; }
+    int fd = q->fds[q->head];
+    q->head = (q->head + 1) % CONN_QUEUE_CAP;
+    q->count--;
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+    return fd;
+}
+
+static void cq_shutdown(conn_queue_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    q->shutdown = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_cond_broadcast(&q->not_full);
+    pthread_mutex_unlock(&q->mtx);
+}
+
+typedef struct {
+    qwen_tts_ctx_t *ctx;
+    conn_queue_t *q;
+    int id;
+} worker_arg_t;
+
+static void *worker_main(void *arg) {
+    worker_arg_t *wa = (worker_arg_t *)arg;
+    for (;;) {
+        int fd = cq_pop(wa->q);
+        if (fd < 0) break;   /* shutdown + drained */
+        handle_connection(wa->ctx, fd, (struct sockaddr_in){0});
+    }
+    return NULL;
+}
+
 /* ── Main server loop ────────────────────────────────────────────────── */
 
 static volatile int server_running = 1;
@@ -447,58 +599,112 @@ static void sigint_handler(int sig) {
     server_running = 0;
 }
 
-int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
+static int setup_listen_socket(int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { perror("socket"); return -1; }
-
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
         .sin_port = htons(port)
     };
-
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(server_fd);
-        return -1;
+        perror("bind"); close(server_fd); return -1;
     }
-
-    if (listen(server_fd, 5) < 0) {
-        perror("listen");
-        close(server_fd);
-        return -1;
+    if (listen(server_fd, 16) < 0) {
+        perror("listen"); close(server_fd); return -1;
     }
+    return server_fd;
+}
 
+static void install_signal_handlers(void) {
     struct sigaction sa = { .sa_handler = sigint_handler };
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0; /* no SA_RESTART — let accept() return EINTR */
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+}
 
-    fprintf(stderr, "Server listening on http://0.0.0.0:%d\n", port);
-    fprintf(stderr, "Endpoints:\n");
+static void print_banner(int port, int n_workers) {
+    fprintf(stderr, "Server listening on http://0.0.0.0:%d", port);
+    if (n_workers > 1)
+        fprintf(stderr, " (%d workers%s)", n_workers,
+                g_serialize_synth ? ", synthesis serialized: non-reentrant thread pool" : "");
+    fprintf(stderr, "\nEndpoints:\n");
     fprintf(stderr, "  POST /v1/tts          — generate speech (returns WAV)\n");
     fprintf(stderr, "  POST /v1/tts/stream   — generate speech (chunked PCM stream)\n");
     fprintf(stderr, "  POST /v1/audio/speech — OpenAI-compatible TTS\n");
     fprintf(stderr, "  GET  /v1/speakers     — list speakers\n");
     fprintf(stderr, "  GET  /v1/health       — health check\n\n");
-    fprintf(stderr, "Examples:\n");
-    fprintf(stderr, "  # Full WAV:\n");
-    fprintf(stderr, "  curl -s http://localhost:%d/v1/tts -d '{\"text\":\"Hello world\"}' -o out.wav\n\n", port);
-    fprintf(stderr, "  # Streaming playback (macOS):\n");
-    fprintf(stderr, "  curl -sN http://localhost:%d/v1/tts/stream -d '{\"text\":\"Hello world\"}' | "
-                    "ffplay -f s16le -ar 24000 -ac 1 -nodisp -autoexit -\n\n", port);
-    fprintf(stderr, "  # With options:\n");
-    fprintf(stderr, "  curl -s http://localhost:%d/v1/tts -d '{\"text\":\"Hello\",\"speaker\":\"ryan\","
-                    "\"language\":\"English\"}' -o out.wav\n\n", port);
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
+}
+
+int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
+    if (n_workers < 1) n_workers = 1;
+    int server_fd = setup_listen_socket(port);
+    if (server_fd < 0) return -1;
+    install_signal_handlers();
 
     /* Suppress model output during request handling */
     ctx->silent = 1;
+
+    /* ── Single-worker: original inline accept loop (zero extra memory) ── */
+    if (n_workers == 1) {
+        print_banner(port, 1);
+        while (server_running) {
+            struct sockaddr_in client_addr;
+            socklen_t client_len = sizeof(client_addr);
+            int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+            if (client_fd < 0) {
+                if (errno == EINTR) continue;
+                perror("accept");
+                continue;
+            }
+            handle_connection(ctx, client_fd, client_addr);
+        }
+        close(server_fd);
+        fprintf(stderr, "\nServer stopped.\n");
+        return 0;
+    }
+
+    /* ── Multi-worker: acceptor thread + worker pool ──
+     * Decide serialization: on a non-reentrant kernel pool (pthread/Win32) two
+     * workers calling qwen_parallel at once would corrupt its single job slot. */
+    g_serialize_synth = !qwen_parallel_is_reentrant();
+
+    /* Clone n_workers-1 independent contexts (worker 0 reuses the base ctx).
+     * Clones SHARE the mmapped weights + loaded voice, so only KV/work buffers
+     * cost extra memory per worker. */
+    qwen_tts_ctx_t **ctxs = (qwen_tts_ctx_t **)calloc(n_workers, sizeof(*ctxs));
+    pthread_t *threads = (pthread_t *)calloc(n_workers, sizeof(pthread_t));
+    worker_arg_t *args = (worker_arg_t *)calloc(n_workers, sizeof(worker_arg_t));
+    if (!ctxs || !threads || !args) {
+        fprintf(stderr, "Error: worker pool allocation failed\n");
+        free(ctxs); free(threads); free(args); close(server_fd); return -1;
+    }
+    ctxs[0] = ctx;
+    int spawned = n_workers;
+    for (int i = 1; i < n_workers; i++) {
+        ctxs[i] = qwen_tts_clone_for_worker(ctx);
+        if (!ctxs[i]) {
+            fprintf(stderr, "Warning: failed to clone worker %d; running with %d workers\n", i, i);
+            spawned = i;
+            break;
+        }
+    }
+
+    conn_queue_t q;
+    cq_init(&q);
+    for (int i = 0; i < spawned; i++) {
+        args[i].ctx = ctxs[i];
+        args[i].q = &q;
+        args[i].id = i;
+        pthread_create(&threads[i], NULL, worker_main, &args[i]);
+    }
+
+    print_banner(port, spawned);
 
     while (server_running) {
         struct sockaddr_in client_addr;
@@ -509,69 +715,24 @@ int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
             perror("accept");
             continue;
         }
-
-        /* Read request */
-        char *buf = (char *)malloc(1024 * 1024); /* 1MB max request */
-        int total = read_request(client_fd, buf, 1024 * 1024);
-        if (total <= 0) { free(buf); close(client_fd); continue; }
-
-        /* Parse method and path */
-        char method[16] = {0}, path[256] = {0};
-        sscanf(buf, "%15s %255s", method, path);
-
-        /* Find body (after \r\n\r\n) */
-        const char *body = strstr(buf, "\r\n\r\n");
-        if (body) body += 4;
-        else body = "";
-
-        char *client_ip = inet_ntoa(client_addr.sin_addr);
-        fprintf(stderr, "[HTTP] %s %s %s from %s\n", method, path,
-                (strcmp(method, "POST") == 0 && body[0]) ? "(has body)" : "", client_ip);
-
-        /* Handle CORS preflight */
-        if (strcmp(method, "OPTIONS") == 0) {
-            const char *cors =
-                "HTTP/1.1 204 No Content\r\n"
-                "Access-Control-Allow-Origin: *\r\n"
-                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-                "Access-Control-Allow-Headers: Content-Type\r\n"
-                "Connection: close\r\n\r\n";
-            write(client_fd, cors, strlen(cors));
-        }
-        /* Route requests */
-        else if (strcmp(path, "/v1/health") == 0 && strcmp(method, "GET") == 0) {
-            handle_health(client_fd);
-        }
-        else if (strcmp(path, "/v1/speakers") == 0 && strcmp(method, "GET") == 0) {
-            handle_speakers(client_fd);
-        }
-        /* Synthesis handlers mutate the shared ctx → serialize them under g_synth_lock
-         * (uncontended while the accept loop is single-threaded; correct if it isn't). */
-        else if (strcmp(path, "/v1/tts") == 0 && strcmp(method, "POST") == 0) {
-            pthread_mutex_lock(&g_synth_lock);
-            handle_tts(ctx, client_fd, body);
-            pthread_mutex_unlock(&g_synth_lock);
-        }
-        else if (strcmp(path, "/v1/tts/stream") == 0 && strcmp(method, "POST") == 0) {
-            pthread_mutex_lock(&g_synth_lock);
-            handle_tts_stream(ctx, client_fd, body);
-            pthread_mutex_unlock(&g_synth_lock);
-        }
-        else if (strcmp(path, "/v1/audio/speech") == 0 && strcmp(method, "POST") == 0) {
-            /* OpenAI-compatible: same as /v1/tts */
-            pthread_mutex_lock(&g_synth_lock);
-            handle_tts(ctx, client_fd, body);
-            pthread_mutex_unlock(&g_synth_lock);
-        }
-        else {
-            send_error(client_fd, 404, "not found");
-        }
-
-        free(buf);
-        close(client_fd);
+        cq_push(&q, client_fd);
     }
 
+    /* Graceful shutdown: stop accepting, drain queue, join workers. */
     close(server_fd);
+    cq_shutdown(&q);
+    for (int i = 0; i < spawned; i++)
+        pthread_join(threads[i], NULL);
+
+    /* Free clones (worker 0 = base ctx, owned by the caller). */
+    for (int i = 1; i < spawned; i++)
+        qwen_tts_free_clone(ctxs[i]);
+
+    free(ctxs); free(threads); free(args);
     fprintf(stderr, "\nServer stopped.\n");
     return 0;
+}
+
+int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port) {
+    return qwen_tts_serve_ex(ctx, port, 1);
 }

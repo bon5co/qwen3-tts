@@ -21,8 +21,12 @@ static void ensure_work_buffers(int n) {
     g_work_cap = n;
 }
 
-/* Simple LCG random number generator */
-static uint32_t g_seed = 12345;
+/* Simple LCG random number generator.
+ * __thread (per-thread state): the concurrent server runs one synthesis per
+ * worker thread, each seeded per-request. A shared g_seed would race across
+ * workers and break per-request seed reproducibility. Single-threaded callers
+ * are unaffected (each thread sees its own seed). */
+static __thread uint32_t g_seed = 12345;
 static float rand_uniform(void) {
     g_seed = g_seed * 1103515245 + 12345;
     return (float)((g_seed >> 16) & 0x7FFF) / 32768.0f;

@@ -681,6 +681,132 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     free(ctx);
 }
 
+/* ── Worker clone (concurrent server) ───────────────────────────────────
+ *
+ * Produce an independent context that SHARES all read-only state with `base`
+ * (mmapped weights, quantized arrays, codebooks, RoPE caches, the cloned
+ * voice's overridden/quantized weights + speaker embedding, precomputed
+ * special-token embeddings) but owns FRESH copies of every buffer that the
+ * generation path mutates (KV caches, per-step work buffers, the embedding
+ * LRU cache, the delta-prefill cache, sampling params). This lets N server
+ * workers each run a synthesis concurrently without aliasing each other's
+ * state, while paying the weight memory only once.
+ *
+ * Sizes mirror the allocation sites in qwen_talker_load / qwen_cp_load /
+ * qwen_tts_load_ex exactly (config is identical across clones). The lazily
+ * grown buffers (pref_*, logits, codec_codes, prev_tokens, prev_input_embeds,
+ * sd_stream.*) start NULL and are realloc'd per worker on first request.
+ *
+ * Free a clone with qwen_tts_free_clone (frees ONLY the per-worker buffers —
+ * never the shared weights/safetensors). NEVER pass a clone to
+ * qwen_tts_unload (it would close the shared safetensors / free shared
+ * weights, corrupting the base and the other clones). */
+qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
+    if (!base) return NULL;
+    qwen_tts_ctx_t *w = (qwen_tts_ctx_t *)malloc(sizeof(qwen_tts_ctx_t));
+    if (!w) return NULL;
+    *w = *base;   /* share every pointer by default; override the mutable ones below */
+
+    const qwen_tts_config_t *c = &w->config;
+    int h        = c->hidden_size;
+    int th       = c->text_hidden_size;
+    int q_dim    = c->num_heads * c->head_dim;
+    int kv_dim   = c->num_kv_heads * c->head_dim;
+    int cp_h     = c->cp_hidden_size;
+    int cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    int cp_kv_dim= c->cp_num_kv_heads * c->cp_head_dim;
+    int swiglu_size = c->intermediate_size > c->cp_intermediate_size
+                      ? c->intermediate_size : c->cp_intermediate_size;
+
+    /* Talker KV cache + decode buffers (see qwen_talker_load) */
+    int talker_kv_max = 2048;
+    int64_t kv_size = (int64_t)c->num_layers * talker_kv_max * kv_dim;
+    w->kv_cache_k = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
+    w->kv_cache_v = (uint16_t *)aligned_calloc(kv_size, sizeof(uint16_t));
+    w->kv_max = talker_kv_max; w->kv_len = 0;
+    w->dec_x        = (float *)aligned_calloc(h, sizeof(float));
+    w->dec_x_norm   = (float *)aligned_malloc(h * sizeof(float));
+    w->dec_q        = (float *)aligned_malloc(q_dim * sizeof(float));
+    w->dec_k        = (float *)aligned_malloc(kv_dim * sizeof(float));
+    w->dec_v        = (float *)aligned_malloc(kv_dim * sizeof(float));
+    w->dec_attn_out = (float *)aligned_malloc(q_dim * sizeof(float));
+    w->dec_proj_out = (float *)aligned_malloc(h * sizeof(float));
+    w->dec_gate     = (float *)aligned_malloc(2 * c->intermediate_size * sizeof(float));
+    w->dec_up       = NULL;
+    w->dec_ffn_out  = (float *)aligned_malloc(h * sizeof(float));
+    w->swiglu_tmp   = (float *)aligned_malloc(swiglu_size * sizeof(float));
+
+    /* CP KV cache + decode buffers (see qwen_cp_load) */
+    int cp_kv_max = 64;
+    int64_t cp_kv_size = (int64_t)c->cp_num_layers * cp_kv_max * cp_kv_dim;
+    w->cp_kv_k = (uint16_t *)aligned_calloc(cp_kv_size, sizeof(uint16_t));
+    w->cp_kv_v = (uint16_t *)aligned_calloc(cp_kv_size, sizeof(uint16_t));
+    w->cp_kv_max = cp_kv_max; w->cp_kv_len = 0;
+    w->cp_dec_x        = (float *)aligned_malloc(cp_h * sizeof(float));
+    w->cp_dec_q        = (float *)aligned_malloc(cp_q_dim * sizeof(float));
+    w->cp_dec_k        = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
+    w->cp_dec_v        = (float *)aligned_malloc(cp_kv_dim * sizeof(float));
+    w->cp_dec_attn_out = (float *)aligned_malloc(cp_q_dim * sizeof(float));
+    w->cp_dec_gate     = (float *)aligned_malloc(2 * c->cp_intermediate_size * sizeof(float));
+    w->cp_dec_up       = NULL;
+    w->cp_dec_ffn_out  = (float *)aligned_malloc(cp_h * sizeof(float));
+
+    /* Text-embedding temp buffers (mutated per embed call) */
+    w->emb_tmp1 = (float *)aligned_malloc(th * sizeof(float));
+    w->emb_tmp2 = (float *)aligned_malloc(th * sizeof(float));
+
+    /* Per-worker LRU embedding cache (emb_cache_init reads w->emb_cache.* fresh) */
+    memset(&w->emb_cache, 0, sizeof(w->emb_cache));
+    emb_cache_init(w);
+
+    /* Lazily grown buffers — start empty, realloc'd per worker on first request */
+    w->pref_residual = w->pref_x_norm = w->pref_q = NULL;
+    w->pref_k = w->pref_v = w->pref_attn_out = w->pref_gate = w->pref_proj = NULL;
+    w->pref_seq_cap = 0;
+    w->pref_wq_f32 = w->pref_wk_f32 = w->pref_wv_f32 = NULL;
+    w->pref_wo_f32 = w->pref_gate_up_f32 = w->pref_down_f32 = NULL;
+    w->logits = NULL;
+    w->codec_codes = NULL; w->codec_frames = 0; w->codec_frames_cap = 0;
+    w->prev_tokens = NULL; w->n_prev_tokens = 0; w->prev_tokens_cap = 0;
+    w->prev_input_embeds = NULL; w->prev_prefill_len = 0;
+    w->audio_buf = NULL; w->audio_samples = 0;
+    memset(&w->sd_stream, 0, sizeof(w->sd_stream));
+
+    /* Per-worker tokenizer: loaded lazily on first generate (avoids sharing a
+     * single tokenizer across threads). instruct/tf/streaming reset per request. */
+    w->cached_tokenizer = NULL;
+    w->instruct = NULL;
+    w->tf_ref_codes = NULL;
+    w->stream = 0; w->audio_cb = NULL; w->audio_cb_userdata = NULL;
+
+    return w;
+}
+
+/* Free a worker clone: ONLY the per-worker buffers (mirrors the runtime-buffer
+ * subset of qwen_tts_unload). Shared weights/safetensors/rope/voice belong to
+ * the base ctx and must NOT be touched here. */
+void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
+    if (!ctx) return;
+    free(ctx->kv_cache_k); free(ctx->kv_cache_v); free(ctx->cp_kv_k); free(ctx->cp_kv_v);
+    free(ctx->dec_x); free(ctx->dec_x_norm); free(ctx->dec_q); free(ctx->dec_k); free(ctx->dec_v);
+    free(ctx->dec_attn_out); free(ctx->dec_proj_out); free(ctx->dec_gate); free(ctx->dec_up); free(ctx->dec_ffn_out);
+    free(ctx->swiglu_tmp);
+    free(ctx->cp_dec_x); free(ctx->cp_dec_q); free(ctx->cp_dec_k); free(ctx->cp_dec_v);
+    free(ctx->cp_dec_attn_out); free(ctx->cp_dec_gate); free(ctx->cp_dec_up); free(ctx->cp_dec_ffn_out);
+    free(ctx->pref_residual); free(ctx->pref_x_norm); free(ctx->pref_q);
+    free(ctx->pref_k); free(ctx->pref_v); free(ctx->pref_attn_out);
+    free(ctx->pref_gate); free(ctx->pref_proj);
+    free(ctx->pref_wq_f32); free(ctx->pref_wk_f32); free(ctx->pref_wv_f32);
+    free(ctx->pref_wo_f32); free(ctx->pref_gate_up_f32); free(ctx->pref_down_f32);
+    free(ctx->emb_tmp1); free(ctx->emb_tmp2);
+    emb_cache_free(ctx);
+    free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
+    free(ctx->prev_input_embeds);
+    free(ctx->instruct);
+    if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
+    free(ctx);
+}
+
 void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void *userdata) {
     ctx->audio_cb = cb;
     ctx->audio_cb_userdata = userdata;

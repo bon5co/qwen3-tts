@@ -617,6 +617,17 @@ test-serve-parallel: $(TARGET)
 	 echo "PASS: 2 parallel requests served"
 	@echo ""
 
+# ── True concurrent worker-pool test (--workers 2) ──
+# Unlike test-serve-parallel (single-worker server → serialized), this exercises
+# the concurrent worker pool: it fires 2 simultaneous requests at a 2-worker
+# server and verifies each output matches a single-worker reference via mel-corr
+# (proving per-worker clones share weights correctly and don't corrupt state),
+# across {bf16, int8, int4, voice+int8}. Kills the server BY NAME (runaway-safe).
+
+test-serve-concurrent: $(TARGET)
+	@MODEL=$(MODEL_SMALL) bash tests/test_parallel.sh
+	@echo ""
+
 # ── Server reproducibility regression (delta-prefill stale dec_x bug, fixed cbfa979) ──
 # Two+ IDENTICAL consecutive requests MUST produce bit-identical output. Runs -j1
 # --temperature 0 for full determinism (no threading FP noise / no sampling butterfly),
@@ -646,7 +657,7 @@ test-serve-repro: $(TARGET)
 
 # ── Combined server tests ──
 
-test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -785,7 +796,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update quant-ladder test-modes test-qvoice e2e \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \

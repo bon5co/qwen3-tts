@@ -286,6 +286,7 @@ int main(int argc, char **argv) {
     int do_stdout = 0;
     int stream_chunk = 10;
     int serve_port = 0;  /* 0 = not serving */
+    int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
@@ -339,6 +340,7 @@ int main(int argc, char **argv) {
         {"greedy-warmup", required_argument, 0, 1023},
         {"target-cv",     required_argument, 0, 1024},
         {"caps",          no_argument,       0, 1025},
+        {"workers",       required_argument, 0, 1026},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -377,6 +379,7 @@ int main(int argc, char **argv) {
             case 1023: { int gw = atoi(optarg); ctx_greedy_warmup = gw; } break;
             case 1024: target_cv_dir = optarg; break;
             case 1025: show_caps = 1; break;
+            case 1026: serve_workers = atoi(optarg); break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -402,6 +405,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --stdout                   Output raw s16le PCM to stdout (implies --stream)\n");
                 fprintf(stderr, "  --stream-chunk <n>         Frames per stream chunk (default: 10)\n");
                 fprintf(stderr, "  --serve <port>             Start HTTP server on port\n");
+                fprintf(stderr, "  --workers <n>              Concurrent synthesis workers (server; default 1)\n");
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
@@ -1565,7 +1569,7 @@ int main(int argc, char **argv) {
 
     /* Server mode: start HTTP server and block */
     if (serve_port > 0) {
-        int ret = qwen_tts_serve(ctx, serve_port);
+        int ret = qwen_tts_serve_ex(ctx, serve_port, serve_workers);
         qwen_tts_unload(ctx);
         return ret;
     }

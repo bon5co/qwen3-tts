@@ -32,6 +32,7 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
 
 void qwen_threadpool_start(int n_threads) { (void)n_threads; }
 void qwen_threadpool_stop(void) {}
+int qwen_parallel_is_reentrant(void) { return 1; }  /* GCD: concurrent callers safe */
 
 /* -------------------------------------------------------------------------
  * Windows native (Win32 threads + condition variables)
@@ -147,6 +148,9 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     LeaveCriticalSection(&P.mtx);
 }
 
+/* Single global job slot → NOT safe to submit from two threads at once. */
+int qwen_parallel_is_reentrant(void) { return 0; }
+
 /* -------------------------------------------------------------------------
  * POSIX pthread persistent pool (Linux / WSL / *BSD; macOS with -DQWEN_FORCE_PTHREAD)
  * ------------------------------------------------------------------------- */
@@ -260,5 +264,8 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     P.job = NULL;
     pthread_mutex_unlock(&P.mtx);
 }
+
+/* Single global job slot → NOT safe to submit from two threads at once. */
+int qwen_parallel_is_reentrant(void) { return 0; }
 
 #endif

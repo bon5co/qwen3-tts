@@ -40,6 +40,15 @@ void qwen_threadpool_start(int n_threads);
 /* Tear down the pool (joins workers). Optional — process exit also reclaims. */
 void qwen_threadpool_stop(void);
 
+/* 1 if qwen_parallel may be called CONCURRENTLY from multiple application
+ * threads (e.g. several server workers each running a synthesis), 0 otherwise.
+ *   GCD: 1  — dispatch_apply has no shared global state; concurrent callers are fine.
+ *   pthread/Win32: 0 — the persistent pool has a single global job slot
+ *                      (P.job/P.completed/P.generation); two simultaneous
+ *                      submitters would corrupt completion accounting.
+ * The concurrent server uses this to decide whether to serialize synthesis. */
+int qwen_parallel_is_reentrant(void);
+
 #ifdef __cplusplus
 }
 #endif
