@@ -634,11 +634,19 @@ ConvNeXt pw1/pw2 if ever quantized (MEDIUM-HIGH, currently f32); (7) embeddings 
 keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligibility.**
 
 **Speed levers (ranked):** SDOT (validated, ARM) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
-x86 is scalar+single-thread today, the #1 unblock)** · fuse codec_head into final Talker wo ·
-vectorize RoPE + online-softmax attn accumulators (scalar today) · server continuous-batching
-(throughput only). **Refuted/closed:** int4-Q4_0 global on CP, self-speculative (marginal),
-contextual sparsity (CP FFN dense), **SDOT-on-lm_head (forks int8 trajectory, mel-corr→0.51),
-q4_0 2-row-fuse (no win on NEON — decode-bound not x-load-bound)** — both tried & reverted 2026-06-04.
+x86 is scalar+single-thread today, the #1 unblock)** · server continuous-batching (throughput only).
+**Refuted/closed (all verified 2026-06-04):**
+- int4-Q4_0 global on CP, self-speculative (marginal), contextual sparsity (CP FFN dense).
+- SDOT-on-lm_head — forks int8 trajectory (golden mel-corr → 0.51); reverted.
+- q4_0 2-row-fuse — no win on NEON (decode-bound, not x-load-bound); reverted.
+- **"vectorize RoPE + attention" — ALREADY DONE (workflow was WRONG here).** Hot-path attention
+  (`qwen_causal_attention_bf16kv`) has full NEON (Q·K dot + online-softmax V accumulation) + AVX2
+  twins; RoPE (`apply_rope_neox_inplace`, Talker + CP) is NEON+AVX2. The only scalar RoPE
+  (`qwen_apply_rope_interleaved`, kernels.c:2209) has ZERO callers = dead code. Nothing to do.
+- **"fuse codec_head into final Talker wo" — NOT a real fusion.** codec_head applies to last_hidden
+  = output AFTER the final layer's residual+FFN+RMSNorm (nonlinearities in between), so it can't fold
+  into wo. It's one already-optimized bf16 matvec (~1% of total). Skip-special-token rows would save
+  ~0.3% total — not worth the branching. Closed.
 
 **Prosody/instruct knobs (ranked, concrete):** (1) `--roughness` = bf16↔q2 blend on CP `down`
 (code_predictor.c FFN); (2) steerable prosody vector added to `cp_x` BEFORE CP layer 0 (the single
