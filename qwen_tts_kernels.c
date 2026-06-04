@@ -99,8 +99,10 @@ void qwen_caps_report(void *out) {
 #endif
 #if defined(__ARM_FEATURE_DOTPROD)
     fprintf(f, "  int8 dot:         SDOT vdotq_s32 (native)\n");
+#elif defined(__AVX512VNNI__)
+    fprintf(f, "  int8 dot:         VNNI _mm512_dpbusd_epi32 (native)\n");
 #elif defined(__AVX2__)
-    fprintf(f, "  int8 dot:         widen->FMA (AVX2; no VNNI yet — PLAN 21.3)\n");
+    fprintf(f, "  int8 dot:         widen->FMA (AVX2; no VNNI)\n");
 #else
     fprintf(f, "  int8 dot:         dequant->FMA (no SDOT/VNNI)\n");
 #endif
@@ -1055,6 +1057,86 @@ static void int8_matvec_sdot(float *y, const int8_t *qx, float sx,
 }
 #endif /* __ARM_FEATURE_DOTPROD */
 
+#if defined(__AVX512VNNI__)
+/* ── x86 native int8 dot via AVX-512 VNNI (the SDOT analog for x86) ──
+ * UNVALIDATED ON HARDWARE — written for a rented AVX-512-VNNI VPS (e.g. Zen4/Zen5
+ * 9950X3D, Cascade Lake+). Cross-compiles clean; validate with `make test-golden`
+ * on the VPS before trusting. Opt out at runtime with QWEN_NO_VNNI=1. */
+
+/* f32 activation -> signed int8 (per-vector absmax). Scalar inner (n is small,
+ * e.g. hidden=1024); correctness-first — vectorize later if it shows up. */
+static float quantize_act_int8_x86(int8_t *qx, const float *x, int n) {
+    float amax = 0.0f;
+    for (int i = 0; i < n; i++) { float a = fabsf(x[i]); if (a > amax) amax = a; }
+    if (amax == 0.0f) { memset(qx, 0, (size_t)n); return 0.0f; }
+    float inv = 127.0f / amax;
+    for (int i = 0; i < n; i++) {
+        int v = (int)lrintf(x[i] * inv);
+        qx[i] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+    }
+    return amax / 127.0f;
+}
+
+/* y[o] = scale[o]*sx * Σ_k W[o][k]·qx[k], via _mm512_dpbusd_epi32.
+ * VNNI multiplies UNSIGNED u8 × SIGNED s8, but qx is signed. Use ua = qx+128
+ * (unsigned) and correct: Σ w·qx = Σ w·ua − 128·Σ w. Both Σw·ua and Σw are
+ * accumulated with VNNI in the same loop (the latter via dpbusd(ones_u8, w)).
+ * 2-row fused; 64 int8/iter per 512-bit lane. */
+static void int8_matvec_vnni(float *y, const int8_t *qx, float sx,
+                             const int8_t *W, const float *scale,
+                             int in_dim, int out_dim) {
+    const __m512i v128 = _mm512_set1_epi8((char)128);
+    const __m512i ones = _mm512_set1_epi8(1);
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        const int8_t *w1 = W + (size_t)(o + 1) * in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), acc1 = _mm512_setzero_si512();
+        __m512i ws0  = _mm512_setzero_si512(), ws1  = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            __m512i wv1 = _mm512_loadu_si512((const void *)(w1 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            acc1 = _mm512_dpbusd_epi32(acc1, ua, wv1);
+            ws0  = _mm512_dpbusd_epi32(ws0, ones, wv0);
+            ws1  = _mm512_dpbusd_epi32(ws1, ones, wv1);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
+        int s1 = _mm512_reduce_add_epi32(acc1) - 128 * _mm512_reduce_add_epi32(ws1);
+        for (; k < in_dim; k++) { s0 += (int)w0[k] * qx[k]; s1 += (int)w1[k] * qx[k]; }
+        y[o]     = (float)s0 * scale[o]     * sx;
+        y[o + 1] = (float)s1 * scale[o + 1] * sx;
+    }
+    if (o < out_dim) {
+        const int8_t *w0 = W + (size_t)o * in_dim;
+        __m512i acc0 = _mm512_setzero_si512(), ws0 = _mm512_setzero_si512();
+        int k = 0;
+        for (; k + 64 <= in_dim; k += 64) {
+            __m512i ua  = _mm512_add_epi8(_mm512_loadu_si512((const void *)(qx + k)), v128);
+            __m512i wv0 = _mm512_loadu_si512((const void *)(w0 + k));
+            acc0 = _mm512_dpbusd_epi32(acc0, ua, wv0);
+            ws0  = _mm512_dpbusd_epi32(ws0, ones, wv0);
+        }
+        int s0 = _mm512_reduce_add_epi32(acc0) - 128 * _mm512_reduce_add_epi32(ws0);
+        for (; k < in_dim; k++) s0 += (int)w0[k] * qx[k];
+        y[o] = (float)s0 * scale[o] * sx;
+    }
+}
+
+typedef struct {
+    float *y; const int8_t *qx; float sx; const int8_t *W; const float *scale; int rows, cols;
+} int8_vnni_ctx;
+static void int8_vnni_task(size_t tid, size_t nt, void *vc) {
+    int8_vnni_ctx *c = (int8_vnni_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matvec_vnni(c->y + r0, c->qx, c->sx, c->W + (size_t)r0 * c->cols,
+                     c->scale + r0, c->cols, r1 - r0);
+}
+#endif /* __AVX512VNNI__ */
+
 typedef struct {
     float *y; const float *x; const int8_t *W; const float *scale; int rows, cols;
 } int8_mv_ctx;
@@ -1080,6 +1162,25 @@ static void int8_sdot_task(size_t tid, size_t nt, void *vc) {
 
 void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
                       const float *x, int rows, int cols) {
+#if defined(__AVX512VNNI__)
+    /* x86 native int8 dot (VNNI). Same shape as the ARM SDOT path: quantize the
+     * shared activation once, then int8×int8 via dpbusd. QWEN_NO_VNNI=1 opts out. */
+    enum { QXV_MAX = 8192 };
+    static int vnni_off = -1;
+    if (vnni_off < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_off = (e && e[0] == '1'); }
+    if (!vnni_off && cols <= QXV_MAX) {
+        int8_t qx_buf[QXV_MAX];
+        float sx = quantize_act_int8_x86(qx_buf, x, cols);
+        int nt = g_n_threads;
+        if (nt > 1 && rows >= 256) {
+            int8_vnni_ctx c = { y, qx_buf, sx, W, scale, rows, cols };
+            qwen_parallel((size_t)nt, int8_vnni_task, &c);
+            return;
+        }
+        int8_matvec_vnni(y, qx_buf, sx, W, scale, cols, rows);
+        return;
+    }
+#endif
 #if defined(__ARM_FEATURE_DOTPROD)
     /* SDOT path: quantize the shared activation x once, then int8×int8 dot.
      * qx is a fixed-size stack buffer; qwen_parallel is synchronous so the pool

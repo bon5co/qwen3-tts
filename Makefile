@@ -19,6 +19,9 @@ ifeq ($(UNAME_S),Darwin)
 else ifneq (,$(filter x86_64 amd64,$(UNAME_M)))
     ifeq ($(SIMD),scalar)
         ARCH_FLAGS =
+    else ifeq ($(SIMD),avx512vnni)
+        # AVX-512 + VNNI (native int8 dot). Cascade Lake+/Ice Lake/Zen4+ (e.g. Ryzen 9950X3D).
+        ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma
     else ifeq ($(SIMD),avx512)
         ARCH_FLAGS = -mavx512f -mavx512bw -mavx512vl -mavx2 -mfma
     else
