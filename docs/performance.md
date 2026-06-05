@@ -31,9 +31,10 @@ the Code Predictor's per-frame weight traffic; longer audio amortizes prefill so
 server (delta-prefill + embedding cache + decoder overlap) holds ~0.88 warm. Quality is validated by
 ear vs bf16, including cloned `.qvoice` voices. See [Quantization](quantization.md) for the details.
 
-## RTF Across Modes
+## RTF Across Modes (bf16, full precision)
 
-Results from `make bench-full` (seed 42, speaker ryan):
+Results from `make bench-full` (seed 42, speaker ryan). These are **bf16** (reference quality);
+for the `--int8` numbers (sub-1.0 on M1) see the sweet-spot table above.
 
 | Config | 0.6B Short | 0.6B Long | 1.7B Short | 1.7B Long |
 |--------|-----------|----------|-----------|----------|

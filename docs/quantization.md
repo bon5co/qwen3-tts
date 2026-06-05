@@ -55,11 +55,15 @@ INT8 Talker is ~46 ms/f, see the validated figures in the box above):
 ## Recommendation
 
 On Apple Silicon, use `--int8` for **both** models — Talker −23% (1.7B) and CP −29% (both) with
-SDOT, good audio quality. On x86/Linux, measure first: the int8 matvec is scalar there today and
-may not beat BF16 until the AVX2/VNNI path lands (PLAN.md 21.3).
+SDOT, and **0.6B goes sub-realtime (RTF < 1.0) in CLI/stream/server**. On x86 the int8 matvec now has
+AVX2 + AVX-512/VNNI (validated on Ryzen 6800H and EPYC 9555P/Zen5) — `--int8` is the right default
+there too; on a memory-starved CPU with a small L3, `--int4` can edge ahead multi-threaded
+(see [x86 optimization](x86-optimization.md)).
 
-INT4 saves memory but is *slower* than INT8 (nibble unpacking + per-block-32 scales too coarse for
-the CP — int4 was refuted on both the Talker and the CP; int8 is the quality/speed floor).
+INT4 is the lever on **memory-starved x86** (small L3 → fewer weight bytes wins, e.g. Ryzen 6800H
+3.9→2.02). On **cache-rich / bandwidth-rich chips (Apple M1)** INT4 is *slower* than INT8 (nibble
+unpacking dominates) — there INT8 is the quality/speed floor. Per-block-32 int4 scales are also a
+touch coarse for the CP's fine residuals (slight timbre shift), so INT8 stays the quality reference.
 For maximum speed, use the 0.6B model (RTF ~1.3–1.7 vs 3.6 for 1.7B INT8).
 
 On systems with 16+ GB free RAM, expected performance is better than shown above

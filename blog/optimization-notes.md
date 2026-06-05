@@ -2,6 +2,14 @@
 
 *How cache alignment, SIMD intrinsics (NEON/AVX), pipeline threading, algorithm fixes, and lessons from 1990s game programming nearly tripled our inference speed.*
 
+> **Scope note (updated for v0.9.0).** This post is the original **Apple M1, bf16** optimization story
+> (RTF ~3.5 → ~1.3). Two things landed since: (1) **`--int8` + native SDOT** takes the 0.6B model
+> **sub-realtime on Apple Silicon** (RTF < 1.0, CLI/stream/server); (2) the x86 hot path got real
+> **AVX2 + AVX-512/VNNI** kernels + cross-OS threading. That cross-platform speedup story has its own
+> write-up → [Making Qwen3-TTS fast on every CPU](making-qwen3-tts-fast-on-every-cpu.md) and the
+> [x86 optimization findings](../docs/x86-optimization.md). When this post says "AVX on x86", note
+> those AVX paths actually shipped in v0.9.0 — at the time of writing they were NEON-only/scalar.
+
 ## The Starting Point
 
 We have a pure C inference engine for Qwen3-TTS, a text-to-speech model with
@@ -117,7 +125,8 @@ with fused multiply-accumulate, versus one float at a time in the scalar version
 Same story with RoPE (rotary position embeddings) — the speech decoder had a
 scalar loop doing paired rotations at 32 elements per head. We replaced it
 with SIMD intrinsics that process 4 pairs at once, fusing Q and K rotation
-in the same pass (shown here with NEON; AVX variant in `qwen_tts_kernels_avx.c`):
+in the same pass (shown here with NEON; the AVX2 twin lives inline in `qwen_tts_kernels.c`
+under `#elif defined(__AVX2__)`, added in v0.9.0):
 
 ```c
 // NEON: 4-wide fused Q+K rotation

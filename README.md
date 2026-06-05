@@ -59,7 +59,7 @@ make blas
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`.
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
-- **INT8 quantization** — `--int8` quantizes Talker + Code Predictor: **0.6B RTF 1.70→1.29 (−24%)**, **1.7B 2.66→1.79 (−33%)**. Works with preset speakers and custom `.qvoice` voices. (INT4 is opt-in but slower than INT8 on CPU — nibble-unpack overhead.)
+- **INT8 quantization** — `--int8` quantizes Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B goes sub-realtime on Apple Silicon (RTF < 1.0, CLI/stream/server)**, **1.7B 2.66→1.79 (−33%)**, near-bf16 quality, works with preset speakers and custom `.qvoice` voices. (INT4 is the lever on memory-starved x86; on cache-rich chips like M1, INT8 wins.)
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
 - **24 kHz WAV output** — 16-bit PCM, mono.
 
@@ -216,7 +216,7 @@ Text --> BPE Tokenizer --> Talker (LLM) --> Code Predictor --> Speech Decoder --
 
 | | 0.6B | 1.7B |
 |---|------|------|
-| Hidden dim | 1024 | 2048 |
+| Talker hidden dim | 1024 | 2048 |
 | Heads (Q/KV) | 16/8 | 16/8 |
 | Layers | 28 | 28 |
 | Code Predictor | 1024 hidden, 5 layers | 1024 hidden, 5 layers (+2048→1024 projection) |
@@ -273,11 +273,12 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 
 | Hardware | 0.6B RTF | Notes |
 |----------|----------|-------|
-| **This project (C, Apple M1 CPU)** | **1.26–1.39** | Pure C, no GPU |
+| **This project (C, Apple M1 CPU, `--int8`)** | **0.80–0.90** | Pure C, no GPU — **faster than real-time** |
+| This project (C, Apple M1 CPU, bf16) | 1.26–1.39 | Pure C, no GPU |
 | Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | Official Python, CPU-only |
 | NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
 
-3–4x faster than Python on CPU. Within 2x of an RTX 3090 — on a 2020 laptop with no GPU.
+5–7x faster than Python on CPU, and **faster than real-time with `--int8`** — on a 2020 laptop with no GPU.
 
 > Per-component breakdown, full GPU table, optimization history → [docs/performance.md](docs/performance.md)
 > x86 AVX2/AVX-512/VNNI findings + how to benchmark your CPU → [docs/x86-optimization.md](docs/x86-optimization.md)
@@ -301,7 +302,8 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 |------|-------|
 | [Voice Cloning Internals](blog/voice-cloning-internals.md) | ECAPA-TDNN architecture deep-dive |
 | [Cross-Model Voice Analysis](blog/cross-model-voice-analysis.md) | Why delta format works (weight analysis) |
-| [Optimization Notes](blog/optimization-notes.md) | RTF 3.5 → 1.3: the full optimization story |
+| [Optimization Notes](blog/optimization-notes.md) | RTF 3.5 → 1.3: the full M1 bf16 optimization story |
+| [Fast on Every CPU](blog/making-qwen3-tts-fast-on-every-cpu.md) | SDOT (sub-1.0 on M1) + AVX2/AVX-512/VNNI on x86; why it's memory-bound |
 
 ## Credits & Acknowledgments
 

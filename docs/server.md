@@ -114,25 +114,23 @@ temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 Each request resets its **sampling parameters** to defaults (speaker, language, temperature,
 top-k/p, rep-penalty, seed), so those do not leak between requests.
 
-> **Known issue (2026-06-03): generation state is NOT fully reset between requests.** The KV
-> cache / sequence position are not cleared in `reset_request_state()`, so a request inherits the
-> previous request's end-state. Consequence: two *identical* consecutive requests (same text, same
-> seed, even `-j1 --temperature 0`) produce **different** output — the first (cold) request matches
-> the CLI, later ones diverge in length/trajectory. The output stays coherent speech, but server
-> output is **not reproducible across requests** today. Pre-existing and unrelated to `--int8`/SDOT
-> (the engine itself is bit-deterministic via the CLI). Tracked in PLAN.md OPEN TASKS.
+> **Reproducibility (fixed 2026-06-03):** identical consecutive requests now produce **bit-identical**
+> output, and a cold server request matches the CLI. The earlier cross-request divergence was a stale
+> `ctx->dec_x` left over on a full-prefix match; the fix forces a fresh prefill in that case (the
+> partial-match delta-prefill optimization is preserved). Regression-guarded by `make test-serve-repro`
+> (3 identical requests, bit-identical) and `make test-serve-concurrent` (per-worker clones, corr=1.0).
 
 ## Performance
 
-Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads (RTF numbers are **Apple-M1-only** — see
-[performance.md](performance.md) for why x86/Linux are slower today). Same text, same seed
-(`--seed 42`) — note the warm call does **not** reproduce the cold call bit-for-bit (see the
-known-issue note above):
+Benchmarked on Apple M1 8-core, 16 GB RAM, 4 threads, same text + seed (`--seed 42`). bf16 below;
+**with `--int8` the 0.6B server is faster than real-time warm — RTF ~0.88** (and ~0.93 with a cloned
+`.qvoice`). See [performance.md](performance.md) for the full int8 sweet-spot table.
 
-| | Short text (~8s audio) | Long text (~16s audio) |
+| 0.6B, bf16 | Short text (~8s audio) | Long text (~16s audio) |
 |---|---|---|
-| **First call** | 12.2s → RTF 1.50 | 20.0s → RTF 1.28 |
+| **First call** (cold) | 12.2s → RTF 1.50 | 20.0s → RTF 1.28 |
 | **Warm call** | 11.3s → RTF 1.39 | 19.7s → **RTF 1.26** |
+| **Warm call, `--int8`** | **RTF ~0.88** ⚡ | even lower |
 
 The first request pays a one-time cost for tokenizer parsing (~200ms) and warming the
 OS page cache for mmap'd weights. Warm calls benefit from:
