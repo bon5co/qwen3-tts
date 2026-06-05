@@ -1,11 +1,14 @@
 # PLAN.md — Qwen3-TTS C Engine Roadmap
 
-Updated: 2026-06-01
+Updated: 2026-06-04
 
 Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B.
-INT8 is validated end-to-end this session. The current focus is **hybrid
-mixed-precision quantization** + making the engine actually fast off Apple Silicon
-(cross-OS threading, x86 SIMD). History is compacted at the bottom — nothing dropped.
+INT8 is validated end-to-end. **x86 is no longer Apple-only:** AVX2 hot-path twins +
+cross-OS pthread pool + int4 are **validated on a Ryzen 7 6800H (2026-06-04, RTF ~2.02)**.
+Remaining x86 work = **AVX-512/VNNI** (code written, needs a rented Zen4+/Intel box; the
+6800H has no AVX-512). The current focus is **hybrid mixed-precision quant**, the
+**prosody/roughness knob** (the differentiator), and the test/release backlog. History is
+compacted at the bottom — nothing dropped.
 
 ---
 
@@ -117,28 +120,23 @@ Two structural facts drive the map:
   matter there (the AVX2 twin would need the rented box). The real q4 lever, if any, is a DECODE
   rework (e.g. int8-x + SDOT on decoded nibbles), not x-load sharing.
 
-> ⚠️ **SDOT is ARM-only (`vdotq_s32`, guarded by `__ARM_FEATURE_DOTPROD`).** On x86 the whole
-> int8 matvec already falls to **scalar** (no AVX2 — `qwen_tts_kernels_avx.c` is empty, see 21.5),
-> so x86 gets neither the SDOT win nor even the NEON int8 path; it runs scalar + single-thread.
-> **TODO (x86, after ARM lands):** write the equivalent native int8 dot with **VNNI**
-> (`_mm256_dpbusds_epi32` / AVX512-VNNI) PLUS the baseline AVX2 int8/bf16 matvec it builds on, and
-> **re-audit the full x86 path** (today it's all scalar — measure real x86 RTF, it has never been
-> benchmarked). Gated on the rented AVX512 box + Intel SDE in CI (see 21.3 / 21.5). The activation
-> quant (`quantize_act_int8`) is portable C and reusable for the VNNI path.
+> ⚠️ **SDOT is ARM-only (`vdotq_s32`).** Its x86 equivalents are now WRITTEN (2026-06-04):
+> the **AVX2 int8/bf16 matvec twins** (`#elif __AVX2__`, validated on the Ryzen box — see 21.3)
+> and the **AVX-512 VNNI** native int8 dot (`_mm512_dpbusd_epi32`, `SIMD=avx512vnni`, commit
+> d67648a — **UNVALIDATED**, needs a Zen4+/Intel AVX-512 VPS; the Ryzen 6800H is AVX2-only).
+> `quantize_act_int8` is portable C, reused as-is by the VNNI path. **x86 reality now (Ryzen
+> 6800H, validated): AVX2 + pthread pool + int4 → RTF ~2.02 on 0.6B** (memory-bound, AVX2 only
+> ~6% over scalar; int4 multi-threaded is the real lever). The "x86 is all scalar / AVX file
+> empty" claim is OBSOLETE.
 - [ ] `[LOW]` No `silvio_17b.qvoice` to test custom voice on 1.7B (needs `qwen3-tts-1.7b-base` to
   create). 1.7B preset already validates the Talker int8+SDOT critical path.
 
-> **Next session (2026-06-02) — validation & release gate.** Before merging `feat/int8-sdot`:
-> 0. **FIRST — deep re-analysis of all docs/md/code to re-verify the real x86 state.** The
->    "x86 matvec is all scalar / AVX file empty" claim came from one Explore pass + a grep; the
->    user expected x86 support to exist and was surprised. Re-confirm THOROUGHLY whether any
->    x86/AVX2 matvec code exists before planning the VNNI work (this repo has a history of
->    assumptions believed-then-wrong — verify, don't trust the first pass).
-> 1. Download `qwen3-tts-1.7b-base`, create `silvio_17b.qvoice`, test custom voice on the 1.7B.
-> 2. Massive total regression: `make test-small`/`test-large`, server (bf16 + int8 + `.qvoice`),
->    voice-clone e2e, both models, SDOT on AND off (`QWEN_NO_SDOT`).
-> 3. IF all green AND Phase 21 plan is considered done → merge `feat/int8-sdot` → `feat/labs`
->    (then evaluate → `main`) AND cut a release. ("vediamo" — gated on the tests.)
+> **Gate status (updated 2026-06-04):** ① x86 re-audit DONE (deep re-read, not a grep — confirmed
+> AVX2 existed only on 5 aux ops; now AVX2 twins written for all hot ops). ② `silvio_17b.qvoice`
+> created + 1.7B custom voice validated. ③ `feat/int8-sdot` already MERGED → `feat/labs` (14a0239).
+> Branch `feat/avx2-xos-threading` carries the AVX2/threading/int4/VNNI work, NOT yet merged.
+> **Still owed before a release:** the test backlog in 21.6 (qvoice×quant matrix, TSan race,
+> server RTF re-run) + AVX-512/VNNI validation on a rented box.
 - [ ] `[HIGH]` **Group-wise scales for int4** (not per-row absmax like int8). Q4_0 already does
   per-32-block scales — that's the "no big quality loss" enabler. Per-row int4 = quality death.
 - [ ] `[HIGH]` **Native int8 dot (ARM SDOT)** — M1 has `__ARM_FEATURE_DOTPROD`. Today int8 does
@@ -218,9 +216,12 @@ scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
   fused / FMA, scalar fallback preserved. `qwen_quantize_bf16_to_int8` (load-time) too. Simple
   elementwise (silu/add/mul/scale, swiglu) auto-vectorize under `-ffast-math` — left as-is.
   **Still scalar on x86 (follow-up, correctness-safe):** the NEON-only inline f32<->bf16 pack +
-  NeoX RoPE in talker/code_predictor/speech_decoder, and snake. **Validated:** x86+AVX2
-  cross-compiles clean (`clang -target x86_64 -mavx2 -mfma`, `-Wall -Wextra`); **runtime AVX2
-  correctness still owed — needs the Ryzen box** (Rosetta has no AVX2, so it can't run here).
+  NeoX RoPE in talker/code_predictor/speech_decoder, and snake. **✅ RUNTIME-VALIDATED 2026-06-04
+  on the Ryzen 7 6800H** (Zen3+, WSL2): `make blas` builds clean with portable `-mavx2`, `--caps`
+  reports `AVX2 (2-row fused, FMA)` + pthread pool, output coherent by ear. **Measured (0.6B,
+  4-thread): AVX2 only ~6% over `SIMD=scalar`** (hot path is DRAM-bandwidth-bound, not compute) —
+  so the SIMD twin is correct but not a miracle; **int4 multi-threaded is the real x86 lever: RTF
+  2.81→2.02 (−28%)**. Full numbers in `docs/building.md` "Performance notes (x86 / WSL2)".
 - [~] `[HIGH]` **Drop `-march=native` off-Mac + runtime ISA guard** — DONE (the SIGILL bug).
   Makefile now: Linux x86 default `-mavx2 -mfma` (portable Haswell+), `SIMD=scalar` for
   pre-AVX2, `SIMD=avx512` opt-in; macOS/ARM keep `-march=native`. `qwen_check_runtime_isa()`
@@ -234,12 +235,18 @@ scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
   - **Real-world evidence:** a user on a brand-new Ryzen (should have AVX-512) reported SLOW perf.
     Cause = exactly this gap — we have ZERO AVX2/AVX512 on the hot path AND no runtime dispatch, so
     his AVX-512 silicon ran our scalar single-thread decode. This is the bug to kill.
-- [ ] `[MED]` **VNNI** (`_mm256_dpbusds_epi32` AVX-VNNI / AVX512-VNNI) = x86 SDOT twin for int8,
-  on the rented AVX512 box. Prereq: AVX2 baseline + dispatch above. `quantize_act_int8` is
-  portable C and reused as-is. Verify ISA with Intel SDE in CI; tune perf only on real HW.
-- [ ] `[LOW]` **AVX512-BF16** (`_mm512_dpbf16_ps`) bf16 dot twin, same box.
-- **Order**: finish ARM (incl. the NEON headroom in 21.3b, dev HW measurable now); x86 after, on
-  a rented AVX512 server (can't tune blind on M1).
+- [~] `[MED]` **VNNI** = x86 SDOT twin for int8 — **WRITTEN 2026-06-04 (commit d67648a),
+  UNVALIDATED.** `_mm512_dpbusd_epi32` AVX-512-VNNI path, `SIMD=avx512vnni` build
+  (`-mavx512f -mavx512bw -mavx512vl -mavx512vnni`), `--caps` reports `int8 dot: VNNI (native)`.
+  `quantize_act_int8` reused as-is. **Can't run on the Ryzen 6800H (AVX2-only, no AVX-512)** →
+  next x86 step is to **rent a Zen4+/Intel AVX-512 VPS** and validate correctness (golden mel-corr)
+  + measure RTF. Verify ISA with Intel SDE in CI before trusting on HW.
+- [~] `[LOW]` **AVX-512 bf16 matvec** (`__m512` 16-wide) — **WRITTEN 2026-06-04 (commit b89f30e),
+  UNVALIDATED**, `SIMD=avx512` build. Same rented-box gate. (Note: this is the `__m512` widen-FMA
+  path, not yet the native `_mm512_dpbf16_ps` AVX512-BF16 dot — that's a further upgrade.)
+- **Order**: ARM NEON headroom (21.3b, dev HW measurable now); x86 AVX2+threading+int4 ✅ DONE on
+  the Ryzen box; **only AVX-512/VNNI remains → rented Zen4+/Intel VPS** (can't run AVX-512 on M1
+  or the 6800H).
 
 ### 21.3b ARM NEON is NOT at peak either (the SDOT lesson, generalized)
 
@@ -272,19 +279,20 @@ NEON→scalar fallback, so M1 and x86 are unaffected:
 |---|---|---|---|---|
 | **macOS ARM (M1)** | NEON ✅ (+SDOT int8) | NEON ✅ | GCD 4-thread ✅ | the only truly optimized target (= all benchmarks) |
 | **macOS/Linux ARM (M2+/Graviton)** | NEON ✅ but **bf16/i8mm headroom** (21.3b) | NEON ✅ | GCD ✅ Mac / **single ❌** Linux | works, leaves ~2× on the table on the matvecs |
-| **Linux ARM (aarch64, M1-class)** | NEON ✅ | NEON ✅ | **single-thread ❌** | correct but ~3–4× slower than bench (1 core) |
-| **Linux/WSL/Win x86-64** | **scalar ❌** (no AVX2 on any matvec/attn) | **AVX2 ✅** (only these) | **single-thread ❌** | decode catastrophic; only prefill (`cblas_sgemm`) is fast |
+| **Linux ARM (aarch64, M1-class)** | NEON ✅ | NEON ✅ | pthread pool ✅ (2026-06-03) | correct + multi-thread; bf16/i8mm NEON headroom remains |
+| **Linux/WSL/Win x86-64** | **AVX2 ✅** (all matvec/attn, 2026-06-04) + VNNI written/unvalidated | **AVX2 ✅** | pthread pool ✅ | **Ryzen-validated: RTF ~2.02 (int4, 4-thread); bandwidth-bound so AVX2 only +6% vs scalar** |
 
 **Coverage matrix we OWE users** (goal: NEON-equivalent everywhere SIMD exists, scalar always):
 | Op family | NEON | AVX2 | AVX512/VNNI | scalar | Gap |
 |---|---|---|---|---|---|
-| matvec bf16/int8/q4_0 + argmax | ✅ | ❌ | ❌ | ✅ | **AVX2+VNNI (21.3), bf16/i8mm NEON (21.3b)** |
-| attention (3 variants) | ✅ | ❌ | ❌ | ✅ | **AVX2 (21.3)** |
-| RoPE / bf16 pack / swiglu / add·mul·scale / snake | ✅ | ❌ | ❌ | ✅ | **AVX2 (21.3)** |
+| matvec bf16/int8/q4_0 + argmax | ✅ | ✅ (2026-06-04) | written, **unvalidated** (rented box) | ✅ | bf16/i8mm NEON (21.3b); AVX-512 run on a real box |
+| attention (3 variants) | ✅ | ✅ (2026-06-04) | n/a | ✅ | — |
+| RoPE / bf16 pack / swiglu / add·mul·scale / snake | ✅ | swiglu/add·mul·scale ✅; RoPE/bf16-pack/snake still scalar | n/a | ✅ | AVX2 the remaining inline NEON-only ops (low priority, off hot path) |
 | rms_norm ×3 / bf16_accum / bf16_to_f32 | ✅ | ✅ | ❌ | ✅ | AVX512 optional |
 
-Fixing this = 21.2 (threading) + 21.3 (AVX2 on ALL hot ops + VNNI) + 21.3b (post-M1 NEON).
-Until then, all RTF numbers are **Apple-M1-only**.
+Status: 21.2 (threading) ✅ all platforms · 21.3 (AVX2 on all hot ops) ✅ validated on Ryzen ·
+AVX-512/VNNI written but needs a Zen4+/Intel box · 21.3b (post-M1 NEON) still open.
+**RTF numbers now exist for x86 too** (Ryzen 6800H: int4/4-thread ~2.02), not Apple-M1-only.
 
 ---
 
@@ -376,24 +384,25 @@ one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` d
   (today serialized via `g_serialize_synth`). Options: per-submitter job slots, or a pool-of-pools. Verify
   on the Ryzen VPS. Until then x86 concurrent serving is correct-but-serial.
 
-**PERFORMANCE / PORTABILITY (the big gap — see 21.2/21.3/21.3b):**
-- [ ] All 8 hot matvec/attention kernels scalar on x86; matvec threading GCD/Apple-only; SwiGLU exp
-  uses Accelerate `vvexpf` on macOS, scalar `expf` elsewhere (`kernels.c:1433`); post-M1 NEON headroom.
-- [ ] `[HIGH]` **Makefile `-march=native`** (line 5) → SIGILL on older CPUs, no release/portable
-  target, no runtime cpuid dispatch. **Principle: pick best ISA at runtime, else step down.**
+**PERFORMANCE / PORTABILITY (largely CLOSED 2026-06-04 — see 21.2/21.3/21.3b):**
+- [x] **All 8 hot matvec/attention kernels now have AVX2 twins** + cross-OS pthread pool (was
+  scalar+GCD-only). ✅ Ryzen-validated. Remaining scalar-on-x86: SwiGLU `expf` (`kernels.c:1433`,
+  macOS uses Accelerate `vvexpf`), inline RoPE/bf16-pack/snake — all low-priority/off hot path.
+- [ ] `[LOW]` post-M1 NEON headroom (bf16 vbfdot / i8mm smmla — 21.3b).
+- [x] **Makefile `-march=native` off-Mac → portable `-mavx2` + runtime ISA guard** (no SIGILL).
+  Still missing: true per-CPU function-multiversioning (one fat binary stepping SSE→AVX2→AVX512).
 - [ ] **CI is build-only off-Mac** — `.github/workflows` build Linux x86/ARM + macOS-ARM but run only
   `./qwen_tts --help`; **no inference is ever executed off Apple Silicon, and x86 has NEVER been
   benchmarked.** No macOS-x86, no Windows. Add a real inference smoke (small model) + SDE for ISA.
 - [ ] **Windows native won't compile** (`mmap`/`pthread`/`gettimeofday`, no Win32 fallback) — WSL2 only.
 
-> ✅ **x86 test box NOW available (2026-06-03):** user's **Ryzen 7 6800H** mini PC (Zen 3+, **AVX2+FMA
-> yes, AVX-512 no**) on LAN `192.168.1.93` (RDP; see memory `reference_x86_test_box`). Build under
-> **WSL2** (our Linux x86 path), run a small model, confirm AVX2 is active + get real x86 perf.
-> Workflow: Claude gives build/debug commands → user runs over RDP → pastes logs → verify together.
-> ⟹ This validates the **AVX2 baseline matvec + x86 threading** (the 90% gap). **VNNI/AVX-512** still
-> needs a Zen4+/Intel box. Approach (user): **write + correctness-verify AVX2/threading now** (scalar-
-> equivalence + SDE-in-CI), then **measure on the Ryzen box** — no longer fully blind. (This is exactly
-> the testing that never happened before → why x86 silently rotted.)
+> ✅ **x86 AVX2 + threading VALIDATED on the Ryzen 7 6800H (2026-06-04)** — the test that "never
+> happened before". Built under WSL2 with portable `-mavx2`, `--caps` confirms AVX2 + pthread pool,
+> output coherent. Findings: hot path is DRAM-bandwidth-bound → AVX2 only +6% over scalar; **int4
+> multi-threaded is the x86 lever (RTF 2.81→2.02, −28%)**; 4 threads sweet spot (8 regresses); High-
+> performance Windows power plan matters. Full writeup in `docs/building.md`. **STILL OWED: AVX-512/
+> VNNI** (code written, 6800H is AVX-512-less) → **rent a Zen4+/Intel VPS** more powerful than the
+> mini PC, build `SIMD=avx512vnni`, validate golden mel-corr + measure RTF (Intel SDE in CI first).
 
 **DEBUNKED agent claims (do NOT propagate):** "int4 loaded but never used" (FALSE — int4 wired in
 talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `needs-verify` before acting.
@@ -546,6 +555,9 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 ## Future research (discovered 2026-06-04, to re-analyze)
 
 ### A. Prosody/emotion control by perturbing the Code Predictor (instruct is too weak)
+> **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/expressivity` off `feat/labs`)
+> — segmenter + markup (`<stop>`/`<break>`/`<rough N>`) + CP perturbation knob. Low-risk, hardware-
+> independent, the differentiator. The LIVE track (split-for-quality needs no parallelism).
 Serendipity: quantizing the CP `down` projection to 2-bit (`QWEN_CP_Q2_FFN=down --int4`)
 makes the voice **intelligible but aggressive/rough** ("death metal"). Perturbation magnitude
 maps to roughness: int8 = identical to bf16, int4 = slightly aggressive, q2 = strong. Mechanism:
@@ -562,6 +574,10 @@ perturbing the CP roughens texture without losing intelligibility.
   per-speaker/language sensitivity unknown (q2 effect confirmed only on 0.6B/ryan/EN/seed42).
 
 ### B. Weight-stationary batching = the throughput lever for the SERVER
+> **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/batched-generation` off
+> `feat/labs`) — batch-dim in Talker/CP step fns, batched int8/bf16 GEMM, per-stream attention+sampling,
+> continuous-batch scheduler. The perf bet for LONG-FORM/server (N≥6-8). NEXT cheap step before building:
+> re-run the batching microbench with the REAL int8/bf16 kernels (not f32 BLAS) for the true threshold.
 Single-stream (one audio) cannot reorder to keep weights cache-hot: the CP's 16 steps (and the
 Talker's tokens) are a hard autoregressive chain (step g input = step g-1 output), so the weight
 read order `L1..L5 x16` can't be reordered ("weights-outer, steps-inner" needs all step inputs at
@@ -569,6 +585,52 @@ once — they don't exist yet). BUT across **independent concurrent requests** t
 batch N requests -> each weight read is reused across all N (weight-stationary across the batch) ->
 ~Nx throughput. This is standard LLM continuous-batching. **Not a single-file latency win; a big
 multi-request server throughput win.** Re-analyze when optimizing the HTTP server for concurrency.
+
+**2026-06-04 — MEASURED: `--workers` (N parallel GEMVs) is NOT batching, and is a DEAD-END on M1.**
+The `--workers N` pool runs N INDEPENDENT GEMVs, each re-reading the weights → on a bandwidth-bound
+bf16 workload that's N× the DRAM demand → contention, not reuse. Bench (3-sentence text, full vs 3
+concurrent reqs on `--workers 3`, 0.6B M1): per-chunk latency TRIPLED (~6s→~17s), aggregate throughput
++8% only, total wall-clock WORSE (17.7 vs 16.4s). A single 4-thread synthesis already saturates M1
+bandwidth. **So the worker-pool is correctness-validated but NOT a throughput win on M1.** See
+[[project_split_parallel_bench]] + `docs/pipeline.md`. The fix is TRUE batching (the N current-frame
+vectors stacked into ONE GEMM `Y=W·X`, weight read ONCE) — a different code path from the worker pool
+(needs a batch-dim in the step functions; the matvecs become GEMMs like prefill already does, attention
+stays per-stream since each request has its own KV — but attention is <1% so the 90% matvec slice
+batches cleanly). Microbench of the GEMV-loop vs GEMM ceiling: see section-B addendum below / `docs`.
+NUANCE: after int8+SDOT the CP shifts toward compute-bound (PLAN "Speed must come from compute
+throughput"), so the batching win is largest in the bf16 path and smaller (but still real, via better
+GEMM FMA/SIMD utilization) in int8. **Decision: park worker-parallel behind real batched-GEMM OR a
+higher-bandwidth box (Ryzen/server). The DUAL-PURPOSE insight — text-splitting is ALSO the unit of
+prosodic control (track A) — means the EXPRESSIVITY half of splitting is the live track; it needs no
+parallelism and stands alone. First-audio latency → sequential chunk-1-first (~6s vs ~16s), not
+concurrency (which tripled chunk-1's latency).**
+
+**2026-06-04 — MICROBENCH: true batched-GEMM DOES reuse the weights, but only pays off at N≥4-6.**
+`/tmp/batch_bench.c` (Accelerate f32, M1): N sequential GEMV (= workers) vs 1 GEMM width-N (= batch),
+on the real CP/Talker matvecs. speedup = gemv_loop / gemm:
+
+| W | N=2 | N=3 | N=4 | N=6 | N=8 |
+|---|---|---|---|---|---|
+| CP gate_up [3072×1024] | 0.77× | 1.20× | 1.66× | 2.31× | 3.23× |
+| CP down [1024×3072] | 0.86× | 1.16× | 1.63× | 2.30× | 3.12× |
+| CP QKV [2048×1024] | 0.53× | 0.84× | 1.17× | 1.77× | 2.46× |
+| Talker-1.7B gate_up [6144×2048] | 0.80× | 1.15× | 1.66× | 2.69× | 3.74× |
+
+- **Weights ARE reused** (the win mechanism is real): GEMM time is ~FLAT in N (gate_up 0.48ms at
+  N=2..8) while the GEMV loop grows linearly — the weight is read once, extra columns ~free.
+- **BUT the GEMM has a fixed cost ~2.5× a single GEMV** → N=2 LOSES, break-even N≈3, strong (2-3.7×)
+  only at N≥6. So batching is a **server-scale / many-chunk lever, NOT a 2-3-sentence win** — exactly
+  what this section always said ("not a single-file latency win").
+- **Consequence for the use cases:** short one-shot (2-3 sentences, N≤3) → batching does NOT help on M1
+  (neither do workers). LONG-FORM / AUDIOBOOK is the natural home: split a book into many chunks → keep
+  N≥6-8 active in a continuous batch → **2.3-3.7× throughput**, the real lever. Server with many
+  concurrent users → same regime.
+- **Build cost (real):** batched generation needs a batch-dim in the Talker/CP step functions (matvecs
+  → GEMM like prefill already does; attention stays PER-STREAM since each request has its own KV, but
+  attention is <1%), per-stream sampling, and a continuous-batch scheduler. Caveat: this f32 Accelerate
+  ceiling is the bf16-regime story; the int8+SDOT hot path is more compute-bound, so a batched int8
+  kernel's win is smaller (still real via better FMA/SIMD utilization). NEXT before building: re-run
+  this microbench with the ACTUAL int8/bf16 kernels (not f32 BLAS) to get the realized threshold/curve.
 
 ### C. Break the single-stream autoregressive wall — speculative decode + contextual sparsity
 The status-quo breakers used by DeepSeek/Qwen3.6 MTP etc., applied to the CP. Both could win
@@ -703,8 +765,10 @@ keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligib
 **Speed levers (ranked):** SDOT (validated, ARM) · **0.6B Talker int8 — ✅ SHIPPED 2026-06-04**
 (dropped the stale `hidden<2048` gate; --int8 now quantizes the 0.6B Talker too: Talker step
 30→16 ms/f = −47%, 0.6B int8 RTF → 0.87–0.92 sub-1.0, no 4-thread hang, code0 96.9% = int8-gentle on
-words, user ear-approved, int8 golden regenerated) · **x86 VNNI + cross-OS pool (written, UNVALIDATED —
-x86 is scalar+single-thread today, the #1 unblock)** · server continuous-batching (throughput only).
+words, user ear-approved, int8 golden regenerated) · **x86 AVX2 + cross-OS pthread pool + int4 —
+✅ VALIDATED on Ryzen 6800H 2026-06-04 (RTF ~2.02, int4/4-thread; AVX2 +6% over scalar, bandwidth-
+bound)** · **x86 AVX-512/VNNI — written (d67648a/b89f30e), UNVALIDATED, needs a rented Zen4+/Intel
+box (6800H is AVX2-only)** · server continuous-batching (throughput only).
 **Refuted/closed (all verified 2026-06-04):**
 - int4-Q4_0 global on CP, self-speculative (marginal), contextual sparsity (CP FFN dense).
 - SDOT-on-lm_head — forks int8 trajectory (golden mel-corr → 0.51); reverted.
