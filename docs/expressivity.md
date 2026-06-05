@@ -47,6 +47,20 @@ vector captured on 1.7B works unchanged on 0.6B. An Italian palette lives in
 > The strength is also a **mood crossfade**, not just intensity — pushing a direction far
 > can land on a neighbouring emotion. The shipped weights are the sweet spots we tuned by ear.
 
+### Voice-specific tuning
+
+Steering directions are captured on the *preset* voice (ryan) distribution. Most tones
+transfer cleanly onto other preset speakers and custom `.qvoice` voices, but two caveats:
+
+- **A direction can over-steer on a different voice** → lower it with `--steer-weight`
+  (e.g. a soft-spoken cloned voice may need `--emotion excited --steer-weight 0.5`).
+- **Some tones depend on a vocal register the voice doesn't have.** A bright `happy`
+  needs an upbeat register; a soft, low-energy voice (e.g. a calm narrator clone) simply
+  can't reach it — even a *natively captured* happy fades. Use `eager`/`excited` for
+  upbeat delivery on such voices instead. For a voice that genuinely warrants its own
+  calibration, capture a native palette and drop it in `presets/emotions/<voice>/`
+  (point `--emotion` at it with `QWEN_EMOTION_DIR=presets/emotions/<voice>`).
+
 ## `--roughness <0..1>` — texture / grit
 
 An orthogonal knob: blends a 2-bit copy of the FFN `down` output into the
