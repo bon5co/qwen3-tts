@@ -2339,3 +2339,121 @@ int qwen_argmax_matvec_bf16(const float *x, const uint16_t *W_bf16, int in_dim, 
     }
     return best_idx;
 }
+
+/* ========================================================================
+ * Kernel numeric self-test (`./qwen_tts --self-test`)
+ *
+ * Cross-ISA correctness proof for the matvec kernels that does NOT depend on a
+ * full-pipeline golden — immune to the greedy-decode trajectory fork that makes
+ * cross-ISA / cross-precision audio mel-corr drop benignly. Runs each dispatched
+ * matvec (bf16 / int8 / argmax-int8) against an independent f32 reference on
+ * deterministic pseudo-random data and checks the error is within tolerance.
+ *
+ * On x86 with SIMD=avx512vnni this exercises the VNNI int8 dot (`_mm512_dpbusd`)
+ * and the __m512 bf16 matvec (the two UNVALIDATED AVX-512 paths). On ARM it
+ * exercises SDOT/NEON — useful as a methodology check before trusting the VPS run.
+ * Run twice to A/B the dispatch:  ./qwen_tts --self-test   (VNNI/SDOT on)
+ *                          QWEN_NO_VNNI=1 ./qwen_tts --self-test   (scalar/AVX2 fallback)
+ * Returns 0 on PASS, non-zero on FAIL (so it can gate CI / `make test-selftest`).
+ * ======================================================================== */
+int qwen_kernel_selftest(void *out) {
+    FILE *f = out ? (FILE *)out : stdout;
+    /* Deterministic LCG — no rand()/Date dependence (those break reproducibility). */
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    #define NEXT_F (( (rng = rng * 6364136223846793005ull + 1442695040888963407ull) >> 40) \
+                    / (float)(1u << 24) * 2.0f - 1.0f)   /* uniform in [-1,1) */
+
+    /* Two CP-shaped matrices: gate_up [3072×1024] and a rows-not-multiple case. */
+    const int cases[][2] = { {3072, 1024}, {2048, 1024}, {257, 320} };
+    const int ncases = (int)(sizeof(cases) / sizeof(cases[0]));
+    int failures = 0;
+
+    fprintf(f, "qwen-tts kernel self-test (matvec correctness vs f32 reference)\n");
+    qwen_caps_report(f);
+    fprintf(f, "  (run with QWEN_NO_VNNI=1 / QWEN_NO_SDOT=1 to test the fallback path)\n\n");
+
+    for (int ci = 0; ci < ncases; ci++) {
+        int rows = cases[ci][0], cols = cases[ci][1];
+        float    *x   = malloc((size_t)cols * sizeof(float));
+        float    *wf  = malloc((size_t)rows * cols * sizeof(float));
+        uint16_t *wb  = malloc((size_t)rows * cols * sizeof(uint16_t));
+        int8_t   *wi  = malloc((size_t)rows * cols * sizeof(int8_t));
+        float    *sc  = malloc((size_t)rows * sizeof(float));
+        float    *ref = malloc((size_t)rows * sizeof(float));
+        float    *y   = malloc((size_t)rows * sizeof(float));
+        if (!x || !wf || !wb || !wi || !sc || !ref || !y) {
+            fprintf(f, "  [case %dx%d] OOM, skipped\n", rows, cols);
+            free(x); free(wf); free(wb); free(wi); free(sc); free(ref); free(y);
+            continue;
+        }
+        for (int k = 0; k < cols; k++) x[k] = NEXT_F;
+        for (size_t i = 0; i < (size_t)rows * cols; i++) {
+            float v = NEXT_F;
+            wf[i] = v;
+            /* round-to-nearest f32->bf16 so the reference dequant matches exactly */
+            uint32_t bits; memcpy(&bits, &v, 4);
+            wb[i] = (uint16_t)((bits + 0x8000u) >> 16);
+        }
+
+        /* ---- bf16 matvec ---- */
+        for (int r = 0; r < rows; r++) {
+            float s = 0.0f;
+            const uint16_t *row = wb + (size_t)r * cols;
+            for (int k = 0; k < cols; k++) s += bf16_to_f32(row[k]) * x[k];
+            ref[r] = s;
+        }
+        qwen_matvec_bf16(y, wb, x, rows, cols);
+        double max_rel_bf16 = 0.0;
+        for (int r = 0; r < rows; r++) {
+            double denom = fabs(ref[r]) + 1e-3;
+            double rel = fabs((double)y[r] - ref[r]) / denom;
+            if (rel > max_rel_bf16) max_rel_bf16 = rel;
+        }
+
+        /* ---- int8 matvec ---- (reference = exact int8 dot with the SAME scales) */
+        qwen_quantize_bf16_to_int8(wb, rows, cols, wi, sc);
+        for (int r = 0; r < rows; r++) {
+            const int8_t *row = wi + (size_t)r * cols;
+            float s = 0.0f;
+            for (int k = 0; k < cols; k++) s += (float)row[k] * x[k];
+            ref[r] = sc[r] * s;   /* dequant-W · x  (activation kept f32 in the reference) */
+        }
+        qwen_matvec_int8(y, wi, sc, x, rows, cols);
+        /* int8 dispatch (SDOT/VNNI) quantizes the ACTIVATION -> a roughly-CONSTANT
+         * absolute error per row, so a per-row *relative* error explodes on the rows
+         * where ref[r]≈0 (random dots cluster near zero) and means nothing. The right,
+         * near-zero-robust metric is the GLOBAL L2 relative error ||y-ref|| / ||ref||:
+         * activation-quant noise lands it ~0.7% for a correct kernel; a broken VNNI
+         * offset would blow it up. (bf16 has only fp accumulation-order drift -> tiny,
+         * so max-rel is fine there.) */
+        double l2_num = 0.0, l2_den = 0.0;
+        for (int r = 0; r < rows; r++) {
+            double d = (double)y[r] - ref[r];
+            l2_num += d * d;
+            l2_den += (double)ref[r] * ref[r];
+        }
+        double rel_l2_i8 = sqrt(l2_num / (l2_den + 1e-12));
+
+        /* ---- argmax int8 ---- (must agree with the reference argmax, or tie within eps) */
+        int amax_ref = 0; float amax_val = ref[0];
+        for (int r = 1; r < rows; r++) if (ref[r] > amax_val) { amax_val = ref[r]; amax_ref = r; }
+        int amax_got = qwen_argmax_matvec_int8(x, wi, sc, cols, rows);
+        int argmax_ok = (amax_got == amax_ref) ||
+                        (amax_got >= 0 && amax_got < rows &&
+                         (amax_val - ref[amax_got]) < 0.02 * (fabs(amax_val) + 1e-3));
+
+        int bf16_ok = max_rel_bf16 < 1e-2;   /* bf16: only fp accumulation-order drift */
+        int i8_ok   = rel_l2_i8    < 3e-2;   /* int8: activation-quant noise (~0.7% expected) */
+        if (!bf16_ok || !i8_ok || !argmax_ok) failures++;
+        fprintf(f, "  [%4dx%-4d] bf16 max_rel=%.2e %s | int8 rel_L2=%.2e %s | argmax %s (ref=%d got=%d)\n",
+                rows, cols, max_rel_bf16, bf16_ok ? "OK" : "FAIL",
+                rel_l2_i8, i8_ok ? "OK" : "FAIL",
+                argmax_ok ? "OK" : "FAIL", amax_ref, amax_got);
+
+        free(x); free(wf); free(wb); free(wi); free(sc); free(ref); free(y);
+    }
+    #undef NEXT_F
+    fprintf(f, "\n%s (%d case%s failed)\n", failures ? "SELF-TEST FAILED" : "SELF-TEST PASSED",
+            failures, failures == 1 ? "" : "s");
+    return failures;
+}

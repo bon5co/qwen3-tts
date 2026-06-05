@@ -56,6 +56,13 @@ void qwen_check_runtime_isa(void);
  * `out` may be NULL -> stderr. */
 void qwen_caps_report(void *out);
 
+/* Kernel numeric self-test: runs the dispatched matvecs (bf16/int8/argmax-int8)
+ * against an f32 reference on deterministic random data. Cross-ISA correctness
+ * proof for the SIMD kernels (esp. the AVX-512/VNNI paths) that does NOT depend
+ * on a full-pipeline golden, so it's immune to the greedy trajectory fork.
+ * `out` may be NULL -> stdout. Returns 0 on PASS, >0 = number of failed cases. */
+int qwen_kernel_selftest(void *out);
+
 /* ========================================================================
  * Norm functions
  * ======================================================================== */

@@ -239,8 +239,14 @@ scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
   UNVALIDATED.** `_mm512_dpbusd_epi32` AVX-512-VNNI path, `SIMD=avx512vnni` build
   (`-mavx512f -mavx512bw -mavx512vl -mavx512vnni`), `--caps` reports `int8 dot: VNNI (native)`.
   `quantize_act_int8` reused as-is. **Can't run on the Ryzen 6800H (AVX2-only, no AVX-512)** →
-  next x86 step is to **rent a Zen4+/Intel AVX-512 VPS** and validate correctness (golden mel-corr)
-  + measure RTF. Verify ISA with Intel SDE in CI before trusting on HW.
+  next x86 step is to **rent a Zen4+/Intel AVX-512 VPS**. **VALIDATION TOOLING READY (2026-06-05):**
+  `./qwen_tts --self-test` + `make test-selftest` = a model-free kernel numeric gate (matvec
+  bf16/int8/argmax vs f32 reference, `qwen_kernel_selftest` in kernels.c) — **immune to the greedy
+  trajectory fork that makes cross-ISA `test-golden` a false alarm** (the right way to prove VNNI:
+  correct → int8 rel_L2 ~4e-3, broken offset → blows up). One-shot `bash tests/vps_validate.sh
+  [model]` drives the whole VPS run (cpuinfo check, build avx512vnni, `--caps` asserts VNNI,
+  self-test, int8/int4 ×{-j1,-j4} RTF, VNNI-on-vs-off A/B). Validated on M1 (SDOT path rel_L2
+  3.8e-3, fallback 1.8e-7, both PASS). Verify ISA with Intel SDE in CI before trusting perf on HW.
 - [~] `[LOW]` **AVX-512 bf16 matvec** (`__m512` 16-wide) — **WRITTEN 2026-06-04 (commit b89f30e),
   UNVALIDATED**, `SIMD=avx512` build. Same rented-box gate. (Note: this is the `__m512` widen-FMA
   path, not yet the native `_mm512_dpbf16_ps` AVX512-BF16 dot — that's a further upgrade.)
@@ -416,9 +422,19 @@ PASSED. Closed the worst gaps:
   temp0 seed42`) and compare to committed `tests/golden/*.wav` via **mel-spectrogram correlation
   (≥0.99) + duration (≤5%)** (`tests/compare_audio.py`, librosa). Covers 0.6B en/it/int8 + 1.7B en.
   Wired into `test-all`. `make golden-update` regenerates after an intended change. **mel-corr (not
-  md5)**: md5 flakes even at `-j1 temp0` (±1 LSB decoder noise, verified) AND mel-corr is the correct
-  cross-ISA check for AVX2/x86 (won't be bit-identical, must stay ~0.99+). This is THE safety net for
-  the kernel work — a wrong AVX2 kernel now fails here instead of silently shipping.
+  md5)**: md5 flakes even at `-j1 temp0` (±1 LSB decoder noise, verified). **⚠ CORRECTION (Ryzen
+  2026-06-04): mel-corr is NOT a valid CROSS-ISA gate.** Greedy `-j1 temp0` decode forks the whole
+  trajectory on a single epsilon-different logit across ISAs → x86 golden scored mel 0.55–0.85 vs the
+  ARM golden despite producing perfectly coherent speech (confirmed by ear). The old "must stay 0.99+
+  cross-ISA" assumption is NAIVE for greedy autoregression — retracted. Same-ISA it's still the safety
+  net. **The real cross-ISA correctness gate is now `make test-selftest`** (kernel numeric, below).
+- [x] **`test-selftest`** (2026-06-05, `qwen_kernel_selftest` + `--self-test`) — **the cross-ISA gate
+  that test-golden can't be.** Compares the dispatched matvecs (bf16/int8/argmax-int8) to an f32
+  reference on deterministic random data → catches a broken SIMD kernel (esp. the AVX-512/VNNI int8
+  dot + `__m512` bf16 matvec) WITHOUT running the pipeline, so the greedy trajectory fork can't mask
+  it. Runs the dispatched path AND the scalar/widen fallback (`QWEN_NO_SDOT/QWEN_NO_VNNI`). int8 uses
+  a near-zero-robust L2-relative metric (act-quant → ~4e-3 correct, blows up if broken). Wired into
+  `test-all`; `tests/vps_validate.sh` drives the full AVX-512 VPS run around it.
 - [x] **`test-serve-repro`** — 3 identical requests bit-identical (catches cross-request state leaks).
 - [x] **`test-voice-design`** now SKIPs cleanly (was failing on absent model — double bug: dir-only
   check + per-line `exit 0` that didn't stop the recipe).

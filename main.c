@@ -288,6 +288,7 @@ int main(int argc, char **argv) {
     int serve_port = 0;  /* 0 = not serving */
     int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
+    int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -341,6 +342,7 @@ int main(int argc, char **argv) {
         {"target-cv",     required_argument, 0, 1024},
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
+        {"self-test",     no_argument,       0, 1027},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -380,6 +382,7 @@ int main(int argc, char **argv) {
             case 1024: target_cv_dir = optarg; break;
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
+            case 1027: run_self_test = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -423,6 +426,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
                 fprintf(stderr, "  -D, --debug                Debug mode\n");
                 fprintf(stderr, "  --caps                     Print compiled SIMD/threading capabilities and exit\n");
+                fprintf(stderr, "  --self-test                Run kernel numeric self-test (matvec vs f32 ref) and exit\n");
                 return opt == 'h' ? 0 : 1;
         }
     }
@@ -434,6 +438,15 @@ int main(int argc, char **argv) {
         qwen_init_threads();
         qwen_caps_report(stdout);
         return 0;
+    }
+
+    /* --self-test: prove the dispatched matvec kernels are numerically correct vs
+     * an f32 reference (no model needed). This is the cross-ISA correctness gate for
+     * the AVX-512/VNNI paths — immune to the greedy trajectory fork that makes
+     * end-to-end audio mel-corr a false alarm cross-ISA. Exits non-zero on failure. */
+    if (run_self_test) {
+        qwen_init_threads();
+        return qwen_kernel_selftest(stdout);
     }
 
     /* Voice library management (no model loading needed) */

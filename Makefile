@@ -358,7 +358,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-errors test-caps test-golden
+test-all: test-small test-large test-regression test-errors test-caps test-selftest test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -387,6 +387,21 @@ test-caps: $(TARGET)
 	 fi
 	@grep -q "matvec threads:" $(TEST_DIR)/caps.txt && ! grep -q "SINGLE-THREAD" $(TEST_DIR)/caps.txt || { echo "FAIL: threads must report an active pool (GCD/pthread/Win32), not SINGLE-THREAD"; exit 1; }
 	@echo "PASS: --caps report consistent with build arch"
+	@echo ""
+
+# ── Kernel numeric self-test (matvec correctness vs f32 reference) ──
+# Cross-ISA correctness gate for the SIMD matvecs (bf16/int8/argmax) that does NOT depend
+# on a full-pipeline golden, so it's immune to the greedy-decode trajectory fork that makes
+# end-to-end audio mel-corr a FALSE ALARM cross-ISA (the test-golden cross-ISA caveat).
+# Runs the dispatched path AND the scalar/widen fallback (QWEN_NO_SDOT/QWEN_NO_VNNI). On the
+# AVX-512 VPS this is THE proof the VNNI int8 dot + __m512 bf16 matvec are correct.
+# Needs no model — fast, run anywhere.
+test-selftest: $(TARGET)
+	@echo "=== Kernel self-test (dispatched path) ==="
+	@./$(TARGET) --self-test || { echo "FAIL: kernel self-test (dispatched)"; exit 1; }
+	@echo "=== Kernel self-test (scalar/widen fallback: QWEN_NO_SDOT=1 QWEN_NO_VNNI=1) ==="
+	@QWEN_NO_SDOT=1 QWEN_NO_VNNI=1 ./$(TARGET) --self-test || { echo "FAIL: kernel self-test (fallback)"; exit 1; }
+	@echo "PASS: kernel self-test (both paths numerically correct)"
 	@echo ""
 
 # ── Golden-reference correctness (mel-correlation + duration) ──
@@ -795,7 +810,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
