@@ -40,6 +40,29 @@ sudo dnf install openblas-devel     # Fedora/RHEL
 make blas
 ```
 
+## Choosing the SIMD build (x86)
+
+The hot matvec/attention kernels have NEON (+SDOT) on ARM and **AVX2 + AVX-512/VNNI** twins on
+x86, all with a scalar fallback and a runtime ISA guard. On x86 the `make blas` default targets a
+portable **AVX2 + FMA** baseline (Haswell 2013+). Pick a higher level explicitly with `SIMD=`:
+
+```bash
+make blas                    # x86 default: portable -mavx2 -mfma (works on any Haswell+ CPU)
+make blas SIMD=scalar        # no AVX2 — pre-2013 CPUs / portable fallback
+make blas SIMD=avx512         # AVX-512 (adds the __m512 16-wide bf16 matvec)
+make blas SIMD=avx512vnni    # AVX-512 + VNNI native int8 dot (_mm512_dpbusd_epi32) — Zen4+/Intel
+
+# verify what the binary actually compiled + the CPU it's running on:
+./qwen_tts --caps            # e.g. "int8 dot: VNNI _mm512_dpbusd_epi32 (native)"
+./qwen_tts --self-test       # kernel numeric correctness vs an f32 reference (no model needed)
+```
+
+`SIMD=avx512vnni` needs `avx512f avx512bw avx512vl avx512_vnni` in `/proc/cpuinfo` (note the
+kernel flag is `avx512_vnni`, with an underscore). If you build for an ISA your CPU lacks, the
+runtime guard aborts with a clear message instead of a SIGILL. **macOS/ARM** ignore `SIMD=`
+(they use `-march=native` + NEON). See [Performance](performance.md) for the cross-device RTF
+table and `bash tests/x86_bench.sh` to benchmark your own box.
+
 ## Windows (WSL2) — Beta
 
 WSL2 runs a real Linux kernel, so the build is identical to native Linux.
