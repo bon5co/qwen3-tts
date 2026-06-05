@@ -92,12 +92,45 @@ static float  ql_ffn_eps    = 1e-4f;
 static long   ql_ffn_total  = 0;
 static long   ql_ffn_zero   = 0;
 
+/* ---- Steering-vector capture (QWEN_STEER_CAPTURE=path): accumulate the mean
+ * cp_x at the Talker→CP injection point and write it as a .vec on exit. The
+ * emotion control vector is mean(angry) − mean(neutral) from two such runs
+ * (see tests/steer_make.py). Format: 'QSTV' magic + int32 dim + dim×float32. */
+#define STEER_VEC_MAGIC 0x56545351u  /* 'QSTV' little-endian */
+static const char *steer_cap_path   = NULL;
+static double     *steer_cap_acc    = NULL;
+static long        steer_cap_frames = 0;
+static int         steer_cap_dim    = 0;
+
+static void steer_capture_accum(const float *cp_x, int n) {
+    if (!steer_cap_path) return;
+    if (!steer_cap_acc) { steer_cap_acc = (double *)calloc(n, sizeof(double)); steer_cap_dim = n; }
+    if (!steer_cap_acc || steer_cap_dim != n) return;
+    for (int i = 0; i < n; i++) steer_cap_acc[i] += cp_x[i];
+    steer_cap_frames++;
+}
+
 static void ql_report_atexit(void) {
     if (ql_codes_fp) { fclose(ql_codes_fp); ql_codes_fp = NULL; }
     if (ql_ffn_on && ql_ffn_total > 0)
         fprintf(stderr, "  [QWEN_FFN_SPARSITY] post-SwiGLU |x|<%.0e: %ld/%ld = %.2f%% (sparsity headroom)\n",
                 (double)ql_ffn_eps, ql_ffn_zero, ql_ffn_total,
                 100.0 * (double)ql_ffn_zero / (double)ql_ffn_total);
+    if (steer_cap_path && steer_cap_frames > 0 && steer_cap_acc) {
+        FILE *f = fopen(steer_cap_path, "wb");
+        if (f) {
+            uint32_t magic = STEER_VEC_MAGIC; int32_t dim = steer_cap_dim;
+            fwrite(&magic, 4, 1, f); fwrite(&dim, 4, 1, f);
+            for (int i = 0; i < steer_cap_dim; i++) {
+                float v = (float)(steer_cap_acc[i] / (double)steer_cap_frames);
+                fwrite(&v, 4, 1, f);
+            }
+            fclose(f);
+            fprintf(stderr, "  [QWEN_STEER_CAPTURE] wrote mean cp_x (dim=%d, %ld frames) -> %s\n",
+                    steer_cap_dim, steer_cap_frames, steer_cap_path);
+        }
+        free(steer_cap_acc); steer_cap_acc = NULL;
+    }
 }
 
 static void ql_init(void) {
@@ -111,7 +144,9 @@ static void ql_init(void) {
         double e = atof(s);
         if (e > 0) ql_ffn_eps = (float)e;
     }
-    if (ql_codes_fp || ql_ffn_on) atexit(ql_report_atexit);
+    const char *sc = getenv("QWEN_STEER_CAPTURE");
+    if (sc && *sc) steer_cap_path = sc;
+    if (ql_codes_fp || ql_ffn_on || steer_cap_path) atexit(ql_report_atexit);
 }
 
 /* ========================================================================
@@ -272,6 +307,21 @@ static void cp_qz_q2(q2_0_block_t **dst, const uint16_t *src, int rows, int cols
     int bpr = cols / Q2_0_BLOCK_SIZE;
     if (!*dst) *dst = (q2_0_block_t *)aligned_malloc((size_t)rows * bpr * sizeof(q2_0_block_t));
     if (*dst) qwen_quantize_bf16_to_q2_0(src, rows, cols, *dst);
+}
+
+/* Lazily build the per-layer Q2_0 copy of the FFN down weight used by the
+ * --roughness knob. Quantized from the bf16 mmap (never freed) so it is
+ * independent of the active quant mode (works under bf16/int8/int4). */
+static void cp_build_roughness(qwen_tts_ctx_t *ctx) {
+    if (ctx->cp_rough_built) return;
+    qwen_tts_config_t *c = &ctx->config;
+    int cp_h = c->cp_hidden_size, cp_inter = c->cp_intermediate_size;
+    for (int i = 0; i < c->cp_num_layers; i++) {
+        qwen_cp_layer_t *l = &ctx->cp_layers[i];
+        if (l->down_bf16 && !l->down_q2_rough)
+            cp_qz_q2(&l->down_q2_rough, l->down_bf16, cp_h, cp_inter);
+    }
+    ctx->cp_rough_built = 1;
 }
 
 /* ---- Quant-ladder decomposition knobs (env-gated; reset-then-quantize fix-ups
@@ -665,6 +715,16 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
         matvec_bf16(proj, l->down_bf16, ctx->cp_dec_gate, cp_h, cp_inter);
     CPB_MARK(CPB_FFN_DOWN);
 
+    /* Roughness knob: blend a q2 version of the down output into the high-precision
+     * one. `down` is the causal driver of the texture/roughness effect (q2-on-down =
+     * "death metal"); blending dials it in continuously. 0 = off (no extra work). */
+    if (ctx->cp_roughness > 0.0f && l->down_q2_rough) {
+        float proj_q2[2048];  /* cp_h is 1024 on both models */
+        qwen_matvec_q2_0(proj_q2, l->down_q2_rough, ctx->cp_dec_gate, cp_h, cp_inter);
+        float r = ctx->cp_roughness;
+        for (int i = 0; i < cp_h; i++) proj[i] = (1.0f - r) * proj[i] + r * proj_q2[i];
+    }
+
     /* Fused residual-add + next layer's input RMSNorm (or just add for last layer) */
     if (layer + 1 < c->cp_num_layers) {
         qwen_rms_norm_residual(x_norm, x, proj, ctx->cp_layers[layer + 1].input_norm, cp_h, eps);
@@ -716,7 +776,9 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     int cp_h = c->cp_hidden_size;
     int emb_dim = ctx->cp_emb_dim;  /* talker_hidden for 1.7B, cp_hidden for 0.6B */
 
-    ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY) */
+    ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY / QWEN_STEER_CAPTURE) */
+
+    if (ctx->cp_roughness > 0.0f && !ctx->cp_rough_built) cp_build_roughness(ctx);
 
     /* Reset CP KV cache for this frame */
     ctx->cp_kv_len = 0;
@@ -729,6 +791,18 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     CPB_RESET();
     /* Step 0: process talker hidden state (project if needed) */
     cp_mtp_project(ctx, cp_x, talker_hidden);
+
+    /* Capture the clean (pre-steer) cp_x for control-vector building. */
+    steer_capture_accum(cp_x, cp_h);
+
+    /* Emotion/prosody steering: inject the control vector at the single Talker→CP
+     * point. It enters the CP KV cache at pos 0, so all 15 codebook predictions
+     * attend to the steered hidden → one injection point, global per-frame effect. */
+    if (ctx->cp_steer_vec && ctx->cp_steer_weight != 0.0f && ctx->cp_steer_dim == cp_h) {
+        float w = ctx->cp_steer_weight;
+        for (int i = 0; i < cp_h; i++) cp_x[i] += w * ctx->cp_steer_vec[i];
+    }
+
     CPB_MARK(CPB_EMBED);
     cp_transformer_step(ctx, cp_x, x_norm, 0);
 

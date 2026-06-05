@@ -646,6 +646,8 @@ void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     /* Free malloc'd fused weights (gate_up are the only malloc'd weight copies) */
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].gate_up_fused_bf16);
+    for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
+    free(ctx->cp_steer_vec);
     /* Free pre-converted F32 codec embeddings */
     /* codec_embedding_f32 removed — vectorized bf16→f32 conversion used instead */
     /* Free malloc'd codebooks (EMA-reconstructed, not from safetensors) */

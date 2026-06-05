@@ -221,6 +221,11 @@ typedef struct {
      * biggest, most quant-tolerant matrices below int4 to reduce DRAM bytes. */
     q2_0_block_t *gate_up_fused_q2;   /* [2*inter, hidden/32 blocks] */
     q2_0_block_t *down_q2;            /* [hidden, inter/32 blocks] */
+
+    /* Q2_0 copy of down used ONLY by the --roughness knob (feat/expressivity):
+     * built lazily from down_bf16 independent of the active quant mode, blended
+     * into the high-precision down output to dial in texture roughness. */
+    q2_0_block_t *down_q2_rough;      /* [hidden, inter/32 blocks], NULL until roughness>0 */
 } qwen_cp_layer_t;
 
 /* ========================================================================
@@ -539,6 +544,15 @@ typedef struct qwen_tts_ctx {
      * every precision sees identical per-step inputs → isolates CP quant drift.
      * Set per-frame by the generation loop in QWEN_TF_CODES replay mode; else NULL. */
     const int *tf_ref_codes;
+
+    /* ---- Expressivity / prosody control (feat/expressivity) ----
+     * All default to 0/NULL → the normal path is bit-identical (no overhead). */
+    float  cp_roughness;     /* 0..1: blend q2-down into the high-prec down output
+                              *        (texture "roughness" knob; 0 = off). */
+    int    cp_rough_built;   /* lazy-build guard for the per-layer down_q2_rough copies. */
+    float *cp_steer_vec;     /* [cp_hidden] emotion/prosody control vector, or NULL. */
+    int    cp_steer_dim;     /* length of cp_steer_vec (must equal cp_hidden_size). */
+    float  cp_steer_weight;  /* injection scale: cp_x += weight*steer at the Talker→CP point. */
 
     /* Audio output buffer */
     float *audio_buf;
