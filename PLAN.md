@@ -611,6 +611,24 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 ## Future research (discovered 2026-06-04, to re-analyze)
 
 ### A. Prosody/emotion control on the Code Predictor — BUILT v1 (`feat/expressivity`), NOT YET AT THE TOP
+
+> **▶ RESUME 2026-06-07 (read this first; full details in the dated entries below + `docs/expressivity-recipes.md`).**
+> Session 2026-06-06 was long & productive. WHERE WE LANDED:
+> - **Galatea = the IT demo voice** (`voices/galatea_06b.qvoice`, CC LibriVox, better than Silvio). Centered IT
+>   palette (`presets/emotions/it_centered/`) = the one to use (collinearity fixed, +88% contrast).
+> - **Validated recipe doc committed: `docs/expressivity-recipes.md`** (joy=excited NOT happy, sad=slow+pauses,
+>   annoyed=angry+roughness, news=proud; per-language map; dead-ends; emergent-basin map + the ES "eeem"/sbuffo reproducer).
+> - **Settled with proof:** think=language-slot (our RE correct, vs official source); instruct is Chinese-tuned/weak-on-EU
+>   & not exposed for clones → CP-steering is the only emotion path for cloned EU voices. Closed dead-ends: full rage,
+>   paralinguistic tags, relax-identity (`QWEN_SPK_SCALE` knob added, no-op default), real-breath splice, DSP pauses, hesitant-capture.
+> - **`--volume`/`--rate` flags = trivial future add** (volume=pure PCM gain; not yet exposed).
+> NEXT STEPS (ranked): (1) **reply to Leo** (task #3 — perf leads int8-Talker/Windows-SD-single-thread/9P + his 2 forked
+>   params `--emit-tokens`/`--decode-tokens` deduced; re-read his full email first). (2) **compound-emotion MANIFEST as code**
+>   (name → {vec, steer_weight, rate, volume, roughness}) so `--emotion joy/sad/stern` sets all knobs — the v2 deliverable.
+> (3) optional: dedicated ES palette capture (ES inverts everything); `--volume`/`--rate` flags; retry sbuffo at lower weight.
+> Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
+> `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
+
 > **Status 2026-06-05:** built + ear-validated on branch `feat/expressivity` (6 commits, NOT merged).
 > Two levers ship; the feature WORKS and is a real differentiator, but it is a **v1, not the ceiling** —
 > the control-vector method is crude additive steering and several gaps remain (below). Mechanism
