@@ -1098,11 +1098,18 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             }
 
             float scale = (ref_norm > 0.1f && emb_norm > 0.1f) ? ref_norm / emb_norm : 1.0f;
+            /* Relax-identity lever (QWEN_SPK_SCALE, default 1.0 → no change): scale the speaker
+             * embedding contribution. <1.0 loosens the identity clamp on the register/pitch range
+             * (lets emotional steering reach bigger F0 excursions, like VoiceDesign), at the cost
+             * of some voice fidelity; >1.0 tightens identity. Experimental, env-gated. */
+            float spk_scale_env = 1.0f;
+            { const char *sse = getenv("QWEN_SPK_SCALE"); if (sse && sse[0]) spk_scale_env = (float)atof(sse); }
+            scale *= spk_scale_env;
             for (int j = 0; j < h; j++) dst[j] += ctx->speaker_embedding[j] * scale;
 
             if (!ctx->silent && fabsf(scale - 1.0f) > 0.01f)
-                fprintf(stderr, "  Speaker embedding norm scaled: %.2f -> %.2f (scale=%.4f)\n",
-                        emb_norm, emb_norm * scale, scale);
+                fprintf(stderr, "  Speaker embedding norm scaled: %.2f -> %.2f (scale=%.4f, QWEN_SPK_SCALE=%.2f)\n",
+                        emb_norm, emb_norm * scale, scale, spk_scale_env);
             if (ctx->debug)
                 fprintf(stderr, "[PROMPT] pos=%d SPEAKER EMBED injected (h=%d, raw_norm=%.4f, target_norm=%.4f, scale=%.4f)\n",
                         pos, h, emb_norm, ref_norm, scale);

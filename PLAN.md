@@ -648,7 +648,159 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 - [ ] **Not in the test suite** (no `--emotion` smoke / no steering golden); not merged to feat/labs.
 - **Per-layer & cross-speaker/language sensitivity still largely unmeasured** (validated 0.6B+1.7B / ryan+Silvio / EN+IT).
 
+**NEW LEADS (2026-06-06) — palette decorrelation + prosodic axes:**
+- [x] **ROOT CAUSE of "all tones sound alike" FOUND & FIXED (no re-capture).** Diagnosed the shipped IT
+  palette: vectors are highly collinear — mean off-diagonal cosine **+0.57**, and the somber cluster
+  (gloomy/news/dramatic/calm/sad) is +0.75..+0.91 (≈ the SAME vector). Each preset is ~80-90% a shared
+  "I-am-being-instructed-vs-neutral" common mode; the emotion-specific part is only the residual (happy 86%,
+  but gloomy/news/dramatic only 46-55%). Fix = **mean-center the palette** then renormalize:
+  `vec' = β·mean_all + γ·(vec − mean_all)`, renorm to original per-emotion norm. β=0 γ=2 →
+  **mean pairwise cosine +0.57 → −0.09** (near-orthogonal), same magnitudes. Tooling: `tests/steer_center.py`.
+  → bake this as the shipped palette (or a `--decorrelate` build step); also re-capture over MANY
+  sentences+speakers so the common mode is weaker at the source. Directly closes the "crude additive / not
+  contrastive" gap above. STILL TODO: ear-validate the centered palette is more distinct AND still natural
+  (centering can push off-manifold → metallic); pick β/γ knee; rebuild EN + IT + per-voice.
+- [ ] **Galatea is the better IT base voice** than Silvio (CC/PD LibriVox `it_galatea_fasol.wav`, Riccardo
+  Fasol). Neutral RMS 70 vs Silvio 29 → full/clear vs soft/low; emotions land better on it. New
+  `voices/galatea_06b.qvoice` (823MB, trim only 0.03s = no fade tail). Use as the reference IT clone for
+  expressivity demos. (1.7B + native-Galatea palette = open.)
+- [ ] **Explicit prosodic axes: `--volume`, `--rate`/`--speed`, `--pitch` (user req 2026-06-06).** Same
+  control-vector machinery as `--emotion` — capture "speak louder/softer", "faster/slower", "higher/lower"
+  as instruct-vs-neutral directions on `cp_x` and expose as signed knobs (−1..+1). (This is WHY some emotions
+  already shift Silvio's volume — the captured direction carries projection/energy.) Two implementations to
+  compare: (a) **steering vector** (model-side, changes delivery/register, on-manifold risk) vs (b) **cheap
+  DSP post-step** — `--volume` = PCM gain/normalize (trivial, `qwen_tts_audio.c`); `--rate` = WSOLA/`atempo`
+  time-stretch (pitch-preserving); `--pitch` = pitch-shift. DSP is reliable & decoupled but doesn't change
+  *delivery*; steering changes delivery but can distort. Likely ship: DSP for volume/rate (predictable),
+  steering-vector for "projection/intensity" (the expressive one). Volume/rate are the easy wins — do first.
+- [x] **MEASURED 2026-06-06 (Galatea 0.6B, neutral text, ear-validated):** the per-mood recipes that actually work:
+  - **Steering saturates fast & asymmetrically.** Default `--steer-weight 1.0` is too timid; on the CENTERED
+    palette w≈1.8–2.6 roughly doubles movement and stays clean (no clipping, hi6k flat → on-manifold) for the
+    UP moods. The DOWN moods (sad/gloomy/calm) DON'T respond to more weight — w4.2 is ~= w2.6, gloomy even goes
+    MORE monotone (F0std 17→10). So weight is an UP-mood lever only.
+  - **Down/somber moods = rate↓ + volume↓, NOT steering.** "Sadness" in speech is tempo+energy, which a
+    single-point CP injection can't impose. DSP slowdown (`atempo 0.82–0.85`, pitch-preserving) makes sad/gloomy
+    read as genuinely downcast — ear-confirmed "credibile". This is why `--rate`/`--volume` are REQUIRED, not extra.
+  - **Joy = excited (NOT happy) + rate↑ + volume↑.** The `happy` direction loses energy when pushed (the
+    "neutral is already upbeat" ceiling). The `excited` direction pushed (w2.6) + `atempo 1.10` + `volume 1.10`
+    = RMS +34%, F0 +13Hz, faster → genuine joy. Ear-confirmed. Lesson: for bright/joy use excited, not happy.
+  - **`--roughness` is TIMBRE (raspy/worn/smoker voice), NOT rage.** Ear-confirmed: roughness on a clean qvoice
+    just makes it gravelly/phlegmy, not angry. Rage = a CAPTURED angry steering direction + volume↑ + rate↑
+    (sharp/tense prosody), with NO roughness. Keep `--roughness` as a voice-CHARACTER knob, not an emotion.
+    (Capturing angry directions on 1.7B in progress.)
+  - **Design consequence — preset MANIFEST.** Real emotions are COMPOUND = `{vec, steer_weight, rate, volume,
+    roughness?}`, not a bare vector. Extend the `.vec` palette to a manifest (name → bundle) so `--emotion joy`
+    / `--emotion rage` sets all knobs at once. Bake centered-palette + per-mood weight + rate/volume here.
+  - **FULL RAGE is OUT OF REACH (model limit, ear-confirmed).** Captured 3 "furious/hostile/yell" directions on
+    1.7B, centered them — they land on **proud/authoritative/emphatic**, not angry (the model converts anger into
+    forceful control). Adding low roughness (0.25–0.40) + agitation (atempo 1.12) gets to **"annoyed/stern/light
+    irritation"** ("tired prof telling the class: hey, meeting tomorrow!") — useful and credible, but NOT furious
+    rage. Real anger needs tense/strained phonation + irregular bursts that additive single-point CP steering
+    can't impose. → ship as `annoyed`/`stern`, document rage as a known hard case. Artifacts persisted in
+    `presets/emotions/it_centered/` (decorrelated palette + `angry.vec` + README with the recipe table).
+
+- [ ] **VoiceDesign expressivity — INVESTIGATE (Leo Yu 2026-06-06).** Leo reports CustomVoice/clone "not as
+  emotional/expressive even with good instruct prompting" while **VoiceDesign is very expressive but can't lock a
+  voice identity** — the exact CustomVoice-vs-VoiceDesign tradeoff our steering work bridges. TASK: downloaded
+  `qwen3-tts-voice-design` (1.7B, 4.2GB); generate angry/sad/happy/excited/fearful with RICH official-style prompts
+  (multi-clause, e.g. "incredulous tone with a hint of panic creeping in", "vowels still tighten when nervous" —
+  the official examples are descriptive, NOT bare "speak angrily"), fixed voice-description + varied emotion clause,
+  EN+IT. LISTEN. IF VoiceDesign really renders rage/sadness better → reverse-engineer WHICH levers it has that
+  CustomVoice lacks: hypothesis = (a) no locked speaker identity → full prosody freedom (the identity-conditioning
+  that pins CustomVoice delivery is absent); (b) trained on rich descriptive style prompts. Levers we might port:
+  feed richer instruct, or relax speaker conditioning strength during steering. Official emotion control IS in
+  VoiceDesign per the paper (SOTA on InstructTTSEval); the limit is it doesn't clone.
+  **TESTED 2026-06-06 (downloaded VD 1.7B, EN+IT emotion matrix, user ear-verdict):**
+  - VoiceDesign DOES make bigger acoustic excursions than our CustomVoice (IT: angry F0 **+92Hz** & F0std +150%,
+    happy +29Hz, sad slowed +95%) — confirms the identity-clamp hypothesis: our locked speaker embedding/WDELTA
+    pins the register and blocks the pitch swings strong emotion needs. It also CORROBORATES our recipes (VD does
+    sad by slowing hugely, joy by raising pitch+rate — same directions, just more extreme).
+  - **BUT user verdict = VD's superiority is largely a "different-speaker ILLUSION":** VD synthesizes a NEW voice
+    per prompt, so the listener reads emotion easily because they're literally different people. On ONE consistent
+    recognizable voice the same shift is HARDER to perceive — no "clean break" (sighs/laughs/pauses) a human expects.
+    Our task (emotion on a STABLE identity) is intrinsically harder AND more valuable. Also: **VD Italian is WORSE
+    than ours** ("più orecchiabile noi"); angry/excited rendered with poor Italian — VD has NO base-speaker param
+    (voice is 100% prompt-derived → lands on a base weak in IT, likely a Chinese one), whereas we always use ryan
+    (strong in IT/ES/FR). VD also follows the target language inconsistently. → OUR consistent-voice direction wins.
+  - **Engine note:** `--load-voice` CAN inject an embedding INTO VoiceDesign (cross-model, qwen_tts.c:703, cosine
+    ~0.94) → could pin our identity + use VD's expressive instruct; likely re-clamps, but a cheap experiment.
+  - **NEXT LEADS (readable emotion on a consistent voice):** (A) **relax-identity lever** — scale down speaker
+    conditioning (embedding/WDELTA strength) during emotional spans to unlock pitch excursions while staying
+    recognizably the same voice (THE key reusable engine experiment). (B) **strong contour + onset "stacco"** —
+    sad span STARTS slow+quiet+falling, angry STARTS loud+fast+high, with a short PAUSE before the span = the
+    clean break audiobook voice-actors use. (C) pauses/tempo/volume swings we already have; sighs/laughs we don't
+    (model limit). Fold into the compound-emotion manifest.
+
+- [x] **Hidden-tag / special-token hunt — DEFINITIVE NEGATIVE (2026-06-06, first-hand model analysis).** Goal: find
+  special chars/tokens to pilot the model (sighs/laughs/onomatopoeia/emotion). Result: **Qwen3-TTS has NO
+  paralinguistic or emotion tokens.** Full `added_tokens_decoder` (both 1.7B CustomVoice + VoiceDesign) = only
+  standard Qwen tokens (im_start/end, vision, tool_call, fim, think) + TTS framing (`<|audio_start/end|>`,
+  `<tts_pad>`, `<tts_text_bos>`, `<tts_text_eod>`, `<|audio_pad|>`). NO `<laugh>`/`<sigh>`/`<breath>`/emotion tags.
+  Corroborated: (a) GitHub Discussion #238 is an OPEN request to ADD inline emotion tags (so they don't exist);
+  (b) third-party "TTS-Audio-Suite" gets laughs/sighs NOT from Qwen but by post-processing through a SEPARATE model
+  **Step Audio EditX** (inline tags `<Laughter:2>`/`<emotion:happy>`/`<style:whisper>`; covers ZH/EN/yue/ja/ko only,
+  "distorts" other langs → not for Italian). **The `codec_think_id/nothink/think_bos/think_eos` (2154-2157) = the
+  LANGUAGE-conditioning slot** (`qwen_tts.c:947`, `[THINK,THINK_BOS,language_id,THINK_EOS]` with `-l`, else
+  `[NO_THINK,...]`), already used by our engine — NOT a free-form instruction-following reasoning trace we're
+  missing. **CONCLUSION: emotion control in Qwen3-TTS = the instruct natural-language text ONLY** (no magic tags);
+  real paralinguistics need a 2nd-stage audio-edit model (Step Audio EditX), language-limited. → our steering+recipes
+  + (optional, EN-only) a paralinguistic post-editor is the only path to true sighs/laughs. Style-keyword inspiration
+  from EditX for VoiceDesign instructs: whisper/news/radio/story/shout/warm/gentle/authority/serious/murmur/etc.
+  Still worth a quick check: does OFFICIAL inference place the instruct differently than our `<|im_start|>user\n{instruct}<|im_end|>` (qwen_tts.c:882)?
+- [x] **Relax-identity lever — NEGATIVE (2026-06-06, ear-confirmed).** Added `QWEN_SPK_SCALE` env knob
+  (qwen_tts.c:~1100, default 1.0, scales the speaker-embedding contribution). Scaling DOWN (0.6/0.3) does NOT
+  free pitch excursions — it removes drive (RMS 76→52, F0 range shrinks), and at 0.3 the voice becomes a
+  DIFFERENT voice (lost Galatea); others not angrier. The register clamp lives in the WDELTA **weights**, not the
+  embedding → embedding-scale misses it. Faithful-clone vs VoiceDesign-pitch-range = physical conflict (same clamp).
+  Knob kept as a diagnostic. Deeper WDELTA-blend-toward-base lever = the VoiceDesign tradeoff we want to avoid.
+- [x] **Instruct-by-language test (1.7B ryan, n=1, ear-corrected):** instruct moves CHINESE delivery hugely
+  (angry ΔF0 +45Hz, ear-confirmed angry) but IT/EN by ±1-2Hz → **instruct/emotion is Chinese-tuned, weak on EU**
+  (validates the user's hypothesis; justifies our CP-steering path for EU). CORRECTION: my acoustic proxy claimed
+  "ZH instruct boosts Italian more" (ΔF0 -49) but BY EAR the EN-instruct IT was angrier and ZH-instruct IT less →
+  the "Chinese instruct on EU text" boost is NOT confirmed. (Lesson: ΔF0 magnitude ≠ perceived anger; ear is truth.)
+  Side-obs: `it_neutral` (no instruct) drifted to Chinese-ish PRONUNCIATION while `it_angry` was perfect Italian —
+  possible language re-anchoring by instruct/think → folded into the think re-audit task.
+- [ ] **DEEP RE-AUDIT (task #6): is `think`+instruct really language-only, or a strong emotion lever we mis-RE'd?**
+  We ASSUME codec-think (2154-2157) = fixed 4-token language slot. But we RE'd from PyTorch run-by-run; the paper
+  may be oversimplified. Qwen advertises strong emotional instruct yet ours is weak. Re-verify from scratch:
+  does official inference GENERATE a variable-length think/CoT in codec space between think_bos/think_eos (which we
+  skip)? think on/off/levels? instruct placement (system vs user)? InstructTTSEval setup? Run the OFFICIAL PyTorch
+  on the same angry-IT prompt and A/B vs our C — if PyTorch is much angrier, our RE missed something concrete.
+
 See [[project_expressivity]] for the full build log, the cross-voice map, and the Silvio re-clone saga.
+
+### A2. Cross-CPU PERF — Leo Yu 9950X3D (Zen5 V-Cache) report, 2026-06-06 — VERIFIED LEADS
+> Leo benchmarked pure-C v0.9.0 on a Ryzen 9 9950X3D (CCD0=96MB V-Cache, CCD1=32MB) across Docker/WSL2 +
+> native Windows (first MinGW build). Deep-analyzed against our code. The genuinely-useful, verified takeaways:
+- **int4×CCD insight (CORRECT, matches us):** int4 LOSES on CCD0 (60MB int8 fits the 96MB V-Cache → no bandwidth
+  pressure → nibble-dequant is pure cost) and WINS on CCD1 (32MB<60MB → bandwidth-bound → smaller footprint pays).
+  Refines our "int4 = the x86 lever, not M1" → precisely: int4 helps ONLY when the working set does NOT fit cache.
+- **Thread oversubscription is catastrophic:** -j32 (all 16 cores/32 threads) → RTF 6.38, 3.9× WORSE than -j1
+  (cache thrash + cross-CCD latency on a bandwidth-bound load). Confirms our 4-thread-sweet-spot / EPYC -j1>-j4.
+  → PRODUCT IDEA: auto-detect X3D, pin CP to the V-Cache CCD, cap threads low. Never oversubscribe.
+- **SD is BLAS-bound (verified: `cblas_sgemm` in speech_decoder.c).** Native Windows SD drain = 153 ms/f vs Linux
+  20 (OpenBLAS Win32 CreateThread/WaitForSingleObject per-GEMM sync). This single number kills native Windows
+  (RTF 2.10). **CHEAP FIX to try before any dual-boot: `OPENBLAS_NUM_THREADS=1` for the SD on Windows** — if the
+  cost is per-GEMM thread sync, single-thread (no spawn/join) likely beats 153 → ~30-40, putting Windows-native at
+  ~1.0 with NO Linux/hybrid. Or a persistent BLAS pool / our own Win32 pool for SD.
+- **#1 UNTAPPED WIN — int8 the TALKER.** Leo's Talker is pinned at 21 ms/f across bf16/int8/int4 → tell that his
+  Talker is NOT being quantized (stays bf16=1.2GB). On our tree `--int8` DOES quantize the 0.6B Talker (the
+  `hidden<2048` gate was removed). Quantizing it → 600MB halves DRAM traffic on the bottleneck HE correctly named
+  (Talker=DRAM-bound). Verify dtype via `--debug`; OS-independent win, ~−0.7..0.9s.
+- **Docker CP=54 likely contaminated by 9P filesystem** (his own note: model on /mnt/c = +30% CP). Clean on ext4
+  ≈ 38-42 → the "Windows 1.82× faster CP" (54→30) shrinks to ~1.3× and is partly mmap/filesystem, not V-Cache.
+- **RTF/per-frame table don't reconcile:** int4-j4-CCD1 (CP60+Talker21=81ms/f) shows RTF 1.11 < int8-j1-CCD0
+  (CP54=75ms/f) RTF 1.21 → only explained by prefill (threaded GEMM, faster at -j4) and SD-overlap differences;
+  per-frame table ≠ whole-utterance RTF. The hybrid streaming RTF 0.91 ignores per-frame cross-VM IPC (optimistic);
+  Linux-BM 0.80-0.84 stacks best-cases (Talker won't improve — DRAM-bound; CP 30→22 is speculative) → realistically
+  0.85-1.0. The dual-boot is likely UNNECESSARY (fix Windows SD threading + int8 Talker instead).
+- **Confirmed-good & worth keeping:** Leo's native Windows port (5 changes: CreateFileMapping mmap shim, O_BINARY,
+  Win32 server stub, posix_memalign→aligned_alloc, OS detect) closes our "Windows won't compile" gap → ask for the
+  patch. The `__AVX512VNNI__` Makefile-clean-bug he hit = our known gotcha. Cooperlake-BLAS-beats-AOCL on Zen5 SD
+  (medium ConvNet shapes favor Ice Lake blocking; Zen5 has full AVX-512) — plausible, use `OPENBLAS_CORETYPE=COOPERLAKE`.
+- **Streaming clarification:** Leo's "streaming not yet implemented" = HIS hybrid Win-CP→Linux-SD per-frame token
+  PIPE only (`--emit-tokens`/`--decode-tokens`, his local patch, NOT in our tree). It does NOT mean we lack
+  streaming — we HAVE `--stream` (TTFA, feat/streaming-ttfa) + OpenAI-compatible server streaming. Different layer.
 
 ### B. Weight-stationary batching = the throughput lever for the SERVER
 > **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/batched-generation` off
