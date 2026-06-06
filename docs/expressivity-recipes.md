@@ -77,6 +77,21 @@ vocal "basins" — a discovery menu, but knife-edge (a 0.2 weight change flips i
 FR/DE `excited` → irritated; ES `proud` → weary/fed-up; ES `excited` @**2.6** → a bored "eeem"/sigh
 (gone at 2.8). Useful as leads to capture as clean dedicated directions, not to ship raw.
 
+**The "eeem"/sbuffo reproducer** (the one emergent paralinguistic worth saving — the closest the
+model gets to a spontaneous sigh/filler; audio kept locally at `samples/emergent/`):
+```bash
+QWEN_EMOTION_DIR=presets/emotions/it_centered ./qwen_tts -d qwen3-tts-0.6b -j1 \
+  --seed 42 -l Spanish -s ryan --emotion excited --steer-weight 2.6 \
+  --text "La reunión comenzará mañana a las nueve y media en la sala grande." -o ES_sbuffo.wav
+```
+KNIFE-EDGE: `2.6` = sbuffo, `2.8` = calm. ES+ryan+centered-excited specific.
+
+**Trying to capture it as a clean dedicated direction FAILED** (2026-06-06): a "hesitant/umm/bored"
+instruct capture (1.7B) built a genuinely new direction (cos to excited only +0.3), but applied back
+it either broke the language (ES h1 @2.2 sounded Chinese, pushed too far off-manifold) or did nothing
+(IT/ES h2 = unchanged). So the sbuffo stays a fragile emergent artifact, not a portable preset. The
+hesitant `.vec`s live at `/tmp/pal_hes/` (ephemeral) if anyone wants to retry at lower weights.
+
 ## Tools
 - `tests/steer_center.py` — decorrelate a palette (β/γ + renorm).
 - `tests/emotion_compare.sh` — A/B a palette across voices.
