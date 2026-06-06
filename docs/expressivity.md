@@ -5,6 +5,10 @@ limitation of the model. This engine adds two CPU-side levers that act directly 
 **Code Predictor** (the stage that carries texture/prosody), giving controllable,
 audible delivery. Both default off → the normal path is bit-identical (no overhead).
 
+> **Practical, ear-validated per-mood & per-language recipes** (joy=excited, sad=slow+pauses,
+> annoyed=angry+roughness, cross-language notes, dead-ends): see
+> [expressivity-recipes.md](expressivity-recipes.md).
+
 ## `--emotion <name>` — delivery presets
 
 A calibrated palette of emotion/tone "control vectors" ships in `presets/emotions/`.
