@@ -686,8 +686,15 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (2) MULTI-ISA always: every batched kernel = NEON + AVX2 + AVX-512 + scalar (not NEON-only). (3) Annotate newer-ISA
 >   leads: ARM bf16 BFDOT/BFMMLA + i8mm SMMLA (M2/M3/M4/M5, Neoverse V1/V2, NVIDIA Grace/DGX Spark), SVE/SVE2, x86
 >   AVX-512-BF16/VNNI; add int8/int4 batched twins (batching pays most at low precision).
->   DONE so far: `qwen_matmat_bf16` (batched step primitive, multi-ISA NEON/AVX2/AVX512/scalar) + --self-test check
->   (matmat(B=8) vs B×matvec, L2_rel ~6e-7 PASS). NEXT: batched Talker step (B per-seq KV + batched attention) calling it.
+>   DONE so far: (a) `qwen_matmat_bf16` batched step primitive, multi-ISA NEON/AVX2/AVX512/scalar, --self-test PASS
+>   (matmat(B=8) vs B×matvec L2_rel ~6e-7); (b) **`qwen_batch_talker_step` — batched Talker step (opt-in), commit 6851eb0**:
+>   B seqs in lockstep through the full Talker (B per-seq KV + batched attention), REUSES per-vector kernels (rmsnorm/
+>   rope/attn/swiglu looped over B), batches ONLY the matvecs (gather→matmat→scatter). `--batch-test`/`make test-batch`:
+>   **WIRING bit-EXACT vs single-stream** (force_matvec mode L2_rel 0.00) + matmat-kernel probe 6e-7. **KEY FINDING:**
+>   the real matmat path diverges ~1.6% in HIDDEN state purely by fp accumulation ORDER amplified through 28 layers
+>   (1.46×/layer) — a valid alternative kernel LIKE INT8, NOT a bug; validate end-to-end by AUDIO mel-corr, not hidden
+>   bit-match. v1 = bf16, lockstep (no ragged EOS), Talker only. NEXT bricks: CP batched (90%/frame, pays most),
+>   batched sampling, ragged-EOS compaction, chunk scheduler, then opt-in `--batch N` (CLI+server) wiring.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
