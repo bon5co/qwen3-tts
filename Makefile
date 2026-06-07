@@ -361,6 +361,11 @@ test-emotion: $(TARGET)
 	@echo "PASS: expressivity/emotion smoke"
 	@echo ""
 
+batching-bench:
+	@echo "=== Batching premise microbench (GEMV xB vs GEMM B) ==="
+	$(CC) $(CFLAGS_BASE) -o /tmp/batching_bench tests/batching_bench.c -lm
+	@/tmp/batching_bench
+
 test-compose: $(TARGET)
 	@echo "=== Inline markup / --compose smoke test ==="
 	@mkdir -p $(TEST_DIR)
@@ -867,7 +872,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
