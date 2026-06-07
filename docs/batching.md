@@ -46,4 +46,47 @@ long document where 2× wall-time matters). For single short utterances it does 
 gain is ~2× on M1; a higher-bandwidth box (where single-stream is more memory-bound) could see
 more. Decide based on whether 2× justifies the rewrite + the per-sequence complexity.
 
+## Batching × PRECISION (int8 / int4 / int2)
+
+Re-ran the bench storing weights at their real byte size (`make batching-bench`, 4-thread).
+Two opposing effects: lower precision shrinks the weight READ (less to amortize → batching
+helps less) BUT makes the UNPACK costlier, and GEMV redoes that unpack per token while GEMM
+does it once (→ batching amortizes unpack → helps more). Measured trend:
+
+| precision | weight read | batching speedup (trend) |
+|---|---|---|
+| bf16 | 2 B/w | ~2× (clean NEON kernels) |
+| int8 | 1 B/w | ~1–1.2× (cheap decode, small read → little to amortize) |
+| **int4** | 0.5 B/w | **large — unpack-bound GEMV, GEMM amortizes the nibble unpack** |
+| **int2** | 0.25 B/w | **large — same, bit unpack** |
+
+**The unpack-amortization effect dominates at low precision: batching is WORTH MORE the lower
+you quantize.** Caveat: our microbench decodes scalar, so the int4/int2 GEMV is un-vectorized
+and the raw 6–8× is inflated; a production int4 kernel unpacks faster, so the real speedup is
+smaller — but the *synergy is real and the direction is solid*. This matters because **int4 is
+slow on M1 today precisely because nibble-unpack dominates** (per the quant notes — "int4 is the
+x86 lever, not M1"); batching amortizes that unpack, so **int4 + batching could make int4 viable
+on M1** and compound on x86. → If we build batching, pair it with int4/int8, not bf16.
+
+## Prediction for other CPUs (AMD VPS / mini-PC / Leo's new Zen5)
+
+Batching pays in proportion to how MEMORY/UNPACK-bound single-stream is. M1 is the *worst* case
+(high per-core bandwidth + wide caches → compute-bound → only ~2× at bf16). Expectations:
+
+- **AMD Ryzen mini-PC (Zen3+, 6800H):** more memory-bound per core than M1 (int4-MT was already
+  THE lever there, RTF 2.81→2.02). Batching at bf16 likely **>2×**; **int4 + batching the sweet
+  spot** (x86 + nibble-unpack amortization compound). Watch thread placement.
+- **EPYC server VPS (Zen4/5, many cores/channels):** per-core bandwidth lower, designed for
+  throughput; single-stream tops ~1.6–1.9 (quant notes). Batching is the *intended* use —
+  expect ~2–4× per core **× linear core scaling** = the real throughput play. Pin threads to one
+  CCD (a 4-vCPU VM scattering across CCDs already hurt single-stream).
+- **Leo's new "super AMD" (Zen5, 9950X / Turin):** native VNNI int8 (validated ~1.85× at equal
+  core) + AVX-512. A batched **int8-VNNI GEMM** is very efficient (matrix VNNI amortizes both
+  read and unpack); strong AVX-512 compute means bf16 stays compute-bound (modest batching) but
+  **int8/int4 + batching should be excellent**. Best target for the throughput prototype.
+
+Net: M1 is the floor for batching benefit; every x86 box we've touched should do **as well or
+better**, and the win grows when paired with int4/int8. Validate on the Ryzen box + Leo's Zen5
+before/while building the full prototype.
+
 Bench: `tests/batching_bench.c` (`make batching-bench`).
