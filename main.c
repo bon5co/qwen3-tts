@@ -410,20 +410,30 @@ static int qwen_apply_emotion(qwen_tts_ctx_t *ctx,
  * Used by --compose AND auto-detected inside --text. Each span is synthesized with
  * its own recipe and concatenated (model-generated -> seamless, same voice/codec). */
 
-typedef struct { int is_pause; float pause_s; char mood[48]; char *text; } cspan_t;
+/* steer_weight: <0 = use the mood recipe's weight; >=0 = override (0 = NO steering).
+ * rate/volume: >0 = override the recipe value, else inherit it. */
+typedef struct { int is_pause; float pause_s; char mood[48]; char *text;
+                 float steer_weight; float rate; float volume; } cspan_t;
 
-/* English paralinguistic macro -> {emotion recipe, onomatopoeia text fed to the model}.
- * Approximations (not true breaths): the slow+soft 'sad' recipe elongates the vowel
- * into a weary filler; 'annoyed' gives a clipped irritated huff. */
-typedef struct { const char *tag; const char *mood; const char *text; } cmacro_t;
+/* English paralinguistic macro = a self-contained soft filler recipe.
+ * Ear-validated 2026-06-07: steering on a short, time-stretched vowel goes metallic/
+ * "growl", so fillers use NO steering — just a breathy onomatopoeia (leading 'h' =
+ * aspiration), a gentle slowdown and a low volume. Not true breaths (no <breath> token),
+ * but they read as weary/aspirated in context. */
+typedef struct { const char *tag; const char *text; float steer_weight; float rate; float volume; } cmacro_t;
 static const cmacro_t COMPOSE_MACROS[] = {
-    { "sigh",  "sad",     "Ehh..." },
-    { "sighs", "sad",     "Ehh..." },
-    { "groan", "sad",     "Ahh..." },
-    { "hmm",   "sad",     "Mmm..." },
-    { "huff",  "annoyed", "Uff..." },
-    { "ugh",   "annoyed", "Uff..." },
-    { NULL, NULL, NULL }
+    /* tag        onomatopoeia  steer  rate   volume   (all ear-validated 2026-06-07) */
+    { "sigh",    "Hah...",    0.0f, 0.95f, 0.67f },  /* breathy "ah" sigh (short) */
+    { "sighs",   "Hah...",    0.0f, 0.95f, 0.67f },
+    { "hmm",     "Hmmm...",   0.0f, 0.88f, 0.65f },  /* pensive "hmm" — TOP */
+    { "ahh",     "Haaa...",   0.0f, 0.87f, 0.70f },  /* relief "ahhh" */
+    { "relief",  "Haaa...",   0.0f, 0.87f, 0.70f },
+    { "groan",   "Haaa...",   0.0f, 0.85f, 0.72f },
+    { "laugh",   "Hehhh...",  0.0f, 0.87f, 0.67f },  /* discovered: laughs, esp. in English */
+    { "laughs",  "Hehhh...",  0.0f, 0.87f, 0.67f },
+    { "huff",    "Uff...",    0.0f, 0.95f, 0.82f },  /* irritated huff */
+    { "ugh",     "Ugh...",    0.0f, 0.92f, 0.80f },
+    { NULL, NULL, 0.0f, 0.0f, 0.0f }
 };
 
 static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
@@ -461,6 +471,7 @@ static int parse_markup(const char *input, cspan_t **out, int *out_n) {
         while (_b > _a && (seg[_b-1]==' '||seg[_b-1]=='\t'||seg[_b-1]=='\n')) _b--; \
         if (_b > _a) {                                                           \
             cspan_t _s; _s.is_pause = 0; _s.pause_s = 0;                          \
+            _s.steer_weight = -1.0f; _s.rate = 0; _s.volume = 0;                  \
             snprintf(_s.mood, sizeof(_s.mood), "%s", cur_mood);                   \
             _s.text = (char *)malloc((size_t)(_b - _a) + 1);                      \
             if (!_s.text) { free(seg); free(arr); return -1; }                    \
@@ -500,7 +511,10 @@ static int parse_markup(const char *input, cspan_t **out, int *out_n) {
                             if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) {
                                 MK_FLUSH();
                                 cspan_t s; s.is_pause = 0; s.pause_s = 0;
-                                snprintf(s.mood, sizeof(s.mood), "%s", COMPOSE_MACROS[m].mood);
+                                s.steer_weight = COMPOSE_MACROS[m].steer_weight;
+                                s.rate = COMPOSE_MACROS[m].rate;
+                                s.volume = COMPOSE_MACROS[m].volume;
+                                s.mood[0] = 0;  /* macros are no-steer prosody; mood unused */
                                 s.text = strdup(COMPOSE_MACROS[m].text);
                                 if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
                                 handled = 1;
@@ -578,10 +592,19 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
         }
         const char *mood = spans[i].mood[0] ? spans[i].mood : NULL;
         float vol = 1.0f, rate = 1.0f;
-        if (qwen_apply_emotion(ctx, mood, NULL, language, 1.0f, 0, 0.0f, 0, 1.0f, 0, 1.0f, 0,
+        int   sw_set = spans[i].steer_weight >= 0.0f;          /* macro -> explicit (0 = no steer) */
+        float sw     = sw_set ? spans[i].steer_weight : 1.0f;
+        if (qwen_apply_emotion(ctx, mood, NULL, language, sw, sw_set, 0.0f, 0, 1.0f, 0, 1.0f, 0,
                                &vol, &rate, silent) != 0) { free(out); return -1; }
+        if (spans[i].rate   > 0.0f) rate = spans[i].rate;     /* macro filler overrides recipe rate */
+        if (spans[i].volume > 0.0f) vol  = spans[i].volume;   /* and volume */
         if (last_spoken && default_pause > 0) RS_APPEND(NULL, (size_t)(default_pause * SR));
         if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", idx, mood ? mood : "neutral", spans[i].text);
+
+        /* Each span is an INDEPENDENT synthesis: force a cold prefill so the previous
+         * span's KV/trajectory can't leak in via delta-prefill (which would change this
+         * span's delivery vs synthesizing it alone — ear-caught 2026-06-07). */
+        ctx->prev_prefill_len = 0;
 
         float *audio = NULL; int n = 0;
         if (qwen_tts_generate(ctx, spans[i].text, &audio, &n) != 0 || !audio || n <= 0) {

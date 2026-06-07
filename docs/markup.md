@@ -20,9 +20,16 @@ expressive markup automatically. (`--compose "..."` does the same explicitly.)
 |---|---|
 | `[happy] [sad] [excited] [eager] [proud] [calm] [dramatic] [news] [annoyed] [stern] [angry] [joy] [gloomy]` | switch the emotion for the text that follows (full recipe: steering + roughness + volume + rate) |
 | `[neutral]` (`[none]`, `[normal]`) | back to plain, unmodified delivery |
-| `[sigh]` `[sighs]` `[groan]` `[hmm]` | weary paralinguistic filler (slow + soft) |
-| `[huff]` `[ugh]` | clipped, irritated filler |
+| `[sigh]` `[sighs]` | breathy "ah" sigh (`Hahh…`) |
+| `[hmm]` | pensive "hmm" (`Hmmm…`) |
+| `[ahh]` `[relief]` | relief exhale (`Haaa…`) |
+| `[laugh]` `[laughs]` | a short laugh (`Hehhh…`) — **laughs best in English**; in other languages it reads more like a breathy sigh |
+| `[groan]` `[huff]` `[ugh]` | groan / irritated huff |
 | `[pause:400ms]` `[pause:1s]` `[pause:0.5]` `[break:300ms]` `[0.5]` | insert a pause (ms or seconds; bare number = seconds) |
+
+> Paralinguistic tags are **soft, un-steered** onomatopoeia tuned by ear (a leading `h` adds
+> breathy aspiration). They're approximations, not recorded breaths — and a few are
+> language-dependent (e.g. `[laugh]` lands as a real laugh in English, a sigh elsewhere).
 
 - Tags are **case-insensitive** and **always English** (`[sigh]`, not `[sospiro]`).
 - An emotion tag stays active until the next emotion tag or `[neutral]`.
@@ -43,9 +50,11 @@ don't collide; explicit `[pause:…]` tags add exactly the silence you specify.
 
 ## Paralinguistic fillers — what they are (and aren't)
 
-`[sigh]`/`[huff]`/etc. are **approximations**, not recorded breaths. The trick: the slow+soft
-`sad` recipe stretches a short vowel (`"Ehh…"`, `"Uff…"`) into a weary-sounding filler. They
-read convincingly as tiredness/exasperation in context, but they are synthesized vowels, not
+`[sigh]`/`[hmm]`/`[laugh]`/etc. are **approximations**, not recorded breaths. The trick: a short
+aspirated onomatopoeia (`"Hahh…"`, `"Hmmm…"`, `"Hehhh…"` — a leading `h` adds breathiness) is
+synthesized with **no emotion steering**, a gentle slowdown and low volume. (Steering a short,
+time-stretched vowel goes metallic/"growl", so fillers are pure soft prosody.) They read
+convincingly as tiredness/relief/amusement in context, but they are synthesized vowels, not
 true non-verbal breaths (the model has no real `<breath>` token — see the dead-ends in
 [expressivity-recipes.md](expressivity-recipes.md)).
 

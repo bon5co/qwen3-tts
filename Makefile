@@ -345,8 +345,9 @@ test-emotion: $(TARGET)
 	@# Down-mood lengthens audio (rate < 1)
 	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion sad \
 		--text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_sad.wav 2>$(TEST_DIR)/em_sad.log
-	@grep -qi "Rate: 0\.8" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe did not slow tempo"; cat $(TEST_DIR)/em_sad.log; exit 1; }
-	@echo "  PASS: --emotion sad -> slower tempo"
+	@grep -qi "Volume: 0.86" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe (vol 0.86) not applied"; cat $(TEST_DIR)/em_sad.log; exit 1; }
+	@grep -qi "Steering: active" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe steering not applied"; cat $(TEST_DIR)/em_sad.log; exit 1; }
+	@echo "  PASS: --emotion sad -> recipe (steering + quiet) applied"
 	@# Explicit knob overrides the baked recipe value
 	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy --steer-weight 1.0 \
 		--text "Ciao." -o $(TEST_DIR)/em_ovr.wav 2>$(TEST_DIR)/em_ovr.log

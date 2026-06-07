@@ -33,7 +33,7 @@ static const qwen_emotion_recipe_t MANIFEST[] = {
      * high weight pushes the IT direction off-manifold into a 'Chinese tone' basin
      * (ear-validated 2026-06-07: sad sweet spot = weight ~1.1 + rate 0.80 + vol 0.86;
      * the gloomy direction goes off-manifold even at 1.0, so it stays lower). */
-    { "sad",       "sad",      1.1f,  0.00f, 0.86f, 0.80f, "downcast (slow + quiet + slight ache; add ... pauses in text)" },
+    { "sad",       "sad",      1.1f,  0.00f, 0.86f, 1.08f, "downcast (steering + quiet, lightly compressed so words don't drag)" },
     { "gloomy",    "gloomy",   0.5f,  0.00f, 0.88f, 0.82f, "somber, low (mostly prosody; gloomy dir is off-manifold-prone on IT)" },
     { "annoyed",   "angry",    2.6f,  0.32f, 1.05f, 1.05f, "irritated/short-tempered (angry + grit + brisk)" },
     { "stern",     "angry",    2.6f,  0.28f, 1.05f, 1.00f, "firm, authoritative reprimand" },
