@@ -693,8 +693,15 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   **WIRING bit-EXACT vs single-stream** (force_matvec mode L2_rel 0.00) + matmat-kernel probe 6e-7. **KEY FINDING:**
 >   the real matmat path diverges ~1.6% in HIDDEN state purely by fp accumulation ORDER amplified through 28 layers
 >   (1.46×/layer) — a valid alternative kernel LIKE INT8, NOT a bug; validate end-to-end by AUDIO mel-corr, not hidden
->   bit-match. v1 = bf16, lockstep (no ragged EOS), Talker only. NEXT bricks: CP batched (90%/frame, pays most),
->   batched sampling, ragged-EOS compaction, chunk scheduler, then opt-in `--batch N` (CLI+server) wiring.
+>   bit-match. v1 = bf16, lockstep (no ragged EOS). (c) **`qwen_batch_cp_predict` — batched Code Predictor (the
+>   90%/frame bottleneck), commit 09edb01**: B frames lockstep through the 16-step CP (B per-frame CP KV), reuses
+>   CP layer math, batches matvecs via shared `qwen_batch_proj`; steering supported, v1 bf16 no-roughness.
+>   `--batch-test`: **CP wiring 0/120 codes differ (bit-exact) AND CP matmat 0/120 differ** — greedy argmax absorbs
+>   the fp-order noise → batched CP yields IDENTICAL audio codes. So both batched COMPUTE kernels (Talker+CP) are
+>   built + validated; golden 1.0 (additive). REMAINING (integration layer): batched sampling (Talker code0 +
+>   temperature/rejection), ragged-EOS compaction (chunks end at different lengths), chunk scheduler (split long
+>   text on sentence bounds, keep batch full, reuse render_spans for concat), then opt-in `--batch N` (CLI+server)
+>   + end-to-end RTF bench + audio mel-corr validation.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
