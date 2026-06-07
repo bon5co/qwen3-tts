@@ -1,9 +1,19 @@
 # Text-chunk batching — premise test (feat/batching)
 
-> **Design constraint: batching is an OPT-IN alternative path, never the default.** Like vLLM,
-> you turn it on (`--batch` / a server mode) when the workload fits — many requests, or one long
-> document where throughput matters. The single-stream path (today's code) stays the default and
-> is untouched. Default behavior + golden tests must remain bit-identical.
+> **Design constraints (non-negotiable):**
+> 1. **OPT-IN alternative path, never the default.** Like vLLM, you turn it on (`--batch` / a
+>    server mode) when the workload fits. The single-stream path (today's code) stays the default,
+>    **untouched** — golden tests bit-identical. The batched path is `if (--batch) { new flow }
+>    else { exactly as today }`. Reuse existing functions where possible; write NEW code for the
+>    batched parts — never zap/rewrite the working single-stream code.
+> 2. **Multi-ISA always.** Every batched kernel ships NEON **and** AVX2 **and** AVX-512 paths plus
+>    a scalar fallback (same dispatch discipline as the rest of the engine). `qwen_matmat_bf16`
+>    already does (vectorizes over the B dimension: AVX-512 16-wide → AVX2 8 → NEON 4 → scalar).
+> 3. **Newer-ISA leads (annotate now, exploit later)** — see the TODO in `bf16_matmat_slice`:
+>    ARM bf16 BFDOT/BFMMLA + i8mm SMMLA (Apple **M2/M3/M4/M5**, Neoverse V1/V2, **NVIDIA Grace /
+>    DGX Spark**), ARM **SVE/SVE2** (Grace/Spark, vector-length-agnostic), x86 **AVX-512-BF16**
+>    (VDPBF16PS) and **AVX-512-VNNI** for the int8 batched twin. And add `qwen_matmat_int8/_int4`
+>    twins — batching pays MOST at low precision (it amortizes the unpack).
 >
 > **Validation roadmap (in order):** (1) M1 Mac — build + correctness + RTF; (2) the AMD Ryzen
 > mini-PC (Zen2/3) over RDP; (3) the EPYC **Turin** VPS (AVX-512/VNNI); (4) only *after* those, use

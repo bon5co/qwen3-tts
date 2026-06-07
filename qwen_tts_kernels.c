@@ -738,7 +738,19 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
 /* ---- Batched matmat: Y[rows,B] = W[rows,cols] @ X[cols,B] (the batching /
  * spec-decode-verify primitive). Each weight element is loaded ONCE and FMA'd
  * into all B accumulators, so W streams from DRAM exactly once regardless of B
- * (X[k][0..B] is contiguous; acc[] stays L1/register-resident for B<=64). ---- */
+ * (X[k][0..B] is contiguous; acc[] stays L1/register-resident for B<=64).
+ *
+ * Multi-ISA, same dispatch discipline as the rest of the engine: vectorize over
+ * the B (accumulator) dimension — AVX-512 (16-wide) -> AVX2 (8) -> NEON (4) ->
+ * scalar tail. The bf16 weight decode is scalar (1 per element, amortized over B).
+ *
+ * TODO (newer ISAs, annotate-now / exploit-later): the bf16 decode + FMA could use
+ *   - ARM bf16 BFDOT/BFMMLA (Apple M2+, Neoverse V1/V2, NVIDIA Grace, DGX Spark) and
+ *     i8mm SMMLA for the int8 batched twin — NEON here does a scalar bf16->f32 shift.
+ *   - ARM SVE/SVE2 (Grace/Spark): vector-length-agnostic B loop.
+ *   - x86 AVX-512-BF16 (VDPBF16PS) to fuse decode+FMA; AVX-512-VNNI for int8 batched.
+ * Add an int8/int4 batched twin (qwen_matmat_int8/_int4) — that's where batching
+ * pays most (it amortizes the unpack). See docs/batching.md. */
 static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
                               int r0, int r1, int cols, int B) {
     for (int r = r0; r < r1; r++) {
@@ -750,10 +762,20 @@ static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
             float wv = bf16_to_f32(w[k]);
             const float *xk = X + (size_t)k * B;
             int b = 0;
+#if defined(__AVX512F__)
+            __m512 wq16 = _mm512_set1_ps(wv);
+            for (; b + 16 <= B; b += 16)
+                _mm512_storeu_ps(acc + b, _mm512_fmadd_ps(wq16, _mm512_loadu_ps(xk + b), _mm512_loadu_ps(acc + b)));
+#endif
+#if defined(__AVX2__)
+            __m256 wq8 = _mm256_set1_ps(wv);
+            for (; b + 8 <= B; b += 8)
+                _mm256_storeu_ps(acc + b, _mm256_fmadd_ps(wq8, _mm256_loadu_ps(xk + b), _mm256_loadu_ps(acc + b)));
+#endif
 #if defined(__ARM_NEON)
-            float32x4_t wq = vdupq_n_f32(wv);
+            float32x4_t wq4 = vdupq_n_f32(wv);
             for (; b + 4 <= B; b += 4)
-                vst1q_f32(acc + b, vfmaq_f32(vld1q_f32(acc + b), wq, vld1q_f32(xk + b)));
+                vst1q_f32(acc + b, vfmaq_f32(vld1q_f32(acc + b), wq4, vld1q_f32(xk + b)));
 #endif
             for (; b < B; b++) acc[b] += wv * xk[b];
         }

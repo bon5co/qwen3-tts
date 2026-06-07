@@ -680,7 +680,14 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   ≥ M1 (Ryzen mini-PC >2×+int4 sweet-spot; EPYC Turin VPS ~2-4×/core × core-scaling = the throughput play; Zen5+VNNI
 >   best target). VALIDATION ORDER: M1 → Ryzen mini-PC (Zen2/3, RDP) → Turin VPS (AVX-512) → ONLY THEN discuss w/ Leo.
 >   Full prototype scope in docs/batching.md (B per-seq KV, GEMM step kernels Talker+CP, ragged-EOS, chunk scheduler,
->   reuse render_spans for concat). Commits 3e0cb70-area on feat/batching: d175eb1, 5027490.
+>   reuse render_spans for concat). Commits on feat/batching: d175eb1, 5027490, 190a8f7, f34766d, +.
+>   **NON-NEGOTIABLE CONSTRAINTS (user 2026-06-07):** (1) ADDITIVE flow — `if(--batch){new}else{exactly as today}`;
+>   NEVER zap/rewrite the working single-stream path; reuse where possible, new code for batched parts; golden bit-identical.
+>   (2) MULTI-ISA always: every batched kernel = NEON + AVX2 + AVX-512 + scalar (not NEON-only). (3) Annotate newer-ISA
+>   leads: ARM bf16 BFDOT/BFMMLA + i8mm SMMLA (M2/M3/M4/M5, Neoverse V1/V2, NVIDIA Grace/DGX Spark), SVE/SVE2, x86
+>   AVX-512-BF16/VNNI; add int8/int4 batched twins (batching pays most at low precision).
+>   DONE so far: `qwen_matmat_bf16` (batched step primitive, multi-ISA NEON/AVX2/AVX512/scalar) + --self-test check
+>   (matmat(B=8) vs B×matvec, L2_rel ~6e-7 PASS). NEXT: batched Talker step (B per-seq KV + batched attention) calling it.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
