@@ -400,24 +400,168 @@ static int qwen_apply_emotion(qwen_tts_ctx_t *ctx,
     return 0;
 }
 
-/* Render a --compose spec into one WAV. Spans are separated by '|'; each span is:
- *   "[mood] text..."  -> synthesize `text` with the --emotion `mood` recipe
- *   "[pause=0.5]"     -> insert 0.5s of silence (also "[0.5]")
- *   "text..."         -> synthesize neutral (no emotion)
- * Each spoken span is post-processed with its recipe's rate/volume, then all spans
- * are concatenated (model-generated → seamless, same voice/codec) with a small
- * default gap between spoken spans. Enables e.g. a slow+sad "Ehh..." sigh span
- * followed by a normally-delivered sentence. Returns 0 on success. */
-static int run_compose(qwen_tts_ctx_t *ctx, const char *spec_in, const char *language,
-                       float default_pause, const char *output, int silent) {
+/* ---- Inline expressive markup (ElevenLabs/Bark-style square-bracket tags) ----
+ * One text body; tags are ENGLISH and inline, switchable mid-text:
+ *   [happy] [sad] [excited] [annoyed] [proud] [calm] ...  emotion for following text
+ *   [neutral]                                  back to plain delivery
+ *   [sigh] [sighs] [huff] [ugh] [groan] [hmm]  paralinguistic fillers (generated)
+ *   [pause:400ms] [pause:1s] [pause:0.5]       a pause (also [break:...] or bare [0.5])
+ * Unrecognized [..] tags are kept as literal text. A legacy '|' is a hard span break.
+ * Used by --compose AND auto-detected inside --text. Each span is synthesized with
+ * its own recipe and concatenated (model-generated -> seamless, same voice/codec). */
+
+typedef struct { int is_pause; float pause_s; char mood[48]; char *text; } cspan_t;
+
+/* English paralinguistic macro -> {emotion recipe, onomatopoeia text fed to the model}.
+ * Approximations (not true breaths): the slow+soft 'sad' recipe elongates the vowel
+ * into a weary filler; 'annoyed' gives a clipped irritated huff. */
+typedef struct { const char *tag; const char *mood; const char *text; } cmacro_t;
+static const cmacro_t COMPOSE_MACROS[] = {
+    { "sigh",  "sad",     "Ehh..." },
+    { "sighs", "sad",     "Ehh..." },
+    { "groan", "sad",     "Ahh..." },
+    { "hmm",   "sad",     "Mmm..." },
+    { "huff",  "annoyed", "Uff..." },
+    { "ugh",   "annoyed", "Uff..." },
+    { NULL, NULL, NULL }
+};
+
+static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
+    if (*n >= *cap) {
+        int nc = *cap * 2 + 8;
+        cspan_t *t = (cspan_t *)realloc(*arr, (size_t)nc * sizeof(cspan_t));
+        if (!t) return -1;
+        *arr = t; *cap = nc;
+    }
+    (*arr)[(*n)++] = s;
+    return 0;
+}
+
+/* "400ms"/"1s"/"0.5s"/"0.5" -> seconds */
+static float parse_duration_s(const char *s) {
+    while (*s == ' ') s++;
+    float v = (float)atof(s);
+    const char *u = s;
+    while (*u && ((*u >= '0' && *u <= '9') || *u == '.' || *u == '+' || *u == '-')) u++;
+    while (*u == ' ') u++;
+    if (strncasecmp(u, "ms", 2) == 0) return v / 1000.0f;
+    return v;  /* "s" or bare = seconds */
+}
+
+/* Parse inline markup into a span list. Caller frees each span.text and the array. */
+static int parse_markup(const char *input, cspan_t **out, int *out_n) {
+    cspan_t *arr = NULL; int n = 0, cap = 0;
+    char cur_mood[48] = "";
+    char *seg = (char *)malloc(strlen(input) + 1);
+    if (!seg) return -1;
+    int seglen = 0;
+    #define MK_FLUSH() do {                                                      \
+        int _a = 0, _b = seglen;                                                 \
+        while (_a < _b && (seg[_a]==' '||seg[_a]=='\t'||seg[_a]=='\n')) _a++;     \
+        while (_b > _a && (seg[_b-1]==' '||seg[_b-1]=='\t'||seg[_b-1]=='\n')) _b--; \
+        if (_b > _a) {                                                           \
+            cspan_t _s; _s.is_pause = 0; _s.pause_s = 0;                          \
+            snprintf(_s.mood, sizeof(_s.mood), "%s", cur_mood);                   \
+            _s.text = (char *)malloc((size_t)(_b - _a) + 1);                      \
+            if (!_s.text) { free(seg); free(arr); return -1; }                    \
+            memcpy(_s.text, seg + _a, (size_t)(_b - _a)); _s.text[_b - _a] = 0;   \
+            if (cspan_push(&arr, &n, &cap, _s) != 0) { free(_s.text); free(seg); free(arr); return -1; } \
+        }                                                                        \
+        seglen = 0;                                                              \
+    } while (0)
+
+    for (const char *p = input; *p; ) {
+        if (*p == '|') { MK_FLUSH(); p++; continue; }
+        if (*p == '[') {
+            const char *close = strchr(p, ']');
+            if (close) {
+                size_t tl = (size_t)(close - p - 1);
+                char tag[64];
+                if (tl < sizeof(tag)) {
+                    memcpy(tag, p + 1, tl); tag[tl] = 0;
+                    char *t = tag; while (*t == ' ') t++;
+                    char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
+                    int handled = 0;
+
+                    if (strncasecmp(t, "pause", 5) == 0 || strncasecmp(t, "break", 5) == 0) {
+                        const char *col = strchr(t, ':'); const char *eq = strchr(t, '=');
+                        const char *num = col ? col + 1 : (eq ? eq + 1 : t + 5);
+                        MK_FLUSH();
+                        cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(num);
+                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
+                        handled = 1;
+                    } else if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') {
+                        MK_FLUSH();
+                        cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(t);
+                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
+                        handled = 1;
+                    } else {
+                        for (int m = 0; COMPOSE_MACROS[m].tag && !handled; m++) {
+                            if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) {
+                                MK_FLUSH();
+                                cspan_t s; s.is_pause = 0; s.pause_s = 0;
+                                snprintf(s.mood, sizeof(s.mood), "%s", COMPOSE_MACROS[m].mood);
+                                s.text = strdup(COMPOSE_MACROS[m].text);
+                                if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
+                                handled = 1;
+                            }
+                        }
+                        if (!handled) {
+                            if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) {
+                                MK_FLUSH(); cur_mood[0] = 0; handled = 1;
+                            } else if (qwen_emotion_lookup(t)) {
+                                MK_FLUSH(); snprintf(cur_mood, sizeof(cur_mood), "%s", t); handled = 1;
+                            }
+                        }
+                    }
+                    if (handled) { p = close + 1; continue; }
+                }
+            }
+            seg[seglen++] = *p++;   /* unrecognized -> literal '[' */
+            continue;
+        }
+        seg[seglen++] = *p++;
+    }
+    MK_FLUSH();
+    free(seg);
+    #undef MK_FLUSH
+    *out = arr; *out_n = n;
+    return 0;
+}
+
+/* Quick scan: does `text` contain at least one RECOGNIZED inline tag? (auto-route) */
+static int text_has_markup(const char *text) {
+    for (const char *p = strchr(text, '['); p; p = strchr(p + 1, '[')) {
+        const char *c = strchr(p, ']');
+        if (!c) continue;
+        size_t tl = (size_t)(c - p - 1);
+        char tag[64];
+        if (tl >= sizeof(tag)) continue;
+        memcpy(tag, p + 1, tl); tag[tl] = 0;
+        char *t = tag; while (*t == ' ') t++;
+        char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
+        if (strncasecmp(t, "pause", 5) == 0 || strncasecmp(t, "break", 5) == 0) return 1;
+        if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') return 1;
+        if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) return 1;
+        for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
+        if (qwen_emotion_lookup(t)) return 1;
+    }
+    return 0;
+}
+
+/* Synthesize a parsed span list and concatenate into one WAV. Returns 0 on success. */
+static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
+                        const char *language, float default_pause,
+                        const char *output, int silent) {
     const int SR = QWEN_TTS_SAMPLE_RATE;
     float *out = NULL; size_t out_n = 0, out_cap = 0;
-    #define COMPOSE_APPEND(src, cnt) do {                                  \
+    int spoken = 0, idx = 0, last_spoken = 0;
+    #define RS_APPEND(src, cnt) do {                                       \
         size_t _c = (cnt);                                                 \
         if (out_n + _c > out_cap) {                                        \
             out_cap = (out_n + _c) * 2 + 1024;                             \
             float *_t = (float *)realloc(out, out_cap * sizeof(float));    \
-            if (!_t) { free(out); free(spec); return -1; }                 \
+            if (!_t) { free(out); return -1; }                            \
             out = _t;                                                      \
         }                                                                  \
         if (src) memcpy(out + out_n, (src), _c * sizeof(float));           \
@@ -425,65 +569,24 @@ static int run_compose(qwen_tts_ctx_t *ctx, const char *spec_in, const char *lan
         out_n += _c;                                                       \
     } while (0)
 
-    char *spec = strdup(spec_in);
-    if (!spec) return -1;
-    int span_idx = 0, spoken = 0;
-    char *saveptr = NULL;
-    for (char *span = strtok_r(spec, "|", &saveptr); span; span = strtok_r(NULL, "|", &saveptr)) {
-        while (*span == ' ' || *span == '\t') span++;
-        char *end = span + strlen(span);
-        while (end > span && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n')) *--end = '\0';
-        if (!*span) continue;
-
-        const char *mood = NULL;
-        const char *text = span;
-        char moodbuf[64];
-        if (*span == '[') {
-            char *close = strchr(span, ']');
-            if (close) {
-                size_t taglen = (size_t)(close - span - 1);
-                if (taglen >= sizeof(moodbuf)) taglen = sizeof(moodbuf) - 1;
-                memcpy(moodbuf, span + 1, taglen); moodbuf[taglen] = '\0';
-                char *t = moodbuf; while (*t == ' ') t++;
-                char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = '\0';
-                text = close + 1; while (*text == ' ' || *text == '\t') text++;
-
-                /* pause span? "[pause=N]", "[pauseN]", or bare "[N]" */
-                int is_pause = 0; float ps = 0.3f;
-                if (strncasecmp(t, "pause", 5) == 0) {
-                    is_pause = 1; const char *num = t + 5;
-                    while (*num && !((*num >= '0' && *num <= '9') || *num == '.')) num++;
-                    if (*num) ps = (float)atof(num);
-                } else if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') {
-                    is_pause = 1; ps = (float)atof(t);
-                }
-                if (is_pause) {
-                    if (ps > 0) COMPOSE_APPEND(NULL, (size_t)(ps * SR));
-                    if (!silent) fprintf(stderr, "  [pause %.2fs]\n", ps);
-                    continue;
-                }
-                /* explicit "no emotion" tags */
-                if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 ||
-                    strcasecmp(t, "normal") == 0 || t[0] == '\0')
-                    mood = NULL;
-                else
-                    mood = t;
-            }
+    for (int i = 0; i < nspans; i++) {
+        if (spans[i].is_pause) {
+            if (spans[i].pause_s > 0) RS_APPEND(NULL, (size_t)(spans[i].pause_s * SR));
+            if (!silent) fprintf(stderr, "  [pause %.2fs]\n", spans[i].pause_s);
+            last_spoken = 0;
+            continue;
         }
-        if (!*text) continue;  /* a tag with no spoken text */
-
-        if (spoken > 0 && default_pause > 0) COMPOSE_APPEND(NULL, (size_t)(default_pause * SR));
-
+        const char *mood = spans[i].mood[0] ? spans[i].mood : NULL;
         float vol = 1.0f, rate = 1.0f;
-        if (qwen_apply_emotion(ctx, mood, NULL, language,
-                               1.0f, 0, 0.0f, 0, 1.0f, 0, 1.0f, 0,
-                               &vol, &rate, silent) != 0) { free(spec); free(out); return -1; }
-        if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", span_idx, mood ? mood : "neutral", text);
+        if (qwen_apply_emotion(ctx, mood, NULL, language, 1.0f, 0, 0.0f, 0, 1.0f, 0, 1.0f, 0,
+                               &vol, &rate, silent) != 0) { free(out); return -1; }
+        if (last_spoken && default_pause > 0) RS_APPEND(NULL, (size_t)(default_pause * SR));
+        if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", idx, mood ? mood : "neutral", spans[i].text);
 
         float *audio = NULL; int n = 0;
-        if (qwen_tts_generate(ctx, text, &audio, &n) != 0 || !audio || n <= 0) {
-            fprintf(stderr, "Compose: synthesis failed for span %d\n", span_idx);
-            free(audio); free(spec); free(out); return -1;
+        if (qwen_tts_generate(ctx, spans[i].text, &audio, &n) != 0 || !audio || n <= 0) {
+            fprintf(stderr, "Compose: synthesis failed for span %d\n", idx);
+            free(audio); free(out); return -1;
         }
         float *seg = audio; int seg_n = n; float *stretched = NULL;
         if (rate != 1.0f) {
@@ -491,19 +594,29 @@ static int run_compose(qwen_tts_ctx_t *ctx, const char *spec_in, const char *lan
             if (qwen_audio_time_stretch(audio, n, rate, SR, &stretched, &sn) == 0) { seg = stretched; seg_n = sn; }
         }
         if (vol != 1.0f) qwen_audio_apply_gain(seg, seg_n, vol);
-        COMPOSE_APPEND(seg, (size_t)seg_n);
+        RS_APPEND(seg, (size_t)seg_n);
         free(stretched); free(audio);
-        spoken++; span_idx++;
+        spoken++; idx++; last_spoken = 1;
     }
-    free(spec);
 
     if (out_n == 0) { fprintf(stderr, "Compose: nothing to synthesize\n"); free(out); return -1; }
     int rc = qwen_tts_write_wav(output, out, (int)out_n, SR);
     if (rc == 0 && !silent)
         fprintf(stderr, "Wrote %s (%zu samples, %.2fs) [composed %d spans]\n",
-                output, out_n, (double)out_n / SR, span_idx);
+                output, out_n, (double)out_n / SR, spoken);
     free(out);
-    #undef COMPOSE_APPEND
+    #undef RS_APPEND
+    return rc;
+}
+
+/* Parse a markup spec (from --compose or --text) and render it to one WAV. */
+static int run_compose(qwen_tts_ctx_t *ctx, const char *spec, const char *language,
+                       float default_pause, const char *output, int silent) {
+    cspan_t *spans = NULL; int n = 0;
+    if (parse_markup(spec, &spans, &n) != 0) { fprintf(stderr, "Compose: parse error\n"); return -1; }
+    int rc = render_spans(ctx, spans, n, language, default_pause, output, silent);
+    for (int i = 0; i < n; i++) if (!spans[i].is_pause) free(spans[i].text);
+    free(spans);
     return rc;
 }
 
@@ -694,9 +807,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "                             Also accepts raw preset blends (e.g. happy:0.5,proud:0.5). Explicit knobs override.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
-                fprintf(stderr, "  --compose <spec>           Multi-span synthesis: '[mood] text | [mood] text | [pause=0.5]'\n");
-                fprintf(stderr, "                             Each span uses its own --emotion recipe; spans joined with pauses (one WAV)\n");
-                fprintf(stderr, "  --compose-pause <s>        Default gap between spoken spans (default 0.12s)\n");
+                fprintf(stderr, "  --compose <spec>           Inline markup synthesis (also works inside --text):\n");
+                fprintf(stderr, "                             'Hi! [sad] I have to go... [sigh] [pause:400ms] [neutral] Bye.'\n");
+                fprintf(stderr, "                             Tags: [happy|sad|excited|annoyed|...] emotion, [sigh|huff|ugh|groan|hmm]\n");
+                fprintf(stderr, "                             paralinguistic, [pause:400ms]/[pause:1s] pause. One WAV, spans joined.\n");
+                fprintf(stderr, "  --compose-pause <s>        Default gap between adjacent spoken spans (default 0.12s)\n");
                 fprintf(stderr, "  --steer-vector <file>      Custom emotion/prosody control vector (.vec from QWEN_STEER_CAPTURE)\n");
                 fprintf(stderr, "  --steer-weight <f>         Global injection scale for --emotion/--steer-vector (default 1.0)\n");
                 fprintf(stderr, "  -S, --silent               Silent mode\n");
@@ -862,6 +977,12 @@ int main(int argc, char **argv) {
      * any explicitly-passed knob overrides its baked value. A blend/scale spec
      * (e.g. "happy:0.5,proud:0.5") bypasses the manifest and steers raw presets.
      * (--compose calls the same helper per span; see below.) */
+    /* Auto-route a tagged --text (e.g. "Ciao [sad] ... [sigh]") through the
+     * inline-markup composer, so users get expressive markup without a new flag. */
+    if (!compose_spec && text && text_has_markup(text)) {
+        compose_spec = text;
+        if (!silent) fprintf(stderr, "Inline markup detected in --text -> compose mode\n");
+    }
     if (!compose_spec &&
         qwen_apply_emotion(ctx, emotion_spec, steer_vector_path, language,
                            cp_steer_weight, steer_weight_set, cp_roughness, roughness_set,

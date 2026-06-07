@@ -8,6 +8,10 @@ audible delivery. Both default off → the normal path is bit-identical (no over
 > **Practical, ear-validated per-mood & per-language recipes** (joy=excited, sad=slow+pauses,
 > annoyed=angry+roughness, cross-language notes, dead-ends): see
 > [expressivity-recipes.md](expressivity-recipes.md).
+>
+> **Writing long-form (audiobooks/podcasts)?** Use **inline markup** — one text with
+> `[sad]`/`[excited]` mid-text emotion switches, `[pause:400ms]` pauses and `[sigh]`/`[huff]`
+> fillers, rendered in one pass: see [markup.md](markup.md).
 
 ## `--emotion <name>` — delivery presets
 

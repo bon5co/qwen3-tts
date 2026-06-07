@@ -57,6 +57,7 @@ make blas
 - **Voice management** — List, inspect, delete `.qvoice` profiles (`--list-voices`, `--delete-voice`). No model required.
 - **Style control** — `--instruct` for emotion/style on 1.7B: angry, whisper, cheerful, and more.
 - **Expressivity presets** — `--emotion <mood>` drives a full ear-validated recipe at once (vector + steer-weight + roughness + volume + rate): compound moods `joy, sad, annoyed, stern, angry` plus the base palette `happy, excited, eager, proud, sad, gloomy, news, dramatic, calm`, for controllable delivery where `--instruct` is weak. Language-aware (Italian uses the centered palette), blendable (`happy:0.5,proud:0.5`), dial with `--steer-weight`, plus a `--roughness` grit knob and pitch-preserving `--rate`/`--volume`. Cross-model, works on custom voices. See [docs/expressivity.md](docs/expressivity.md).
+- **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [excited] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
 - **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`.
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
@@ -293,6 +294,7 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 | [HTTP Server](docs/server.md) | All endpoints, request body, streaming, server performance |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Expressivity](docs/expressivity.md) | `--emotion` compound moods + presets, mood blending, `--roughness`, `--rate`/`--volume`, building your own control vectors |
+| [Inline markup](docs/markup.md) | Audiobook/podcast tags in `--text`: `[sad]`/`[excited]` mid-text emotion switches, `[sigh]`/`[huff]` fillers, `[pause:400ms]` |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
 | [Performance](docs/performance.md) | RTF benchmarks, component breakdown, CPU vs GPU, optimization history |
 | [x86 optimization](docs/x86-optimization.md) | AVX2 / AVX-512 / VNNI findings, why it's memory-bound, how to benchmark your CPU |

@@ -360,6 +360,32 @@ test-emotion: $(TARGET)
 	@echo "PASS: expressivity/emotion smoke"
 	@echo ""
 
+test-compose: $(TARGET)
+	@echo "=== Inline markup / --compose smoke test ==="
+	@mkdir -p $(TEST_DIR)
+	@# Inline markup auto-detected in --text -> multi-span compose
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian \
+		--text "Che bella notizia! [pause:400ms] [sad] Devo andare... [sigh] [neutral] Ciao." \
+		-o $(TEST_DIR)/mk_inline.wav 2>$(TEST_DIR)/mk_inline.log
+	@grep -qi "Inline markup detected" $(TEST_DIR)/mk_inline.log || { echo "FAIL: inline markup not auto-detected in --text"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
+	@grep -qi "composed 4 spans" $(TEST_DIR)/mk_inline.log || { echo "FAIL: expected 4 spans (neutral/sad/sigh/neutral)"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
+	@grep -qi "pause 0.40s" $(TEST_DIR)/mk_inline.log || { echo "FAIL: [pause:400ms] not parsed"; cat $(TEST_DIR)/mk_inline.log; exit 1; }
+	@test -s $(TEST_DIR)/mk_inline.wav || { echo "FAIL: no audio"; exit 1; }
+	@echo "  PASS: inline [tag] markup in --text (4 spans, pause, [sigh] macro)"
+	@# Plain text (no tags) must NOT trigger compose
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian \
+		--text "Frase normale senza tag." -o $(TEST_DIR)/mk_plain.wav 2>$(TEST_DIR)/mk_plain.log
+	@if grep -qi "compose mode" $(TEST_DIR)/mk_plain.log; then echo "FAIL: plain text wrongly routed to compose"; cat $(TEST_DIR)/mk_plain.log; exit 1; fi
+	@echo "  PASS: plain text stays on the normal path"
+	@# Explicit --compose with English macros + pause
+	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l English \
+		--compose "[excited] We won! | [pause:0.5] | [sad] But it is over. [sigh]" \
+		-o $(TEST_DIR)/mk_compose.wav 2>$(TEST_DIR)/mk_compose.log
+	@grep -qi "composed" $(TEST_DIR)/mk_compose.log || { echo "FAIL: --compose did not render"; cat $(TEST_DIR)/mk_compose.log; exit 1; }
+	@echo "  PASS: explicit --compose"
+	@echo "PASS: inline markup / compose smoke"
+	@echo ""
+
 test-regression:
 	@echo "=== Regression tests ==="
 	@echo ""
@@ -388,7 +414,7 @@ test-regression:
 
 # ── Combined ──
 
-test-all: test-small test-large test-regression test-errors test-emotion test-caps test-selftest test-golden
+test-all: test-small test-large test-regression test-errors test-emotion test-compose test-caps test-selftest test-golden
 	@echo ""
 	@echo "========================================="
 	@echo "  All tests passed (0.6B + 1.7B)"
@@ -840,7 +866,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench test-errors test-emotion test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
         test-clone test-voice-design \
         demo-clone \
