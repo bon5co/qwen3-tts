@@ -24,6 +24,7 @@ expressive markup automatically. (`--compose "..."` does the same explicitly.)
 | `[ahh]` `[relief]` | pleasure/relief exhale (`Haaa…`) |
 | `[phew]` | big tired relief (`Uao…`) |
 | `[hmm]` | pensive "hmm" (`Hmmm…`) |
+| `[mmm]` | soft assent "mmm" (uses CN 嗯 — cleaner/less smug) |
 | `[hmpf]` | closed "mmmm" |
 | `[mah]` | dismissive "mah" (very Italian) |
 | `[uhm]` | tired/bored drawl |
@@ -37,6 +38,10 @@ expressive markup automatically. (`--compose "..."` does the same explicitly.)
 > Many fillers are **language-dependent** (the same string produces a different sound per
 > language): e.g. `[laugh]`/`Eheh` laughs in Italian, `[haha]`/`Haha` in English. Discover
 > and extend the set with `tests/sound_suite.sh` (mass-generate → listen → bake winners).
+>
+> **Chinese phonetic characters are a clean source** of paralinguistic sounds even under a
+> non-Chinese language: 嗯 → "mmm" (used by `[mmm]`), 哈哈/嘿嘿/呵呵 → laughs, 唉 → a weary
+> sigh. Some emoji also leak a sound (😂 → a faint sigh). Probe more via the suite.
 
 > Paralinguistic tags are **soft, un-steered** onomatopoeia tuned by ear (a leading `h` adds
 > breathy aspiration). They're approximations, not recorded breaths — and a few are

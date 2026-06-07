@@ -426,13 +426,14 @@ static const cmacro_t COMPOSE_MACROS[] = {
      * NOTE: keep rate >= ~0.90 — slower stretches the short vowel into a metallic WSOLA
      * artifact. A trailing "..." can make the model emit a 2nd spurious vocalization. */
     /* sighs / relief */
-    { "sigh",    "Hah...",    0.0f, 0.95f, 0.67f },  /* "aaaahhhww" sigh of relief — TOP */
-    { "sighs",   "Hah...",    0.0f, 0.95f, 0.67f },
+    { "sigh",    "Hah",       0.0f, 1.10f, 0.67f },  /* "aaaahhhww" sigh of relief — TOP (no "..." = shorter) */
+    { "sighs",   "Hah",       0.0f, 1.10f, 0.67f },
     { "ahh",     "Haaa...",   0.0f, 0.90f, 0.70f },  /* "ahhhww" pleasure/relief — TOP */
     { "relief",  "Haaa...",   0.0f, 0.90f, 0.70f },
     { "phew",    "Uao...",    0.0f, 1.00f, 0.82f },  /* big tired relief "ooowww" — TOP */
     /* thinking / hesitation / dismissive */
     { "hmm",     "Hmmm...",   0.0f, 0.88f, 0.65f },  /* pensive "hmm" — TOP */
+    { "mmm",     "\xe5\x97\xaf", 0.0f, 1.00f, 0.85f }, /* CN 嗯 = soft assent "mmm", less smug than [hmm] — TOP */
     { "hmpf",    "Hmpf...",   0.0f, 1.00f, 0.75f },  /* closed "mmmm" — TOP */
     { "mah",     "Mah...",    0.0f, 0.95f, 0.78f },  /* dismissive "mah" (very IT) — TOP */
     { "uhm",     "Uhm...",    0.0f, 0.95f, 0.72f },  /* tired/bored drawl — TOP */

@@ -56,9 +56,15 @@ CANDIDATES=(
   "cry_buaa_it|Italian|-|0|0.90|0.78|Buaa..."
   "sniff_it|Italian|-|0|0.95|0.70|Snif... snif..."
   # --- emoji probes (does the tokenizer turn these into anything?) ---
-  "emoji_joytears_it|Italian|-|0|1.00|0.85|😂😂"
+  "emoji_joytears_it|Italian|-|0|1.00|0.85|😂😂"   # -> faint sigh (validated)
   "emoji_lol_it|Italian|-|0|1.00|0.85|lol 😆"
   "emoji_cry_it|Italian|-|0|1.00|0.85|😢"
+  # --- Chinese phonetic characters (clean sounds even under Italian) ---
+  "zh_haha|Italian|-|0|1.00|0.85|哈哈"            # -> laugh (validated TOP)
+  "zh_heihei|Italian|-|0|1.00|0.85|嘿嘿"          # -> laugh
+  "zh_hehe|Italian|-|0|1.00|0.85|呵呵"            # -> laugh
+  "zh_ai_sigh|Italian|-|0|1.00|0.80|唉"           # -> weary sigh (validated)
+  "zh_en_mmm|Italian|-|0|1.00|0.85|嗯"            # -> soft "mmm" (validated -> [mmm])
 )
 
 INDEX="$OUT/INDEX.txt"

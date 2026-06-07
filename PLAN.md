@@ -650,6 +650,14 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   generates onomatopoeia/vowel/emoji combos PER LANGUAGE × PER PRESET VOICE; user listens + annotates the best by id;
 >   bake the winners into a reusable paralinguistic library (macros). Goal: map which strings→sounds (laughs, cries,
 >   gasps, sighs) each voice/language can produce. Faster than the ad-hoc one-off loop we've been doing.
+>   - **VALIDATED SOUND BANK (ryan, ear 2026-06-07):** baked → [sigh]=Hah, [hmm]=Hmmm, [mmm]=嗯, [mah]=Mah,
+>     [uhm]=Uhm, [hmpf]=Hmpf, [ahh]/[relief]=Haaa, [phew]=Uao, [laugh]=Eheh(IT), [haha]=Haha(EN), [heh]=Hehhh,
+>     [ouch]=Ouch(EN)/[ahi]=Ahi(IT). EXTRA leads to bake: CN 哈哈/嘿嘿/呵呵 = 3 clean laughs; CN 唉 = weary sigh;
+>     😂 = faint sigh; "Ahahah 😆" → AHI pain; ouch_ahi/laugh_hihi = sharp-pain "ahi" (reduce metallic). NOT good:
+>     emoji 😢/lol, cry_buaa, sniff, boh, gasp_ah. RULES: macro rate ≥0.90 (metallic else); trailing "..." can add
+>     a 2nd spurious vocalization; "metallic" = WSOLA over-stretch.
+> - **Known model quirk (note):** occasionally elongates the letters of short words intermittently (model-side,
+>   not the sad recipe) — "Che fatica" drew out even at neutral rate 1.0. Investigate if it becomes a problem.
 > Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
 > `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
 
