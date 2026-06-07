@@ -126,7 +126,7 @@ cp-microbench:
 main.o: main.c qwen_tts.h qwen_tts_audio.h qwen_tts_batch.h qwen_tts_kernels.h qwen_tts_server.h
 qwen_tts.o: qwen_tts.c qwen_tts.h qwen_tts_kernels.h qwen_tts_safetensors.h qwen_tts_tokenizer.h qwen_tts_audio.h
 qwen_tts_talker.o: qwen_tts_talker.c qwen_tts.h qwen_tts_kernels.h qwen_tts_batch.h
-qwen_tts_code_predictor.o: qwen_tts_code_predictor.c qwen_tts.h qwen_tts_kernels.h
+qwen_tts_code_predictor.o: qwen_tts_code_predictor.c qwen_tts.h qwen_tts_kernels.h qwen_tts_batch.h
 qwen_tts_speech_decoder.o: qwen_tts_speech_decoder.c qwen_tts.h qwen_tts_kernels.h
 qwen_tts_kernels.o: qwen_tts_kernels.c qwen_tts_kernels.h qwen_tts_kernels_impl.h
 qwen_tts_kernels_generic.o: qwen_tts_kernels_generic.c qwen_tts_kernels_impl.h

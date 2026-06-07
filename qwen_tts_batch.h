@@ -24,7 +24,30 @@ typedef struct {
     uint16_t *kv_k, *kv_v;
     int force_matvec;   /* diagnostic: do projections as B matvecs (bit-matches single-stream)
                            instead of one batched matmat. Default 0 (use the batched matmat). */
+
+    /* ---- Code Predictor batched buffers (B frames in lockstep) ---- */
+    int cp_h, cp_q_dim, cp_kv_dim, cp_inter, cp_num_layers, cp_kv_max;
+    float *cp_x, *cp_x_norm, *cp_q, *cp_k, *cp_v, *cp_attn, *cp_proj, *cp_gate, *cp_swiglu_tmp;
+    float *cp_Xt, *cp_Yt;
+    uint16_t *cp_kv_k, *cp_kv_v;   /* [B][cp_num_layers][cp_kv_max][cp_kv_dim] */
 } qwen_batch_t;
+
+/* Batched projection dst[B][rows] = W @ src[B][cols] (src row b at b*srcstride).
+ * Shared by the batched Talker and Code Predictor. force_matvec=1 -> B matvecs
+ * (bit-matches single-stream); else one batched matmat. Xt/Yt = scratch. */
+void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
+                     int rows, int cols, int srcstride, int B, int force_matvec,
+                     float *Xt, float *Yt);
+
+/* Single-stream Code Predictor (defined in qwen_tts_code_predictor.c) — declared here
+ * so the batched self-test can use it as the reference. */
+int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes);
+
+/* One batched Code Predictor: for B frames, talker_hidden[B*hidden] + code0[B] ->
+ * out_codes[B*15]. Reuses the CP layer math, batching the matvecs. Returns 0 ok,
+ * -2 if non-bf16. (kv reset internally; B sequences in lockstep.) */
+int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
+                          const float *talker_hidden, const int *code0, int *out_codes);
 
 /* Allocate batched buffers + B KV caches from ctx config. kv_max = max frames per
  * chunk. Returns NULL on OOM or if the model isn't bf16 (v1 limitation). */

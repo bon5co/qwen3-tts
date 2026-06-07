@@ -821,20 +821,28 @@ static void batch_scatter(float *dst, const float *Yt, int B, int rows) {
 }
 
 /* Batched projection dst[B][rows] = W @ src[B][cols] (src row b at b*srcstride).
- * Default: one batched matmat (weights read once). QWEN_BATCH_NOMATMUL=1 falls back
- * to B per-column matvecs — a diagnostic to isolate the matmat from the wiring. */
+ * Default: one batched matmat (weights read once). force_matvec (or QWEN_BATCH_NOMATMUL=1)
+ * falls back to B per-column matvecs — bit-matches single-stream; a diagnostic to isolate
+ * the matmat from the wiring. Xt/Yt are caller-provided scratch ([cols*B] / [rows*B]).
+ * Shared by the batched Talker AND Code Predictor (different dims). */
 static int g_batch_nomatmul = -1;
-static void batch_proj(qwen_batch_t *bb, float *dst, const uint16_t *W,
-                       const float *src, int rows, int cols, int srcstride) {
+void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
+                     int rows, int cols, int srcstride, int B, int force_matvec,
+                     float *Xt, float *Yt) {
     if (g_batch_nomatmul < 0) g_batch_nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
-    if (g_batch_nomatmul || bb->force_matvec) {
-        for (int b = 0; b < bb->B; b++)
+    if (g_batch_nomatmul || force_matvec) {
+        for (int b = 0; b < B; b++)
             qwen_matvec_bf16(dst + (size_t)b * rows, W, src + (size_t)b * srcstride, rows, cols);
     } else {
-        batch_gather(bb->Xt, src, bb->B, cols, srcstride);
-        qwen_matmat_bf16(bb->Yt, W, bb->Xt, rows, cols, bb->B);
-        batch_scatter(dst, bb->Yt, bb->B, rows);
+        batch_gather(Xt, src, B, cols, srcstride);
+        qwen_matmat_bf16(Yt, W, Xt, rows, cols, B);
+        batch_scatter(dst, Yt, B, rows);
     }
+}
+/* thin wrapper for the Talker step (uses bb's own scratch/width) */
+static void batch_proj(qwen_batch_t *bb, float *dst, const uint16_t *W,
+                       const float *src, int rows, int cols, int srcstride) {
+    qwen_batch_proj(dst, W, src, rows, cols, srcstride, bb->B, bb->force_matvec, bb->Xt, bb->Yt);
 }
 
 qwen_batch_t *qwen_batch_alloc(qwen_tts_ctx_t *ctx, int B, int kv_max) {
@@ -858,9 +866,28 @@ qwen_batch_t *qwen_batch_alloc(qwen_tts_ctx_t *ctx, int B, int kv_max) {
     size_t kvN = (size_t)B * bb->num_layers * kv_max * kvd;
     bb->kv_k = (uint16_t *)aligned_calloc(kvN, sizeof(uint16_t));
     bb->kv_v = (uint16_t *)aligned_calloc(kvN, sizeof(uint16_t));
+
+    /* ---- Code Predictor batched buffers (cp_kv_max = 64, matching single-stream) ---- */
+    bb->cp_h = c->cp_hidden_size; bb->cp_q_dim = c->cp_num_heads * c->cp_head_dim;
+    bb->cp_kv_dim = c->cp_num_kv_heads * c->cp_head_dim; bb->cp_inter = c->cp_intermediate_size;
+    bb->cp_num_layers = c->cp_num_layers; bb->cp_kv_max = 64;
+    int ch = bb->cp_h, cqd = bb->cp_q_dim, ckvd = bb->cp_kv_dim, cint = bb->cp_inter;
+    int cmaxrows = 2 * cint; if (cqd > cmaxrows) cmaxrows = cqd; if (ch > cmaxrows) cmaxrows = ch;
+    int cmaxcols = ch; if (cqd > cmaxcols) cmaxcols = cqd; if (cint > cmaxcols) cmaxcols = cint;
+#define AC(n) (float *)aligned_calloc((size_t)(n), sizeof(float))
+    bb->cp_x = AC(B * ch); bb->cp_x_norm = AC(B * ch); bb->cp_q = AC(B * cqd);
+    bb->cp_k = AC(B * ckvd); bb->cp_v = AC(B * ckvd); bb->cp_attn = AC(B * cqd);
+    bb->cp_proj = AC(B * ch); bb->cp_gate = AC((size_t)B * 2 * cint); bb->cp_swiglu_tmp = AC(cint);
+    bb->cp_Xt = AC((size_t)cmaxcols * B); bb->cp_Yt = AC((size_t)cmaxrows * B);
+#undef AC
+    size_t ckvN = (size_t)B * bb->cp_num_layers * bb->cp_kv_max * ckvd;
+    bb->cp_kv_k = (uint16_t *)aligned_calloc(ckvN, sizeof(uint16_t));
+    bb->cp_kv_v = (uint16_t *)aligned_calloc(ckvN, sizeof(uint16_t));
+
     if (!bb->x || !bb->x_norm || !bb->q || !bb->k || !bb->v || !bb->attn_out ||
         !bb->proj_out || !bb->gate || !bb->swiglu_tmp || !bb->Xt || !bb->Yt ||
-        !bb->kv_k || !bb->kv_v) { qwen_batch_free(bb); return NULL; }
+        !bb->kv_k || !bb->kv_v || !bb->cp_x || !bb->cp_q || !bb->cp_gate ||
+        !bb->cp_Xt || !bb->cp_Yt || !bb->cp_kv_k || !bb->cp_kv_v) { qwen_batch_free(bb); return NULL; }
     return bb;
 }
 
@@ -868,7 +895,11 @@ void qwen_batch_free(qwen_batch_t *bb) {
     if (!bb) return;
     free(bb->x); free(bb->x_norm); free(bb->q); free(bb->k); free(bb->v);
     free(bb->attn_out); free(bb->proj_out); free(bb->gate); free(bb->swiglu_tmp);
-    free(bb->Xt); free(bb->Yt); free(bb->kv_k); free(bb->kv_v); free(bb);
+    free(bb->Xt); free(bb->Yt); free(bb->kv_k); free(bb->kv_v);
+    free(bb->cp_x); free(bb->cp_x_norm); free(bb->cp_q); free(bb->cp_k); free(bb->cp_v);
+    free(bb->cp_attn); free(bb->cp_proj); free(bb->cp_gate); free(bb->cp_swiglu_tmp);
+    free(bb->cp_Xt); free(bb->cp_Yt); free(bb->cp_kv_k); free(bb->cp_kv_v);
+    free(bb);
 }
 
 int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
@@ -998,10 +1029,44 @@ int qwen_batch_self_test(qwen_tts_ctx_t *ctx) {
      * to be validated end-to-end by audio mel-corr (not hidden bit-match). */
     int pass = err_matvec < 1e-5;
     fprintf(stderr, "batch-test: B=%d K=%d\n", B, K);
-    fprintf(stderr, "  wiring (matvec mode) vs single-stream: L2_rel=%.2e  %s (must be bit-exact)\n",
+    fprintf(stderr, "  Talker wiring (matvec mode) vs single-stream: L2_rel=%.2e  %s (must be bit-exact)\n",
             err_matvec, err_matvec < 1e-5 ? "PASS" : "FAIL");
-    fprintf(stderr, "  batched matmat path vs single-stream:  L2_rel=%.2e  (fp-order amplification, benign — validate via audio)\n",
+    fprintf(stderr, "  Talker batched matmat vs single-stream:       L2_rel=%.2e  (fp-order amplification, benign — validate via audio)\n",
             err_matmat);
+
+    /* ---- batched Code Predictor: codes must match single-stream qwen_cp_predict ----
+     * (greedy argmax → exact in matvec mode; matmat mode may flip a few argmaxes on
+     * near-ties, reported as a code-disagreement rate.) */
+    {
+        int vocab = c->codec_vocab_size > 0 ? c->codec_vocab_size : 1024;
+        float *th = (float *)malloc((size_t)B * h * sizeof(float));
+        int   *c0 = (int *)malloc((size_t)B * sizeof(int));
+        int   *ref = (int *)malloc((size_t)B * 15 * sizeof(int));
+        int   *bat = (int *)malloc((size_t)B * 15 * sizeof(int));
+        for (int i = 0; i < B * h; i++) th[i] = (float)(RF * 0.5);
+        for (int b = 0; b < B; b++) c0[b] = (int)((RF * 0.5 + 0.5) * (vocab - 1));
+        /* single-stream reference per frame */
+        for (int b = 0; b < B; b++) qwen_cp_predict(ctx, th + (size_t)b * h, c0[b], ref + (size_t)b * 15);
+        int cp_unsupported = 0, diff_mv = 0, diff_mm = 0;
+        for (int mode = 0; mode < 2; mode++) {
+            bb->force_matvec = (mode == 0);
+            if (qwen_batch_cp_predict(ctx, bb, th, c0, bat) == -2) { cp_unsupported = 1; break; }
+            int diff = 0;
+            for (int i = 0; i < B * 15; i++) if (bat[i] != ref[i]) diff++;
+            if (mode == 0) diff_mv = diff; else diff_mm = diff;
+        }
+        if (cp_unsupported) {
+            fprintf(stderr, "  CP batched: skipped (non-bf16 model)\n");
+        } else {
+            fprintf(stderr, "  CP wiring (matvec mode) vs single-stream: %d/%d codes differ  %s (must be 0)\n",
+                    diff_mv, B * 15, diff_mv == 0 ? "PASS" : "FAIL");
+            fprintf(stderr, "  CP batched matmat vs single-stream:       %d/%d codes differ  (argmax flips on near-ties; validate via audio)\n",
+                    diff_mm, B * 15);
+            if (diff_mv != 0) pass = 0;
+        }
+        free(th); free(c0); free(ref); free(bat);
+    }
+
     fprintf(stderr, "batch-test: %s\n", pass ? "PASS" : "FAIL");
     free(embeds_all); free(embedsB); free(href); free(hbat); qwen_batch_free(bb);
     return pass ? 0 : 1;
