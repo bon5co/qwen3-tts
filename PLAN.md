@@ -698,10 +698,16 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   CP layer math, batches matvecs via shared `qwen_batch_proj`; steering supported, v1 bf16 no-roughness.
 >   `--batch-test`: **CP wiring 0/120 codes differ (bit-exact) AND CP matmat 0/120 differ** — greedy argmax absorbs
 >   the fp-order noise → batched CP yields IDENTICAL audio codes. So both batched COMPUTE kernels (Talker+CP) are
->   built + validated; golden 1.0 (additive). REMAINING (integration layer): batched sampling (Talker code0 +
->   temperature/rejection), ragged-EOS compaction (chunks end at different lengths), chunk scheduler (split long
->   text on sentence bounds, keep batch full, reuse render_spans for concat), then opt-in `--batch N` (CLI+server)
->   + end-to-end RTF bench + audio mel-corr validation.
+>   built + validated; golden 1.0 (additive).
+>   **⚠️ STOP / KEY FINDING (b51469c, `--batch-bench` real model 0.6B B=8 K=50): batched compute is 4-12× SLOWER on M1**
+>   (4T 0.24×, 1T 0.08×). The premise microbench mispredicted (it compared two naive kernels). The PRODUCTION
+>   `qwen_matvec_bf16` is heavily optimized (8-wide NEON, 2 rows/iter, register-resident multi-accumulators); our
+>   `bf16_matmat_slice` is naive (scalar decode + acc[64] in L1 NOT registers, load/store every k) + gather/scatter.
+>   On M1 (compute-bound, high per-core BW) B×production-matvec beats it. **DECISION: do NOT build the full --batch
+>   integration on M1.** The 2 batched kernels are built+correct (reusable). Batching needs (1) a production-quality
+>   register-blocked batched matmat AND (2) a memory-bound x86 box (Ryzen/Turin/Zen5) to pay. Confirms M1 = compute-bound;
+>   batching is an x86/THROUGHPUT lever at best. NEXT (only if pursued): optimize the matmat → re-run --batch-bench on
+>   x86 → IF it wins there, then build the integration (sampling/ragged-EOS/scheduler/--batch). Else park as x86-only.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
