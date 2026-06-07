@@ -422,17 +422,31 @@ typedef struct { int is_pause; float pause_s; char mood[48]; char *text;
  * but they read as weary/aspirated in context. */
 typedef struct { const char *tag; const char *text; float steer_weight; float rate; float volume; } cmacro_t;
 static const cmacro_t COMPOSE_MACROS[] = {
-    /* tag        onomatopoeia  steer  rate   volume   (all ear-validated 2026-06-07) */
-    { "sigh",    "Hah...",    0.0f, 0.95f, 0.67f },  /* breathy "ah" sigh (short) */
+    /* tag        onomatopoeia  steer  rate   volume   (ear-validated 2026-06-07, ryan IT/EN)
+     * NOTE: keep rate >= ~0.90 — slower stretches the short vowel into a metallic WSOLA
+     * artifact. A trailing "..." can make the model emit a 2nd spurious vocalization. */
+    /* sighs / relief */
+    { "sigh",    "Hah...",    0.0f, 0.95f, 0.67f },  /* "aaaahhhww" sigh of relief — TOP */
     { "sighs",   "Hah...",    0.0f, 0.95f, 0.67f },
+    { "ahh",     "Haaa...",   0.0f, 0.90f, 0.70f },  /* "ahhhww" pleasure/relief — TOP */
+    { "relief",  "Haaa...",   0.0f, 0.90f, 0.70f },
+    { "phew",    "Uao...",    0.0f, 1.00f, 0.82f },  /* big tired relief "ooowww" — TOP */
+    /* thinking / hesitation / dismissive */
     { "hmm",     "Hmmm...",   0.0f, 0.88f, 0.65f },  /* pensive "hmm" — TOP */
-    { "ahh",     "Haaa...",   0.0f, 0.87f, 0.70f },  /* relief "ahhh" */
-    { "relief",  "Haaa...",   0.0f, 0.87f, 0.70f },
-    { "groan",   "Haaa...",   0.0f, 0.85f, 0.72f },
-    { "laugh",   "Hehhh...",  0.0f, 0.87f, 0.67f },  /* discovered: laughs, esp. in English */
-    { "laughs",  "Hehhh...",  0.0f, 0.87f, 0.67f },
-    { "huff",    "Uff...",    0.0f, 0.95f, 0.82f },  /* irritated huff */
-    { "ugh",     "Ugh...",    0.0f, 0.92f, 0.80f },
+    { "hmpf",    "Hmpf...",   0.0f, 1.00f, 0.75f },  /* closed "mmmm" — TOP */
+    { "mah",     "Mah...",    0.0f, 0.95f, 0.78f },  /* dismissive "mah" (very IT) — TOP */
+    { "uhm",     "Uhm...",    0.0f, 0.95f, 0.72f },  /* tired/bored drawl — TOP */
+    /* laughs (language-dependent) */
+    { "laugh",   "Eheh...",   0.0f, 0.95f, 0.78f },  /* real chuckle "eheheh" — TOP (IT) */
+    { "laughs",  "Eheh...",   0.0f, 0.95f, 0.78f },
+    { "haha",    "Haha!",     0.0f, 1.00f, 0.80f },  /* short laugh — TOP (EN) */
+    { "heh",     "Hehhh...",  0.0f, 0.95f, 0.70f },  /* smug "eh eh" (EN) */
+    /* pain */
+    { "ouch",    "Ouch!",     0.0f, 1.00f, 0.85f },  /* sharp pain (EN) — TOP */
+    { "ahi",     "Ahi!",      0.0f, 1.00f, 0.85f },  /* sharp pain (IT) */
+    /* irritation */
+    { "huff",    "Uff...",    0.0f, 1.00f, 0.78f },  /* irritated huff */
+    { "ugh",     "Ugh...",    0.0f, 1.00f, 0.78f },
     { NULL, NULL, 0.0f, 0.0f, 0.0f }
 };
 

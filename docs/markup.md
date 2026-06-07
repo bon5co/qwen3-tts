@@ -20,12 +20,23 @@ expressive markup automatically. (`--compose "..."` does the same explicitly.)
 |---|---|
 | `[happy] [sad] [excited] [eager] [proud] [calm] [dramatic] [news] [annoyed] [stern] [angry] [joy] [gloomy]` | switch the emotion for the text that follows (full recipe: steering + roughness + volume + rate) |
 | `[neutral]` (`[none]`, `[normal]`) | back to plain, unmodified delivery |
-| `[sigh]` `[sighs]` | breathy "ah" sigh (`Hahh…`) |
+| `[sigh]` `[sighs]` | sigh of relief (`Hah…`) |
+| `[ahh]` `[relief]` | pleasure/relief exhale (`Haaa…`) |
+| `[phew]` | big tired relief (`Uao…`) |
 | `[hmm]` | pensive "hmm" (`Hmmm…`) |
-| `[ahh]` `[relief]` | relief exhale (`Haaa…`) |
-| `[laugh]` `[laughs]` | a short laugh (`Hehhh…`) — **laughs best in English**; in other languages it reads more like a breathy sigh |
-| `[groan]` `[huff]` `[ugh]` | groan / irritated huff |
+| `[hmpf]` | closed "mmmm" |
+| `[mah]` | dismissive "mah" (very Italian) |
+| `[uhm]` | tired/bored drawl |
+| `[laugh]` `[laughs]` | a real chuckle (`Eheh…`) — best in Italian |
+| `[haha]` | short laugh (`Haha!`) — best in English |
+| `[heh]` | smug "eh eh" |
+| `[ouch]` / `[ahi]` | sharp pain — English / Italian |
+| `[huff]` `[ugh]` | irritated huff |
 | `[pause:400ms]` `[pause:1s]` `[pause:0.5]` `[break:300ms]` `[0.5]` | insert a pause (ms or seconds; bare number = seconds) |
+
+> Many fillers are **language-dependent** (the same string produces a different sound per
+> language): e.g. `[laugh]`/`Eheh` laughs in Italian, `[haha]`/`Haha` in English. Discover
+> and extend the set with `tests/sound_suite.sh` (mass-generate → listen → bake winners).
 
 > Paralinguistic tags are **soft, un-steered** onomatopoeia tuned by ear (a leading `h` adds
 > breathy aspiration). They're approximations, not recorded breaths — and a few are

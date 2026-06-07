@@ -63,8 +63,9 @@ CANDIDATES=(
 
 INDEX="$OUT/INDEX.txt"
 : > "$INDEX"
-printf "%-22s %-8s %-6s %-5s %-5s  %s\n" "ID" "LANG" "STEER" "RATE" "VOL" "TEXT" | tee "$INDEX"
-printf '%.0s-' {1..78}; echo
+echo "# sound_suite — id, params, and the exact replicable CLI command (vary --text to probe)." >> "$INDEX"
+echo "# voice=$VOICE model=$MODEL seed=$SEED" >> "$INDEX"
+echo >> "$INDEX"
 
 n=0; ok=0
 for row in "${CANDIDATES[@]}"; do
@@ -72,17 +73,21 @@ for row in "${CANDIDATES[@]}"; do
   n=$((n+1))
   args=( -d "$MODEL" -j1 -T 0 --seed "$SEED" -s "$VOICE" -l "$lang"
          --rate "$rate" --volume "$vol" --text "$text" -o "$OUT/$id.wav" )
-  [ "$emo" != "-" ] && args+=( --emotion "$emo" --steer-weight "$steer" )
+  emo_str=""
+  [ "$emo" != "-" ] && { args+=( --emotion "$emo" --steer-weight "$steer" ); emo_str=" --emotion $emo --steer-weight $steer"; }
+  cmd="$BIN -d $MODEL -j1 -T 0 --seed $SEED -s $VOICE -l $lang --rate $rate --volume $vol$emo_str --text \"$text\" -o $OUT/$id.wav"
   if "$BIN" "${args[@]}" >/dev/null 2>&1; then
-    ok=$((ok+1))
-    line=$(printf "%-22s %-8s %-6s %-5s %-5s  %s" "$id" "$lang" "$steer" "$rate" "$vol" "$text")
-    echo "$line" | tee -a "$INDEX"
+    ok=$((ok+1)); status="ok "
   else
-    echo "FAILED: $id" | tee -a "$INDEX"
+    status="ERR"
   fi
+  printf "[%s] %-22s %-8s rate=%s vol=%s  text=%s\n" "$status" "$id" "$lang" "$rate" "$vol" "\"$text\"" | tee -a "$INDEX"
+  echo "      $cmd" >> "$INDEX"
+  echo >> "$INDEX"
 done
 
 echo
-echo "Generated $ok/$n sounds in $OUT/  (index: $INDEX)"
+echo "Generated $ok/$n sounds in $OUT/  (index + replicable CLI per sound: $INDEX)"
 echo "Listen:  for f in $OUT/*.wav; do echo \"\$f\"; afplay \"\$f\"; done"
+echo "Vary a prompt fast: copy the CLI line from $INDEX, change --text, re-run."
 echo "Then tell me the winning IDs and I'll bake them as [tag] macros."
