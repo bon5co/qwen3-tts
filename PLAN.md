@@ -612,7 +612,37 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 
 ### A. Prosody/emotion control on the Code Predictor — BUILT v1 (`feat/expressivity`), NOT YET AT THE TOP
 
-> **▶ RESUME 2026-06-07 (read this first; full details in the dated entries below + `docs/expressivity-recipes.md`).**
+> **▶▶ SESSION 2026-06-07 WRAP (read FIRST — 12 commits `3e0cb70`→`c1c4d2b` on `feat/expressivity`, NOT merged).**
+> Turned the half-done emotion manifest into a full expressive-control system, all ear-validated with the user.
+> SHIPPED THIS SESSION:
+> - **Compound-emotion MANIFEST** (`qwen_tts_emotion.{c,h}`): `--emotion <mood>` sets the whole recipe
+>   {vec, steer_weight, roughness, volume, rate}. Explicit flags override. Language-aware resolver (IT→`it_centered/`).
+> - **`--volume` (PCM gain) + `--rate` (in-engine WSOLA, pitch-preserving, no ffmpeg)** in `qwen_tts_audio.c`.
+> - **`--compose` + INLINE `[tag]` MARKUP** (ElevenLabs/Bark style, English tags, auto-detected in `--text`): per-span
+>   emotion switch, `[pause:400ms]`, paralinguistic fillers. `parse_markup`→`render_spans`. docs/markup.md.
+> - **🐛 CROSS-SPAN LEAK FIXED (user-caught by ear):** compose's repeated `generate` calls reused the prev span's KV
+>   via delta-prefill → a `[sad]` rendered differently in a mix vs alone. Fix `ctx->prev_prefill_len=0` per span →
+>   each span bit-identical to standalone (corr 1.0). LESSON: delta-prefill is a SERVER opt, wrong for compose.
+> - **PARALINGUISTIC LIBRARY** (ear-validated macros, no-steer soft prosody): `[sigh]`=Hah…, `[hmm]`=Hmmm…, `[mmm]`=嗯,
+>   `[mah]`,`[uhm]`,`[hmpf]`,`[ahh]`/`[relief]`=Haaa…,`[phew]`=Uao…,`[laugh]`=Eheh…(IT),`[haha]`(EN),`[heh]`,
+>   `[ouch]`(EN)/`[ahi]`(IT). `tests/sound_suite.sh` = the discovery workflow (mass-gen→listen→bake; CLI per line).
+> KEY DISCOVERIES (validated): `Hah...`=sigh / `Hah`=laugh (the "…" makes the breathy sigh; bare = a dry laugh);
+> **Chinese phonetic chars are a clean sound source even under IT**: 哈哈/嘿嘿/呵呵=laughs, 唉=weary sigh, 嗯=mmm;
+> 😂 leaks a faint sigh; "Ahahah 😆"→"AHI!" pain. RULES baked in: macro rate ≥0.90 (slower=metallic WSOLA on a short
+> vowel); a trailing "…" can trigger a 2nd spurious vocalization; same string→different sound per language; **weight is
+> an UP-mood lever only — down-moods (sad/gloomy) go off-manifold ('Chinese tone') at high weight → use LOW steer +
+> prosody** (sad=w1.1/rate1.08/vol0.86). Golden mel-corr still 1.0 (default-off untouched); `make test-emotion`/`test-compose` green.
+> NEXT (ranked): (1) reply to Leo (perf, task #3, prepped); (2) run sound_suite + bake more winners (CN laughs, pain
+> 'ahi', `[ha]`=dry laugh); (3) **RE-TEST on a CLONED `.qvoice` (Galatea/Silvio): emotion-MIX (`[happy]/[sad]/[angry]`)
+> + paralinguistic fillers (`[sigh]`/`[laugh]`/`[mmm]`) via `--compose`/markup — all validation so far is on PRESET
+> ryan; verify the macros + mid-text emotion switches survive on a cloned voice (CP is cross-model so it SHOULD, but
+> the no-steer fillers + per-span cold-prefill need ear-checking on a real clone)**; (4) server-side volume/rate/compose
+> (CLI-only today); (5) merge feat/expressivity→feat/labs.
+> KNOWN: server doesn't have volume/rate/compose; true breaths absent (no <breath> token); model occasionally
+> over-elongates short words (intermittent, model-side). Local-only (not git): `samples/` (all audio), `voices/galatea_06b.qvoice`.
+> Stray `analisi_leak*.md` still untracked (NOT ours). BACKLOG below: int2/int3 quant, clone+preset speed/quality bench, emoji map.
+>
+> **▶ RESUME 2026-06-07 (earlier in session — kept for detail; see `docs/expressivity-recipes.md`).**
 > Session 2026-06-06 was long & productive. WHERE WE LANDED:
 > - **Galatea = the IT demo voice** (`voices/galatea_06b.qvoice`, CC LibriVox, better than Silvio). Centered IT
 >   palette (`presets/emotions/it_centered/`) = the one to use (collinearity fixed, +88% contrast).
