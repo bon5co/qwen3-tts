@@ -628,9 +628,17 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   13 moods `name → {vec, steer_weight, roughness, volume, rate}`; `--emotion joy/sad/stern/annoyed` sets ALL knobs.
 >   Also shipped: `--volume` (PCM gain) + `--rate` (in-engine WSOLA time-stretch, no ffmpeg) + language-aware
 >   resolver (Italian auto-uses `it_centered/`) + graceful degrade when a mood's vec is missing for a language.
->   `make test-emotion` (in test-all); golden mel-corr still 1.0 (default-off). STILL TODO: EAR-validate the recipe
->   numbers (joy/sad/annoyed) sound right; wire volume/rate into the HTTP server path (CLI-only today).
-> (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; per-span markup segmenter.
+>   `make test-emotion` (in test-all); golden mel-corr still 1.0 (default-off).
+>   **EAR-VALIDATED + RECALIBRATED 2026-06-07 (ec30e51):** sad@2.0 went off-manifold ('Chinese tone') →
+>   down-moods = LOW steer + strong prosody (sad=w1.1/rate0.80/vol0.86 = 'sad+slight ache', user 'ottimo'; gloomy=w0.5).
+>   (2b) ✅ **DONE 2026-06-07 (bbec95f + 17ca50a): --compose + INLINE MARKUP for audiobooks.** Per-span synthesis
+>   (qwen_apply_emotion re-entrant + render_spans + parse_markup), ElevenLabs/Bark-style English square-bracket tags
+>   auto-detected in --text: `[sad]/[excited]` mid-text emotion, `[sigh]/[huff]/[ugh]/[groan]/[hmm]` paralinguistic
+>   fillers (generated NOT spliced — the slow+sad recipe elongates "Ehh.."/"Uff.." vowels), `[pause:400ms]/[break:1s]`.
+>   Spans model-generated → seamless concat (NOT the dead-end ref-splice). `make test-compose`; docs/markup.md.
+>   KEY SERENDIPITY: slow+sad config = a controllable paralinguistic GENERATOR (user idea). STILL TODO: server-side
+>   volume/rate/compose (CLI-only); true breaths still absent; tune macro recipes; EN/other-lang sigh quality.
+> (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; more macros.
 > Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
 > `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
 
