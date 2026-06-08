@@ -59,6 +59,14 @@ void qwen_batch_free(qwen_batch_t *bb);
 int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                            const float *embeds, float *hidden_out);
 
+/* Ragged variant: each sequence at its OWN position pos_arr[b] (so chunks whose
+ * prompts prefilled to different lengths can generate together). active[b]=0 skips
+ * a finished sequence (ragged EOS). The caller advances pos_arr[b] for active
+ * sequences after each step. NULL pos_arr == the lockstep call above. */
+int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
+                                  const float *embeds, const int *pos_arr,
+                                  const uint8_t *active, float *hidden_out);
+
 /* Correctness self-test: runs K steps of B identical sequences through the batched
  * step and asserts each column matches the single-stream qwen_talker_step (within
  * fp tolerance). Prints a report; returns 0 on pass. (`./qwen_tts --batch-test`) */

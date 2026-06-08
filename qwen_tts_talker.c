@@ -902,13 +902,25 @@ void qwen_batch_free(qwen_batch_t *bb) {
     free(bb);
 }
 
-int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
-                           const float *embeds, float *hidden_out) {
+/* Core batched Talker step. pos_arr[b] = each sequence's CURRENT position (where
+ * its new K/V is written, and the RoPE/attention query position); NULL = lockstep
+ * (all sequences at the shared bb->kv_len, as the bench/self-test use). active[b]=0
+ * skips that sequence's per-seq work (finished/ragged-EOS); NULL = all active. The
+ * batched matvecs still process all B rows (compaction is a later optimization);
+ * inactive outputs are ignored by the caller. The caller advances pos_arr; in
+ * lockstep mode this advances bb->kv_len by one. */
+static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
+                                  const float *embeds, const int *pos_arr,
+                                  const uint8_t *active, float *hidden_out) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, h = bb->h, qd = bb->q_dim, kvd = bb->kv_dim, inter = bb->inter;
-    int pos = bb->kv_len; float eps = c->rms_norm_eps;
-    if (pos + 1 > bb->kv_max) return -1;
+    float eps = c->rms_norm_eps;
     if (ctx->layers[0].wq_bf16 == NULL) return -2;
+    int maxpos = 0;
+    for (int b = 0; b < B; b++) { int p = pos_arr ? pos_arr[b] : bb->kv_len; if (p > maxpos) maxpos = p; }
+    if (maxpos + 1 > bb->kv_max) return -1;
+    #define POS_B(b) (pos_arr ? pos_arr[b] : bb->kv_len)
+    #define ACTIVE_B(b) (!active || active[b])
     memcpy(bb->x, embeds, (size_t)B * h * sizeof(float));
     float scale = 1.0f / sqrtf((float)c->head_dim);
 
@@ -921,8 +933,10 @@ int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         batch_proj(bb, bb->q, l->wq_bf16, bb->x_norm, qd,  h, h);
         batch_proj(bb, bb->k, l->wk_bf16, bb->x_norm, kvd, h, h);
         batch_proj(bb, bb->v, l->wv_bf16, bb->x_norm, kvd, h, h);
-        /* 3-5. per-head norm, RoPE, append KV — per sequence */
+        /* 3-5. per-head norm, RoPE, append KV — per sequence (at its own position) */
         for (int b = 0; b < B; b++) {
+            if (!ACTIVE_B(b)) continue;
+            int pos = POS_B(b);
             qwen_rms_norm_per_head(bb->q + (size_t)b * qd,  l->q_norm, 1, c->num_heads,    c->head_dim, eps);
             qwen_rms_norm_per_head(bb->k + (size_t)b * kvd, l->k_norm, 1, c->num_kv_heads, c->head_dim, eps);
             apply_rope_neox_inplace(bb->q + (size_t)b * qd,  c->num_heads,    c->head_dim, ctx->rope_cos, ctx->rope_sin, pos);
@@ -931,8 +945,10 @@ int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
             f32_to_bf16_vec(bb->kv_k + kvbase, bb->k + (size_t)b * kvd, kvd);
             f32_to_bf16_vec(bb->kv_v + kvbase, bb->v + (size_t)b * kvd, kvd);
         }
-        /* 6. causal GQA attention — per sequence, against its own KV */
+        /* 6. causal GQA attention — per sequence, against its own KV (length pos+1) */
         for (int b = 0; b < B; b++) {
+            if (!ACTIVE_B(b)) continue;
+            int pos = POS_B(b);
             size_t lbase = ((size_t)b * bb->num_layers + layer) * bb->kv_max * kvd;
             qwen_causal_attention_bf16kv(bb->attn_out + (size_t)b * qd, bb->q + (size_t)b * qd,
                                          bb->kv_k + lbase, bb->kv_v + lbase, 1, pos + 1,
@@ -965,8 +981,24 @@ int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     /* final RMSNorm per sequence */
     for (int b = 0; b < B; b++)
         qwen_rms_norm(hidden_out + (size_t)b * h, bb->x + (size_t)b * h, ctx->talker_norm, 1, h, eps);
-    bb->kv_len = pos + 1;
+    if (!pos_arr) bb->kv_len = bb->kv_len + 1;   /* lockstep advance */
+    #undef POS_B
+    #undef ACTIVE_B
     return 0;
+}
+
+/* Lockstep wrapper (bench/self-test): all B sequences share bb->kv_len. */
+int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
+                           const float *embeds, float *hidden_out) {
+    return batch_talker_step_impl(ctx, bb, embeds, NULL, NULL, hidden_out);
+}
+
+/* Ragged wrapper (orchestrator): each sequence at its own pos_arr[b]; active[b]=0
+ * skips finished sequences. The caller advances pos_arr[b] for active sequences. */
+int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
+                                  const float *embeds, const int *pos_arr,
+                                  const uint8_t *active, float *hidden_out) {
+    return batch_talker_step_impl(ctx, bb, embeds, pos_arr, active, hidden_out);
 }
 
 int qwen_batch_self_test(qwen_tts_ctx_t *ctx) {
