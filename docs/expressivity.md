@@ -1,9 +1,32 @@
 # Expressivity: emotion & prosody control
 
-Qwen3-TTS's built-in `--instruct` ("speak angrily") barely changes delivery — a known
-limitation of the model. This engine adds two CPU-side levers that act directly on the
+> ## ★ The strongest lever: the native-instruct recipe (1.7B, ear-validated 2026-06-08)
+> `--instruct` was thought to "barely change delivery" — that was a usage artifact. It works **well**
+> with two conditions the obvious approach misses:
+>
+> 1. **Temperature 1.1–1.3** (not the 0.5 default, and NEVER `-T 0`). Greedy/low temp picks the flattest
+>    prosody → emotion suppressed. At T1.1–1.3 the model expresses it and even adds spontaneous
+>    paralinguistics (a sad lead-in *"hmm… let me tell you…"*). T1.1/1.3 stay clean — you can push them.
+> 2. **Write the instruct in ENGLISH (or Chinese) — the model's training languages — NOT the spoken
+>    language.** Qwen3-TTS's instruct-following is EN/ZH-centric; an Italian instruct is barely understood
+>    (stays flat), while an **English instruct on Italian speech** emotes strongly and keeps the speech
+>    cleanly Italian. (Chinese instruct ≈ a hair stronger, esp. sad.)
+>
+> ```bash
+> ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.2 \
+>   --instruct "Speak deeply sad and heartbroken, a slow broken voice on the verge of tears." \
+>   --text "Allora ti racconto una cosa successa oggi." -o sad.wav
+> ```
+> The `ryan` preset cross-speaks EN/IT/FR/ES well. **Caveat:** works on **preset** voices; a cloned
+> `.qvoice` resists instruct (the WDELTA weight-delta fossilizes the voice) — making clones emote is an
+> open research problem (naive activation steering via `QWEN_ACT_MAP`/`--ml-steer` collapses energy).
+
+Qwen3-TTS's built-in `--instruct` at the default temp barely changes delivery (see the recipe above to
+fix that). This engine also adds two CPU-side levers that act directly on the
 **Code Predictor** (the stage that carries texture/prosody), giving controllable,
 audible delivery. Both default off → the normal path is bit-identical (no overhead).
+NOTE: these control-vector emotions are MILDER than the native-instruct recipe above and work
+cross-model (incl. 0.6B, no instruct); prefer the recipe on 1.7B presets.
 
 > **Practical, ear-validated per-mood & per-language recipes** (joy=excited, sad=slow+pauses,
 > annoyed=angry+roughness, cross-language notes, dead-ends): see

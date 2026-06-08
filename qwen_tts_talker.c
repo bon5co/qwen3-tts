@@ -587,6 +587,28 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         }
 
         if (g_actmap_path) actmap_accum(layer, ctx->dec_x, h);  /* per-layer residual (zero cost when off) */
+
+        /* Multi-layer emotion steering: rotate the residual toward the captured
+         * emotion direction at late layers (L21-25 carry emotion identity), but
+         * PRESERVE the residual's L2 norm so we change TONE, not ENERGY. A plain
+         * additive bias every frame drives the autoregressive loop into an
+         * energy-collapse spiral (fades to silence) — norm-preservation fixes that.
+         * Then re-norm the next layer's input so the rotation propagates. */
+        if (ctx->ml_steer && ctx->ml_steer_weight != 0.0f &&
+            layer >= ctx->ml_steer_l0 && layer <= ctx->ml_steer_l1) {
+            const float *sv = ctx->ml_steer + (size_t)layer * ctx->ml_steer_dim;
+            float w = ctx->ml_steer_weight;
+            float n0 = 0.0f, n1 = 0.0f;
+            for (int i = 0; i < h; i++) n0 += ctx->dec_x[i] * ctx->dec_x[i];
+            for (int i = 0; i < h; i++) ctx->dec_x[i] += w * sv[i];
+            for (int i = 0; i < h; i++) n1 += ctx->dec_x[i] * ctx->dec_x[i];
+            if (n1 > 1e-12f) {
+                float s = sqrtf(n0 / n1);            /* restore the pre-steer energy */
+                for (int i = 0; i < h; i++) ctx->dec_x[i] *= s;
+            }
+            if (layer + 1 < c->num_layers)
+                qwen_rms_norm(ctx->dec_x_norm, ctx->dec_x, ctx->layers[layer + 1].input_norm, 1, h, eps);
+        }
     }
 
     /* Final RMSNorm */

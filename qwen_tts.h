@@ -561,6 +561,17 @@ typedef struct qwen_tts_ctx {
     int    cp_steer_dim;     /* length of cp_steer_vec (must equal cp_hidden_size). */
     float  cp_steer_weight;  /* injection scale: cp_x += weight*steer at the Talker→CP point. */
 
+    /* Multi-layer Talker steering (emotion identity lives at late layers, not the
+     * single cp_x point). ml_steer is [num_layers+1][hidden]: after Talker layer L
+     * the residual stream gets dec_x += ml_steer_weight * ml_steer[L]. Layers outside
+     * [ml_steer_l0, ml_steer_l1] are skipped (zero vectors or range gate). Built from
+     * two QWEN_ACT_MAP captures (emotion − neutral); see tests/act_map_steer.py. */
+    float *ml_steer;         /* [(num_layers+1) * hidden] per-layer steer, or NULL. */
+    int    ml_steer_layers;  /* num_layers+1 */
+    int    ml_steer_dim;     /* hidden */
+    float  ml_steer_weight;  /* injection scale */
+    int    ml_steer_l0, ml_steer_l1;  /* inclusive layer range to inject (e.g. 21..25) */
+
     /* Audio output buffer */
     float *audio_buf;
     int audio_samples;

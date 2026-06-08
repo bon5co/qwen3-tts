@@ -295,6 +295,34 @@ static int load_steer_vec_accum(const char *path, float scale, float **acc, int 
     return *acc ? 0 : -1;
 }
 
+/* Load a multi-layer Talker steer (.qlsteer: 'QLST' magic + int32 L + int32 D +
+ * L*D float32) into ctx->ml_steer. L must be num_layers+1, D = hidden. */
+static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, int l0, int l1) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Error: cannot open ml-steer '%s'\n", path); return -1; }
+    uint32_t magic = 0; int32_t L = 0, D = 0;
+    int want_L = ctx->config.num_layers + 1, want_D = ctx->config.hidden_size;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&L, 4, 1, f) != 1 || fread(&D, 4, 1, f) != 1 ||
+        magic != 0x54534C51u /* 'QLST' */ || L != want_L || D != want_D) {
+        fprintf(stderr, "Error: '%s' invalid ml-steer (L=%d D=%d, expected %d x %d)\n",
+                path, L, D, want_L, want_D);
+        fclose(f); return -1;
+    }
+    size_t n = (size_t)L * D;
+    float *buf = (float *)malloc(n * sizeof(float));
+    if (!buf || fread(buf, sizeof(float), n, f) != n) {
+        fprintf(stderr, "Error: failed to read ml-steer '%s'\n", path); free(buf); fclose(f); return -1;
+    }
+    fclose(f);
+    free(ctx->ml_steer);
+    ctx->ml_steer = buf; ctx->ml_steer_layers = L; ctx->ml_steer_dim = D;
+    ctx->ml_steer_weight = weight;
+    ctx->ml_steer_l0 = l0 < 0 ? 0 : l0;
+    ctx->ml_steer_l1 = l1 >= L ? L - 1 : l1;
+    fprintf(stderr, "ML-steer: %s (L%d-%d, weight %.1f)\n", path, ctx->ml_steer_l0, ctx->ml_steer_l1, weight);
+    return 0;
+}
+
 /* Resolve an emotion preset name to its .vec path (first hit wins).
  * Search order, per base dir ($QWEN_EMOTION_DIR, presets/emotions/, voices/emotions/):
  * language-specific sub-palettes FIRST, then the flat dir. For Italian we prefer
@@ -846,6 +874,9 @@ int main(int argc, char **argv) {
     int serve_port = 0;  /* 0 = not serving */
     int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
     int serve_batch = 1;    /* --batch-size: vLLM-style request-batching (server; N>=2 enables) */
+    const char *ml_steer_path = NULL;  /* --ml-steer: multi-layer Talker emotion steer (.qlsteer) */
+    float ml_steer_weight = 8.0f;      /* --ml-weight */
+    int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
@@ -920,6 +951,9 @@ int main(int argc, char **argv) {
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
         {"batch-size",    required_argument, 0, 1043},
+        {"ml-steer",      required_argument, 0, 1044},
+        {"ml-weight",     required_argument, 0, 1045},
+        {"ml-range",      required_argument, 0, 1046},
         {"self-test",     no_argument,       0, 1027},
         {"matmat-bench",  no_argument,       0, 1038},
         {"roughness",     required_argument, 0, 1028},
@@ -976,6 +1010,9 @@ int main(int argc, char **argv) {
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
             case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
+            case 1044: ml_steer_path = optarg; break;
+            case 1045: ml_steer_weight = atof(optarg); break;
+            case 1046: { int a, b; if (sscanf(optarg, "%d-%d", &a, &b) == 2) { ml_l0 = a; ml_l1 = b; } break; }
             case 1027: run_self_test = 1; break;
             case 1038: run_matmat_bench = 1; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
@@ -1194,6 +1231,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
+
+    /* Multi-layer emotion steer (.qlsteer), if requested */
+    if (ml_steer_path) load_ml_steer(ctx, ml_steer_path, ml_steer_weight, ml_l0, ml_l1);
 
     /* Set parameters */
     ctx->temperature = temperature;
