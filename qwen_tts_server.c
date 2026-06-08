@@ -641,6 +641,315 @@ static void print_banner(int port, int n_workers) {
     fprintf(stderr, "Press Ctrl+C to stop.\n\n");
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Continuous/dynamic request-batching server (vLLM-style, opt-in --batch-size N)
+ *
+ * Architecture (distinct from the --workers pool, which runs N independent
+ * single-stream synths re-reading weights N×):
+ *   - ONE scheduler thread OWNS ctx and is the SOLE synthesizer. It pops jobs,
+ *     groups the batchable ones, and steps them together through Talker+CP
+ *     weight-stationary (qwen_tts_generate_batch_multi) — weights read once.
+ *   - A reader pool reads+parses HTTP into jobs (never touches ctx synthesis)
+ *     and hands fd ownership to the scheduler.
+ *   - Opportunistic batching with ZERO added latency: a batch synth takes
+ *     seconds, so concurrent requests pile up in the queue meanwhile; the next
+ *     batch drains all waiting jobs (no linger window needed).
+ *   - Requests the batch engine can't do (instruct / voice_design / streaming)
+ *     run as single jobs on the scheduler thread (still the sole ctx user).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+enum { JOB_BATCH = 0, JOB_SINGLE = 1 };
+
+typedef struct batch_job {
+    int fd;
+    int kind;              /* JOB_BATCH (preset voice, batchable) or JOB_SINGLE */
+    int is_stream;         /* JOB_SINGLE: route to handle_tts_stream */
+    char *text;            /* owned (JOB_BATCH) */
+    char *body;            /* owned (JOB_SINGLE: re-parsed on scheduler ctx) */
+    qwen_batch_req_t req;  /* JOB_BATCH: req.text aliases ->text */
+    struct batch_job *next;
+} batch_job_t;
+
+typedef struct {
+    batch_job_t *head, *tail;
+    int count;
+    pthread_mutex_t mtx;
+    pthread_cond_t not_empty;
+    int shutdown;
+} job_queue_t;
+
+static void jq_init(job_queue_t *q) {
+    q->head = q->tail = NULL; q->count = 0; q->shutdown = 0;
+    pthread_mutex_init(&q->mtx, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+}
+static void jq_push(job_queue_t *q, batch_job_t *j) {
+    j->next = NULL;
+    pthread_mutex_lock(&q->mtx);
+    if (q->tail) q->tail->next = j; else q->head = j;
+    q->tail = j; q->count++;
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+/* Blocking pop. Returns NULL only on shutdown+drained. */
+static batch_job_t *jq_pop(job_queue_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    while (q->count == 0 && !q->shutdown)
+        pthread_cond_wait(&q->not_empty, &q->mtx);
+    if (q->count == 0 && q->shutdown) { pthread_mutex_unlock(&q->mtx); return NULL; }
+    batch_job_t *j = q->head;
+    q->head = j->next; if (!q->head) q->tail = NULL;
+    q->count--;
+    pthread_mutex_unlock(&q->mtx);
+    return j;
+}
+/* Non-blocking pop. Returns NULL if empty. */
+static batch_job_t *jq_trypop(job_queue_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    if (q->count == 0) { pthread_mutex_unlock(&q->mtx); return NULL; }
+    batch_job_t *j = q->head;
+    q->head = j->next; if (!q->head) q->tail = NULL;
+    q->count--;
+    pthread_mutex_unlock(&q->mtx);
+    return j;
+}
+static void jq_shutdown(job_queue_t *q) {
+    pthread_mutex_lock(&q->mtx);
+    q->shutdown = 1;
+    pthread_cond_broadcast(&q->not_empty);
+    pthread_mutex_unlock(&q->mtx);
+}
+static void job_free(batch_job_t *j) {
+    if (!j) return;
+    free(j->text); free(j->body); free(j);
+}
+
+/* Parse a TTS request body into a qwen_batch_req_t WITHOUT mutating ctx (the
+ * scheduler owns ctx; readers must be read-only on it). Resolves speaker/language
+ * names + defaults using ctx config only. *needs_single set when the batch engine
+ * can't serve it (instruct or voice_design → must run single-stream). Returns
+ * malloc'd text or NULL on bad/oversized input. */
+static char *parse_batch_req(qwen_tts_ctx_t *ctx, const char *body,
+                             qwen_batch_req_t *req, int *needs_single) {
+    *needs_single = 0;
+    char *text = json_extract_string(body, "text");
+    if (!text) text = json_extract_string(body, "input");
+    if (!text || text[0] == '\0' || strlen(text) > MAX_TTS_TEXT) { free(text); return NULL; }
+
+    /* defaults (mirror reset_request_state) */
+    if (ctx->voice_clone) { req->speaker_id = ctx->speaker_id; req->language_id = ctx->language_id; }
+    else { req->speaker_id = 3061 /*ryan*/; req->language_id = 2050 /*English*/; }
+    req->temperature = 0.5f; req->top_k = 50; req->top_p = 1.0f; req->rep_penalty = 1.05f;
+    req->greedy_warmup = ctx->greedy_warmup;
+    struct timeval tv; gettimeofday(&tv, NULL);
+    req->seed = (uint32_t)(tv.tv_sec ^ tv.tv_usec);
+
+    char *speaker = json_extract_string(body, "speaker");
+    if (!speaker) speaker = json_extract_string(body, "voice");
+    if (speaker) { int sid = qwen_tts_speaker_id(speaker); if (sid >= 0) req->speaker_id = sid; free(speaker); }
+    char *language = json_extract_string(body, "language");
+    if (language) { int lid = qwen_tts_language_id(language); if (lid >= 0) req->language_id = lid; free(language); }
+
+    req->temperature = clampf((float)json_extract_number(body, "temperature", req->temperature), 0.0f, 2.0f);
+    req->top_k = (int)json_extract_number(body, "top_k", req->top_k);
+    if (req->top_k < 0) req->top_k = 0;
+    if (req->top_k > ctx->config.codec_vocab_size) req->top_k = ctx->config.codec_vocab_size;
+    req->top_p = clampf((float)json_extract_number(body, "top_p", req->top_p), 0.0f, 1.0f);
+    req->rep_penalty = clampf((float)json_extract_number(body, "rep_penalty", req->rep_penalty), 0.5f, 2.0f);
+    int seed = (int)json_extract_number(body, "seed", -1);
+    if (seed >= 0) req->seed = (uint32_t)seed;
+
+    /* instruct / voice_design can't go through the preset-voice batch engine */
+    char *instruct = json_extract_string(body, "instruct");
+    if (instruct && instruct[0]) *needs_single = 1;
+    free(instruct);
+    char *vd = json_extract_string(body, "voice_design");
+    if (vd) { if (strcmp(vd, "true") == 0 || strcmp(vd, "1") == 0) *needs_single = 1; free(vd); }
+
+    req->text = NULL;  /* caller sets to the owned text pointer */
+    return text;
+}
+
+/* Send a finished request's audio as a WAV response. */
+static void respond_wav(int fd, const float *audio, int n_samples) {
+    if (!audio || n_samples <= 0) { send_error(fd, 500, "generation failed"); return; }
+    int wav_size = 0;
+    void *wav = build_wav(audio, n_samples, &wav_size);
+    send_response(fd, 200, "audio/wav", wav, wav_size);
+    free(wav);
+}
+
+/* Reader thread: pop a client fd, read+route. Synthesis is deferred to jobs;
+ * only non-synth endpoints answer inline. */
+typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; } reader_arg_t;
+
+static void *reader_main(void *arg) {
+    reader_arg_t *ra = (reader_arg_t *)arg;
+    for (;;) {
+        int fd = cq_pop(ra->cq);
+        if (fd < 0) break;
+        char *buf = (char *)malloc(1024 * 1024);
+        if (!buf) { close(fd); continue; }
+        int total = read_request(fd, buf, 1024 * 1024);
+        if (total <= 0) { free(buf); close(fd); continue; }
+        char method[16] = {0}, path[256] = {0};
+        sscanf(buf, "%15s %255s", method, path);
+        const char *body = strstr(buf, "\r\n\r\n");
+        body = body ? body + 4 : "";
+
+        if (strcmp(method, "OPTIONS") == 0) {
+            const char *cors = "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\n"
+                "Connection: close\r\n\r\n";
+            write(fd, cors, strlen(cors)); close(fd);
+        } else if (strcmp(path, "/v1/health") == 0 && strcmp(method, "GET") == 0) {
+            handle_health(fd); close(fd);
+        } else if (strcmp(path, "/v1/speakers") == 0 && strcmp(method, "GET") == 0) {
+            handle_speakers(fd); close(fd);
+        } else if (strcmp(method, "POST") == 0 &&
+                   (strcmp(path, "/v1/tts") == 0 || strcmp(path, "/v1/audio/speech") == 0 ||
+                    strcmp(path, "/v1/tts/stream") == 0)) {
+            int is_stream = (strcmp(path, "/v1/tts/stream") == 0);
+            batch_job_t *j = (batch_job_t *)calloc(1, sizeof(batch_job_t));
+            j->fd = fd;
+            int needs_single = 0;
+            char *text = parse_batch_req(ra->ctx, body, &j->req, &needs_single);
+            if (!text) { send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)"); close(fd); free(j); free(buf); continue; }
+            if (is_stream || needs_single) {
+                /* full re-parse on scheduler ctx via the existing single-stream path */
+                j->kind = JOB_SINGLE; j->is_stream = is_stream;
+                j->body = strdup(body); j->text = text;  /* text freed with job */
+            } else {
+                j->kind = JOB_BATCH; j->text = text; j->req.text = j->text;
+            }
+            jq_push(ra->jq, j);
+        } else {
+            send_error(fd, 404, "not found"); close(fd);
+        }
+        free(buf);
+    }
+    return NULL;
+}
+
+/* Scheduler thread: sole ctx synthesizer. Drains jobs, batches the batchable ones. */
+typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int max_batch; } sched_arg_t;
+
+static void *scheduler_main(void *arg) {
+    sched_arg_t *sa = (sched_arg_t *)arg;
+    qwen_tts_ctx_t *ctx = sa->ctx;
+    int MB = sa->max_batch;
+    batch_job_t **batch = (batch_job_t **)malloc((size_t)MB * sizeof(batch_job_t *));
+    qwen_batch_req_t *reqs = (qwen_batch_req_t *)malloc((size_t)MB * sizeof(qwen_batch_req_t));
+    float **outs = (float **)malloc((size_t)MB * sizeof(float *));
+    int *outn = (int *)malloc((size_t)MB * sizeof(int));
+    batch_job_t **singles = (batch_job_t **)malloc((size_t)MB * sizeof(batch_job_t *));
+
+    for (;;) {
+        batch_job_t *first = jq_pop(sa->jq);
+        if (!first) break;   /* shutdown */
+
+        if (first->kind == JOB_SINGLE) {
+            ctx->stream = 0; ctx->audio_cb = NULL;
+            if (first->is_stream) handle_tts_stream(ctx, first->fd, first->body);
+            else handle_tts(ctx, first->fd, first->body);
+            close(first->fd); job_free(first);
+            continue;
+        }
+
+        /* Gather a batch: first + whatever batchable jobs are already queued.
+         * Single jobs encountered while draining are stashed and run after. */
+        int n = 0, ns = 0;
+        batch[n++] = first;
+        while (n < MB) {
+            batch_job_t *j = jq_trypop(sa->jq);
+            if (!j) break;
+            if (j->kind == JOB_SINGLE) { singles[ns++] = j; if (ns >= MB) break; continue; }
+            batch[n++] = j;
+        }
+
+        for (int b = 0; b < n; b++) { reqs[b] = batch[b]->req; outs[b] = NULL; outn[b] = 0; }
+        double t0 = server_time_ms();
+        int rc = qwen_tts_generate_batch_multi(ctx, reqs, n, outs, outn);
+        double elapsed = server_time_ms() - t0;
+
+        long total_audio = 0;
+        for (int b = 0; b < n; b++) {
+            if (rc == 0 && outs[b] && outn[b] > 0) { respond_wav(batch[b]->fd, outs[b], outn[b]); total_audio += outn[b]; }
+            else send_error(batch[b]->fd, 500, "generation failed");
+            close(batch[b]->fd);
+            free(outs[b]);
+            job_free(batch[b]);
+        }
+        if (n > 0) {
+            float secs = (float)total_audio / QWEN_TTS_SAMPLE_RATE;  /* summed across the batch */
+            fprintf(stderr, "[BATCH] %d req in %.1fs (%.2fs audio total, aggregate RTF %.2f)\n",
+                    n, elapsed / 1000.0, secs, secs > 0 ? (elapsed / 1000.0) / secs : 0.0);
+        }
+
+        /* run any stashed single jobs */
+        for (int s = 0; s < ns; s++) {
+            batch_job_t *j = singles[s];
+            ctx->stream = 0; ctx->audio_cb = NULL;
+            if (j->is_stream) handle_tts_stream(ctx, j->fd, j->body);
+            else handle_tts(ctx, j->fd, j->body);
+            close(j->fd); job_free(j);
+        }
+    }
+
+    free(batch); free(reqs); free(outs); free(outn); free(singles);
+    return NULL;
+}
+
+/* Batched server entry: reader pool + single scheduler. max_batch >= 2. */
+int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
+    if (max_batch < 2) max_batch = 2;
+    int server_fd = setup_listen_socket(port);
+    if (server_fd < 0) return -1;
+    install_signal_handlers();
+    ctx->silent = 1;
+
+    int n_readers = max_batch; if (n_readers < 2) n_readers = 2; if (n_readers > 16) n_readers = 16;
+
+    conn_queue_t cq; cq_init(&cq);
+    job_queue_t jq; jq_init(&jq);
+
+    pthread_t *readers = (pthread_t *)calloc(n_readers, sizeof(pthread_t));
+    reader_arg_t *rargs = (reader_arg_t *)calloc(n_readers, sizeof(reader_arg_t));
+    for (int i = 0; i < n_readers; i++) {
+        rargs[i].ctx = ctx; rargs[i].cq = &cq; rargs[i].jq = &jq;
+        pthread_create(&readers[i], NULL, reader_main, &rargs[i]);
+    }
+    pthread_t sched;
+    sched_arg_t sarg = { .ctx = ctx, .jq = &jq, .max_batch = max_batch };
+    pthread_create(&sched, NULL, scheduler_main, &sarg);
+
+    fprintf(stderr, "Server listening on http://0.0.0.0:%d (request-batching: max_batch=%d, %d readers)\n",
+            port, max_batch, n_readers);
+    fprintf(stderr, "Endpoints:\n"
+            "  POST /v1/tts          — generate speech (returns WAV, BATCHED)\n"
+            "  POST /v1/tts/stream   — generate speech (chunked PCM, single)\n"
+            "  POST /v1/audio/speech — OpenAI-compatible TTS (BATCHED)\n"
+            "  GET  /v1/speakers     — list speakers\n"
+            "  GET  /v1/health       — health check\n\n"
+            "Press Ctrl+C to stop.\n\n");
+
+    while (server_running) {
+        struct sockaddr_in client_addr; socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        if (client_fd < 0) { if (errno == EINTR) continue; perror("accept"); continue; }
+        cq_push(&cq, client_fd);
+    }
+
+    close(server_fd);
+    cq_shutdown(&cq);
+    for (int i = 0; i < n_readers; i++) pthread_join(readers[i], NULL);
+    jq_shutdown(&jq);
+    pthread_join(sched, NULL);
+    free(readers); free(rargs);
+    fprintf(stderr, "\nServer stopped.\n");
+    return 0;
+}
+
 int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers) {
     if (n_workers < 1) n_workers = 1;
     int server_fd = setup_listen_socket(port);

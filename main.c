@@ -845,6 +845,7 @@ int main(int argc, char **argv) {
     int stream_chunk = 10;
     int serve_port = 0;  /* 0 = not serving */
     int serve_workers = 1;  /* --workers: concurrent synthesis workers (server mode) */
+    int serve_batch = 1;    /* --batch-size: vLLM-style request-batching (server; N>=2 enables) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
@@ -918,6 +919,7 @@ int main(int argc, char **argv) {
         {"target-cv",     required_argument, 0, 1024},
         {"caps",          no_argument,       0, 1025},
         {"workers",       required_argument, 0, 1026},
+        {"batch-size",    required_argument, 0, 1043},
         {"self-test",     no_argument,       0, 1027},
         {"matmat-bench",  no_argument,       0, 1038},
         {"roughness",     required_argument, 0, 1028},
@@ -973,6 +975,7 @@ int main(int argc, char **argv) {
             case 1024: target_cv_dir = optarg; break;
             case 1025: show_caps = 1; break;
             case 1026: serve_workers = atoi(optarg); break;
+            case 1043: serve_batch = atoi(optarg); if (serve_batch < 1) serve_batch = 1; break;
             case 1027: run_self_test = 1; break;
             case 1038: run_matmat_bench = 1; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
@@ -1015,6 +1018,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --stream-chunk <n>         Frames per stream chunk (default: 10)\n");
                 fprintf(stderr, "  --serve <port>             Start HTTP server on port\n");
                 fprintf(stderr, "  --workers <n>              Concurrent synthesis workers (server; default 1)\n");
+                fprintf(stderr, "  --batch-size <n>           Request-batching: step up to n concurrent users together (server; n>=2)\n");
                 fprintf(stderr, "  --seed <n>                 Random seed (default: time-based)\n");
                 fprintf(stderr, "  --max-duration <secs>      Max audio duration in seconds\n");
                 fprintf(stderr, "  --voice-design             VoiceDesign mode (create voice from --instruct)\n");
@@ -2285,7 +2289,11 @@ int main(int argc, char **argv) {
 
     /* Server mode: start HTTP server and block */
     if (serve_port > 0) {
-        int ret = qwen_tts_serve_ex(ctx, serve_port, serve_workers);
+        int ret;
+        if (serve_batch >= 2)
+            ret = qwen_tts_serve_batched(ctx, serve_port, serve_batch);  /* vLLM-style request batching */
+        else
+            ret = qwen_tts_serve_ex(ctx, serve_port, serve_workers);
         qwen_tts_unload(ctx);
         return ret;
     }

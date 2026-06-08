@@ -16,4 +16,13 @@ int qwen_tts_serve(qwen_tts_ctx_t *ctx, int port);
  * parallelism only on the GCD backend. */
 int qwen_tts_serve_ex(qwen_tts_ctx_t *ctx, int port, int n_workers);
 
+/* vLLM-style request-batching server (opt-in --batch-size N, N>=2). A single
+ * scheduler thread owns ctx and steps up to N concurrent users' requests together
+ * through Talker+CP weight-stationary (qwen_tts_generate_batch_multi); a reader
+ * pool parses HTTP into jobs. Throughput lever for many concurrent users —
+ * distinct from --workers (N independent single-stream synths). Preset voices +
+ * sampling params per request; instruct/voice_design/stream fall back to single
+ * jobs on the scheduler. */
+int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch);
+
 #endif /* QWEN_TTS_SERVER_H */
