@@ -756,6 +756,20 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (force sequential ref). **NEXT: (1) int8-SDOT batched twin (qwen_matmat_int8 integer-dot, the matmat-bench TODO) →
 >   makes int8+batch win on M1 too; (2) batched CP lm_head still bf16 in the FORWARD-feed path? no — fixed; (3) Promessi-
 >   Sposi A/B (have the tooling); (4) optional auto-activate --batch on long text; (5) validate batching on x86 (Ryzen/Turin).**
+> - **TODO (later, this branch) — `--batch` × {server, streaming} interaction.** Does enabling batching in
+>   `--serve` / `--stream` help or hurt? Specifically: (a) TTFA — batching prefills ALL chunks before generating →
+>   does first-audio latency get WORSE vs single-stream chunk-1-first? (b) throughput — does a `--serve` worker that
+>   batches concurrent requests improve req/s? (c) is `--batch` even COMPATIBLE with `--stream` today (the orchestrator
+>   decodes per-chunk post-hoc, not via the streaming decoder thread → likely NOT streaming-compatible yet — confirm +
+>   decide if batched-streaming is worth wiring). Measure RTF/TTFA single vs batched in both modes (use bench_matrix.sh
+>   `--full`). Likely outcome: batching is a THROUGHPUT lever (long-form/server), streaming is a LATENCY lever — they may
+>   not compose; document the recommended mode per use-case.
+> - **TODO (later, this branch) — `--batch` × `.qvoice` (cloned/custom voices).** Verify batched long-form works with a
+>   loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's prefill correctly apply the voice
+>   prefix in the batched orchestrator (qwen_tts_generate prefill_only path)? Check fidelity (ear + mel-corr vs sequential
+>   `.qvoice`) and RTF, across bf16/int8. Risk: the per-chunk cold-prefill (prev_prefill_len=0) must re-apply the voice
+>   prefix each time — confirm it does, no voice drift across chunks. `make`-style A/B: silvio_17b.qvoice on 1.7B + a 0.6B
+>   qvoice, single vs --batch.
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on

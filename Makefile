@@ -381,6 +381,14 @@ matmat-bench: $(TARGET)
 	@echo "=== (single thread = compute-bound reference) ==="
 	@./$(TARGET) --matmat-bench -j 1
 
+# Full per-box SIMD-check + RTF matrix (docs/hardware-testing.md). Copy onto any
+# rented ARM/x86 box. `make bench-matrix` = caps+self-test+matmat-bench+single/batch
+# RTF; `make bench-matrix-full` adds streaming + server. Quiet machine only.
+bench-matrix: $(TARGET)
+	@bash tests/bench_matrix.sh $(MODEL_SMALL)
+bench-matrix-full: $(TARGET)
+	@bash tests/bench_matrix.sh $(MODEL_SMALL) --full
+
 test-compose: $(TARGET)
 	@echo "=== Inline markup / --compose smoke test ==="
 	@mkdir -p $(TEST_DIR)

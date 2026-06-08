@@ -183,3 +183,37 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
   f32-accum) is the open optimization that would also tip int8+batch positive on M1.
 
 Keep this file updated as boxes are tested — paste `--caps` output + the RTF matrix row per box.
+
+---
+
+## 7. Per-ISA optimization roadmap (the "flows" — fill in on real hardware)
+
+All the batched-matmul levers plug into the **same three twin families** in `qwen_tts_kernels.c`,
+which are already split into compile-time-B fixed kernels (a clean home — the ISA branch goes
+*inside* each `*_matmat_b<BV>` body, guarded by the feature macro, with the current scalar/NEON path
+as the `#else`):
+
+- bf16: `bf16_matmat_b1..b8,b16`
+- int8: `int8_matmat_b2..b16`
+- int4: `q4_matmat_b2..b16`
+
+Each newer-ISA path is **guarded by its feature macro** so M1 keeps compiling the scalar path
+untouched; `make check-isa` (below) cross-compiles the guarded paths so syntax is verified *now*,
+on M1, before any hardware exists. Build it, measure with `make matmat-bench` / `bench-matrix` on
+the target, keep the scalar `#else` as the always-correct fallback + the `--self-test` oracle.
+
+| # | ISA / instruction | where (function) | what it does | restructuring | expected lever | validate on |
+|---|---|---|---|---|---|---|
+| 1 | **ARM bf16 BFMMLA** `vbfmmlaq_f32` | `bf16_matmat_b*` | 2×4·4×2 bf16→2×2 f32 tile in one op — kills the scalar bf16 decode (M1's bottleneck) | tile 2 rows × 2 B-cols; pack weight+X as bf16 2×4 | **large** (removes decode) | M2/M3/M4, Graviton3+ |
+| 2 | **ARM i8mm SMMLA** `vmmlaq_s32` | `int8_matmat_b*` | 2×8·8×2 int8→2×2 int32 — native int8 matmul | quantize X per-column to int8; same 2×2 tile | **large** for int8+batch | M2+, Graviton3+ |
+| 3 | **ARM SME/SME2** (ZA tiles) | new `*_matmat_sme` | outer-product matrix engine — whole GEMM in tiles | streaming mode; tile config; biggest rewrite | **largest, research** | M4/M5, (no server ARM yet) |
+| 4 | **x86 AVX-512-VNNI** `_mm512_dpbusd_epi32` | `int8_matmat_b*` | int8 dot accumulate (already used in `int8_matvec_vnni`) | per-column int8 X; 16-wide B tiles | **large** for int8+batch | Zen4/5, Ice Lake+ |
+| 5 | **x86 AVX-512-BF16** `_mm512_dpbf16_ps` | `bf16_matmat_b*` | fuse bf16 decode+FMA | 16-wide; bf16-pack X | medium (bf16 stays compute-bound on AVX-512) | Zen4/5, Cooper Lake+ |
+| 6 | **Intel AMX** TMUL tiles | new `*_matmat_amx` | dedicated int8/bf16 matrix unit — strongest x86 GEMM | tile config (TILECFG), 16×64 int8 tiles, load/TMUL/store | **largest x86** | Sapphire Rapids+ |
+| 7 | **int8-SDOT/int-accum twin** (M1-testable) | `int8_matmat_b*` | integer-accumulate (int8 W × int8 X → int32) instead of f32-accum | quantize X per-column to int8 | tips int8+batch positive (the matmat-bench TODO) | **M1 now**, all |
+
+**Sequencing.** #7 is the only one fully implementable+measurable on M1 today (uses NEON int / SDOT,
+no new ISA) — do it first if int8+batch break-even on M1 bugs us. #1–#2 (ARM bf16/i8mm) want an M2+
+(a Mac mini M4 covers both + SME). #4 (VNNI) wants Zen4/5. #6 (AMX) wants Sapphire. Each is a localized
+fill-in once the box is in hand; the dispatch skeleton + `make check-isa` keep them compile-clean
+meanwhile. Always re-run `--self-test` (the cross-ISA correctness oracle) + ear/mel-corr after.
