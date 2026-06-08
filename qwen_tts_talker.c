@@ -19,6 +19,57 @@
 
 /* aligned_malloc/aligned_calloc now in qwen_tts_kernels.h */
 
+/* ── Activation-map capture (QWEN_ACT_MAP=path) ──────────────────────────────
+ * Read-only diagnostic for the emotion/instruct representation analysis: over a
+ * whole generation, accumulate the MEAN of the Talker residual stream after EACH
+ * layer (plus the final-norm hidden) — a [num_layers+1 × hidden] fingerprint of
+ * where, layer by layer, an instruct/emotion shifts the activations. Contrast two
+ * runs (neutral-instruct vs emotion-instruct) with tests/act_map_diff.py. Off
+ * unless QWEN_ACT_MAP is set; zero cost otherwise. */
+static const char *g_actmap_path   = NULL;
+static double    **g_actmap_acc    = NULL;   /* [num_layers+1][hidden] */
+static int         g_actmap_layers = 0;      /* num_layers + 1 (final hidden) */
+static int         g_actmap_dim    = 0;
+static long        g_actmap_frames = 0;
+static int         g_actmap_probed = 0;
+
+static void actmap_dump(void) {
+    if (!g_actmap_path || g_actmap_frames <= 0 || !g_actmap_acc) return;
+    FILE *f = fopen(g_actmap_path, "wb");
+    if (!f) return;
+    uint32_t magic = 0x504D4151;             /* 'QAMP' */
+    int32_t L = g_actmap_layers, D = g_actmap_dim;
+    fwrite(&magic, 4, 1, f); fwrite(&L, 4, 1, f); fwrite(&D, 4, 1, f);
+    for (int l = 0; l < g_actmap_layers; l++)
+        for (int i = 0; i < g_actmap_dim; i++) {
+            float v = (float)(g_actmap_acc[l][i] / (double)g_actmap_frames);
+            fwrite(&v, 4, 1, f);
+        }
+    fclose(f);
+    fprintf(stderr, "  [QWEN_ACT_MAP] wrote %d layers x %d dim (%ld frames) -> %s\n",
+            g_actmap_layers, g_actmap_dim, g_actmap_frames, g_actmap_path);
+}
+
+static void actmap_init(int num_layers, int h) {
+    if (g_actmap_probed) return;
+    g_actmap_probed = 1;
+    const char *p = getenv("QWEN_ACT_MAP");
+    if (!p || !*p) return;
+    g_actmap_path   = p;
+    g_actmap_layers = num_layers + 1;        /* +1 = final-norm hidden */
+    g_actmap_dim    = h;
+    g_actmap_acc    = (double **)calloc(g_actmap_layers, sizeof(double *));
+    if (!g_actmap_acc) { g_actmap_path = NULL; return; }
+    for (int l = 0; l < g_actmap_layers; l++) g_actmap_acc[l] = (double *)calloc(h, sizeof(double));
+    atexit(actmap_dump);
+}
+
+static inline void actmap_accum(int layer, const float *x, int h) {
+    if (!g_actmap_path || !g_actmap_acc) return;
+    double *a = g_actmap_acc[layer];
+    for (int i = 0; i < h; i++) a[i] += (double)x[i];
+}
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -444,6 +495,8 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
 
     if (kv_cache_grow(ctx, pos + 1) != 0) return -1;
 
+    actmap_init(c->num_layers, h);   /* QWEN_ACT_MAP: one-time probe (no-op if unset) */
+
     memcpy(ctx->dec_x, embed, h * sizeof(float));
 
     for (int layer = 0; layer < c->num_layers; layer++) {
@@ -532,10 +585,14 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
         } else {
             for (int i = 0; i < h; i++) ctx->dec_x[i] += ctx->dec_proj_out[i];
         }
+
+        if (g_actmap_path) actmap_accum(layer, ctx->dec_x, h);  /* per-layer residual (zero cost when off) */
     }
 
     /* Final RMSNorm */
     qwen_rms_norm(hidden_out, ctx->dec_x, ctx->talker_norm, 1, h, eps);
+
+    if (g_actmap_path) { actmap_accum(c->num_layers, hidden_out, h); g_actmap_frames++; }
 
     ctx->kv_len = pos + 1;
     return 0;
