@@ -177,6 +177,9 @@ Works with `--instruct`, streaming, and the HTTP server.
 # Start server
 ./qwen_tts -d qwen3-tts-0.6b --serve 8080
 
+# Serve many users at once — step their requests together (vLLM-style request batching)
+./qwen_tts -d qwen3-tts-0.6b --serve 8080 --batch-size 4
+
 # Generate speech
 curl -s http://localhost:8080/v1/tts \
   -d '{"text":"Hello, how are you?"}' -o output.wav
@@ -249,12 +252,25 @@ Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B drops 
 ~0.8–0.9**, **1.7B 2.66 → 1.79 (−33%)**, no perceptible quality loss, and it works with `.qvoice`
 voices ([details](docs/quantization.md)). 1.7B: bf16 ~2.0–4.1, `--int8` ~1.8–2.4 on longer text.
 
-Run benchmarks on your machine:
+### 📊 Benchmark *your* CPU
+
+Want to know how this runs on **your** machine (Apple Silicon, AMD/Intel x86, ARM server)? The repo
+ships a one-command per-box report — no setup beyond the model:
 
 ```bash
-make bench         # Quick: short+long, normal+stream (both models)
-make bench-full    # Full: + server, instruct, INT8, .qvoice (if available)
+make bench              # quick RTF: short+long, normal+stream (both models)
+make bench-full         # + server, instruct, INT8, .qvoice
+
+# Per-CPU report (copy onto any rented ARM/x86 box):
+./qwen_tts --caps       # what SIMD your CPU actually has (NEON/SDOT/bf16/i8mm/SVE • AVX2/AVX-512/VNNI/AMX)
+./qwen_tts --self-test  # are the kernels numerically correct on this ISA?
+make bench-matrix       # caps + self-test + RTF matrix (single vs batch × bf16/int8/int4)
+make bench-matrix-full  # + streaming + server + request-batching throughput
+make bench-server       # concurrent-request throughput alone (N users vs single-stream, per precision)
 ```
+
+The full cross-hardware workflow (which boxes have which SIMD, where to rent, what to measure) lives in
+[docs/hardware-testing.md](docs/hardware-testing.md).
 
 **Cross-device CPU (single-stream 0.6B, this repo's best config — reproduce with `bash tests/x86_bench.sh`):**
 
@@ -270,6 +286,14 @@ that fits the working set (Apple's SLC, an X3D chip's V-cache). On x86 the int8+
 is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.04 → VNNI-int8 `-j1`
 1.64); threading scales on bare metal but a multi-CCD VM limits it. Many-core servers are best for
 **throughput** (concurrent requests), not single-stream latency. Check yours: `./qwen_tts --caps`.
+
+**Concurrent serving — request batching (`--serve --batch-size N`).** For *N users at once*, the server
+can step their requests **together** through the model (vLLM-style): weights are read from memory **once**
+and reused across all in-flight requests, instead of re-read per user. A continuous scheduler keeps the
+batch full (a finished request's slot is refilled immediately) and **streaming composes** — each user
+still gets their own progressive audio stream. This trades a little per-request latency for much higher
+total throughput on bandwidth-bound boxes. Measure it on your CPU with `make bench-server`; details in
+[docs/server-batching.md](docs/server-batching.md).
 
 **vs other implementations:**
 
@@ -292,12 +316,14 @@ is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.0
 | [Voice Cloning](docs/voice-cloning.md) | Reference audio tips, ECAPA-TDNN internals, model comparison, samples |
 | [Custom Voices](docs/custom-voices.md) | `.qvoice` format, delta vs standard, managing profiles, troubleshooting |
 | [HTTP Server](docs/server.md) | All endpoints, request body, streaming, server performance |
+| [Server request-batching](docs/server-batching.md) | vLLM-style `--batch-size N`: serve N concurrent users together, continuous batching, per-request streaming |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Expressivity](docs/expressivity.md) | `--emotion` compound moods + presets, mood blending, `--roughness`, `--rate`/`--volume`, building your own control vectors |
 | [Inline markup](docs/markup.md) | Audiobook/podcast tags in `--text`: `[sad]`/`[excited]` mid-text emotion switches, `[sigh]`/`[huff]` fillers, `[pause:400ms]` |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
 | [Performance](docs/performance.md) | RTF benchmarks, component breakdown, CPU vs GPU, optimization history |
 | [x86 optimization](docs/x86-optimization.md) | AVX2 / AVX-512 / VNNI findings, why it's memory-bound, how to benchmark your CPU |
+| [Hardware testing / benchmark your CPU](docs/hardware-testing.md) | One-command per-box report (`make bench-matrix`), which CPU has which SIMD, where to rent ARM/x86, the RTF + throughput matrix to fill in |
 | [Building](docs/building.md) | All platforms, build targets, testing (golden-reference test needs Python + `librosa`) |
 
 ### Blog Posts

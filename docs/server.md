@@ -4,6 +4,11 @@ The built-in HTTP server loads the model once at startup and keeps weights in me
 across requests. The tokenizer is cached after the first call, so subsequent requests
 skip all loading overhead and go straight to inference.
 
+> **Serving many users at once?** Add `--batch-size N` to step concurrent requests
+> **together** through the model (vLLM-style request batching: weights read once,
+> continuous scheduling, per-request streaming). See
+> [server-batching.md](server-batching.md). This page covers the single-request server.
+
 ## Starting the Server
 
 ```bash
