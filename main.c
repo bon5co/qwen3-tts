@@ -711,13 +711,34 @@ static int run_batch(qwen_tts_ctx_t *ctx, const char *text, int target_words, in
             fprintf(stderr, "  [chunk %d, %d words] %s\n", i, qwen_word_count(chunks[i], (int)strlen(chunks[i])), chunks[i]);
     }
     if (dry) { for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks); return 0; }
+
+    /* Milestone B: batched compute (chunks stepped together, weights reused). Falls
+     * back to Milestone A (sequential render_spans) if the model can't use the bf16
+     * batched path or only one chunk. */
+    int rc;
+    if (nc >= 2) {
+        float *audio = NULL; int n = 0;
+        rc = qwen_tts_generate_batch(ctx, chunks, nc, chunk_pause, &audio, &n);
+        if (rc == 0 && audio && n > 0) {
+            rc = qwen_tts_write_wav(output, audio, n, QWEN_TTS_SAMPLE_RATE);
+            if (rc == 0 && !silent)
+                fprintf(stderr, "Wrote %s (%d samples, %.2fs) [batched %d chunks]\n", output, n, (double)n / QWEN_TTS_SAMPLE_RATE, nc);
+            free(audio);
+            for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks);
+            return rc;
+        }
+        free(audio);
+        if (!silent) fprintf(stderr, "--batch: batched path unavailable (rc=%d), falling back to sequential\n", rc);
+    }
+
+    /* Milestone A fallback: sequential synth + concat via render_spans. */
     cspan_t *spans = (cspan_t *)calloc((size_t)nc, sizeof(cspan_t));
     if (!spans) { for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks); return -1; }
     for (int i = 0; i < nc; i++) {
         spans[i].is_pause = 0; spans[i].mood[0] = 0; spans[i].text = chunks[i];
         spans[i].steer_weight = -1.0f; spans[i].rate = 0.0f; spans[i].volume = 0.0f;
     }
-    int rc = render_spans(ctx, spans, nc, language, chunk_pause, output, silent);
+    rc = render_spans(ctx, spans, nc, language, chunk_pause, output, silent);
     free(spans);
     for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks);
     return rc;

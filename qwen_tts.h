@@ -467,6 +467,13 @@ typedef struct qwen_tts_ctx {
     int kv_max;
     int kv_len;
 
+    /* --batch orchestration: prefill_only=1 makes qwen_tts_generate stop right after
+     * prefill (KV populated, dec_x = last position), so the batched orchestrator can
+     * capture each chunk's KV + seed hidden. bg_text_content_len stashes the text
+     * token count (for the per-chunk EOS-boost heuristic). Not used on the normal path. */
+    int prefill_only;
+    int bg_text_content_len;
+
     /* KV cache (Code Predictor) — stored as bf16 */
     uint16_t *cp_kv_k;
     uint16_t *cp_kv_v;
@@ -625,6 +632,13 @@ void qwen_tts_set_audio_callback(qwen_tts_ctx_t *ctx, qwen_tts_audio_cb cb, void
 /* Generate speech from text */
 int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
                       float **out_samples, int *out_n_samples);
+
+/* Batched long-form generation: step `nc` independent chunks through Talker+CP
+ * together (weight-stationary), decode per chunk, concatenate (chunk_pause seconds
+ * of silence between chunks). Returns -2 if the model can't use the bf16 batched
+ * path (caller falls back to sequential). Used by --batch (Milestone B). */
+int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
+                            float chunk_pause, float **out_samples, int *out_n_samples);
 
 /* Write WAV file */
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);

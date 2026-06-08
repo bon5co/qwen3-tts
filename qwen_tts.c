@@ -9,6 +9,7 @@
 #include "qwen_tts_safetensors.h"
 #include "qwen_tts_tokenizer.h"
 #include "qwen_tts_audio.h"
+#include "qwen_tts_batch.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1305,6 +1306,14 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         fprintf(stderr, "[CORR] post-prefill: pre_conv_w[0]=%.6f\n", ctx->speech_dec.pre_conv_weight[0]);
     }
 
+    /* --batch prefill-only: KV is populated and ctx->dec_x holds the last prefill
+     * position's pre-norm hidden. The orchestrator captures both; stop here (no
+     * generation/decode). Additive: prefill_only is 0 on the normal path. */
+    if (ctx->prefill_only) {
+        ctx->bg_text_content_len = text_content_len;
+        return 0;
+    }
+
     /* Get hidden state from last prefill position (apply final norm) */
     float *last_hidden = (float *)malloc(h * sizeof(float));
     qwen_rms_norm(last_hidden, ctx->dec_x, ctx->talker_norm, 1, h, ctx->config.rms_norm_eps);
@@ -1602,5 +1611,195 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     ttfa_ms, dt_state.chunk_frames);
     }
 
+    return 0;
+}
+
+/* ============================================================================
+ * BATCHED long-form generation (Milestone B).
+ *
+ * Synthesizes `nc` independent text chunks by stepping them through the Talker
+ * + Code Predictor TOGETHER (weight-stationary batched matmat → the weights are
+ * read once and reused across all chunks in flight), instead of one-after-another.
+ * Each chunk keeps its own KV / position / sampling state (ragged: prompts prefill
+ * to different lengths, chunks hit EOS at different frames). Audio is decoded per
+ * chunk (seam-free, same as Milestone A) and concatenated.
+ *
+ * Strategy: process chunks in groups of <= GMAX. Per group: (1) prefill each chunk
+ * via the normal single-stream path (prefill_only) and capture its KV + seed hidden;
+ * (2) batched ragged generation with per-chunk sampling/EOS; (3) decode + concat.
+ *
+ * v1 = bf16 batched step kernels (returns -2 if the model has no bf16 weights — the
+ * caller falls back to sequential). int8/int4 batched-step twins come next; until
+ * then a quantized model still works here via its mmap-resident bf16 weights.
+ * The output is a "valid alternative kernel" (fp-order differs like int8) → validate
+ * by ear/mel-corr, not bit-match. Returns 0 on success. */
+int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
+                            float chunk_pause, float **out_samples, int *out_n_samples) {
+    if (nc <= 0) { *out_samples = NULL; *out_n_samples = 0; return 0; }
+    if (ctx->layers[0].wq_bf16 == NULL) return -2;   /* bf16 batched step only (v1) */
+    int h = ctx->config.hidden_size;
+    int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
+    int num_layers = ctx->config.num_layers;
+    int vocab = ctx->config.codec_vocab_size;
+    int cb = ctx->config.codebook_size;
+    float eps = ctx->config.rms_norm_eps;
+    const int GMAX = 8;
+    int GEN_CAP = ctx->max_tokens; if (GEN_CAP > 600) GEN_CAP = 600; if (GEN_CAP < 32) GEN_CAP = 32;
+    const int SR = QWEN_TTS_SAMPLE_RATE;
+
+    float *out = NULL; size_t out_n = 0, out_cap = 0;
+    #define BG_APPEND(src, cnt) do {                                           \
+        size_t _c = (cnt);                                                     \
+        if (out_n + _c > out_cap) { out_cap = (out_n + _c) * 2 + 4096;         \
+            float *_t = (float *)realloc(out, out_cap * sizeof(float));        \
+            if (!_t) { free(out); return -1; } out = _t; }                     \
+        if (src) memcpy(out + out_n, (src), _c * sizeof(float));               \
+        else memset(out + out_n, 0, _c * sizeof(float));                       \
+        out_n += _c;                                                           \
+    } while (0)
+
+    qwen_set_seed(ctx->seed);
+
+    for (int g0 = 0; g0 < nc; g0 += GMAX) {
+        int B = nc - g0 < GMAX ? nc - g0 : GMAX;
+
+        /* ---- Phase 1: prefill each chunk, capture KV + seed hidden + lengths ---- */
+        int *prompt_len = (int *)calloc(B, sizeof(int));
+        int *tcl = (int *)calloc(B, sizeof(int));
+        float *seed_hidden = (float *)malloc((size_t)B * h * sizeof(float));
+        uint16_t **tk = (uint16_t **)calloc(B, sizeof(uint16_t *));
+        uint16_t **tv = (uint16_t **)calloc(B, sizeof(uint16_t *));
+        int maxpl = 0, ok = 1;
+        ctx->prefill_only = 1;
+        for (int b = 0; b < B && ok; b++) {
+            ctx->prev_prefill_len = 0;   /* cold prefill (no cross-chunk KV reuse) */
+            if (qwen_tts_generate(ctx, chunks[g0 + b], NULL, NULL) != 0) { ok = 0; break; }
+            int pl = ctx->kv_len; prompt_len[b] = pl; tcl[b] = ctx->bg_text_content_len;
+            qwen_rms_norm(seed_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
+            size_t bytes = (size_t)num_layers * pl * kvd * sizeof(uint16_t);
+            tk[b] = (uint16_t *)malloc(bytes); tv[b] = (uint16_t *)malloc(bytes);
+            if (!tk[b] || !tv[b]) { ok = 0; break; }
+            for (int L = 0; L < num_layers; L++) {
+                memcpy(tk[b] + (size_t)L * pl * kvd,
+                       ctx->kv_cache_k + (size_t)L * ctx->kv_max * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+                memcpy(tv[b] + (size_t)L * pl * kvd,
+                       ctx->kv_cache_v + (size_t)L * ctx->kv_max * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+            }
+            if (pl > maxpl) maxpl = pl;
+        }
+        ctx->prefill_only = 0;
+        if (!ok) {
+            for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
+            return -1;
+        }
+
+        int kv_max = maxpl + GEN_CAP + 4;
+        qwen_batch_t *bb = qwen_batch_alloc(ctx, B, kv_max);
+        /* Diagnostic: force the batched proj to do B matvecs (bit-exact to single-
+         * stream) instead of the fp-reordering matmat — isolates wiring bugs from the
+         * benign matmat trajectory fork. QWEN_BATCH_FORCE_MATVEC=1. */
+        if (bb && getenv("QWEN_BATCH_FORCE_MATVEC")) bb->force_matvec = 1;
+        if (!bb) {
+            for (int b = 0; b < B; b++) { free(tk[b]); free(tv[b]); }
+            free(tk); free(tv); free(prompt_len); free(tcl); free(seed_hidden); free(out);
+            return -1;
+        }
+        for (int b = 0; b < B; b++) {
+            int pl = prompt_len[b];
+            for (int L = 0; L < num_layers; L++) {
+                size_t dst = ((size_t)b * num_layers + L) * kv_max * kvd;
+                memcpy(bb->kv_k + dst, tk[b] + (size_t)L * pl * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+                memcpy(bb->kv_v + dst, tv[b] + (size_t)L * pl * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+            }
+            free(tk[b]); free(tv[b]);
+        }
+        free(tk); free(tv);
+
+        /* ---- Phase 2: batched ragged generation ---- */
+        int *pos = (int *)malloc((size_t)B * sizeof(int));
+        uint8_t *active = (uint8_t *)malloc((size_t)B);
+        int *nprev = (int *)calloc(B, sizeof(int));
+        int *chframes = (int *)calloc(B, sizeof(int));
+        int **prev_tok = (int **)malloc((size_t)B * sizeof(int *));
+        int **chcodes = (int **)malloc((size_t)B * sizeof(int *));
+        float *last_hidden = (float *)malloc((size_t)B * h * sizeof(float));
+        float *logits = (float *)malloc((size_t)vocab * sizeof(float));
+        float *step_embed = (float *)malloc((size_t)B * h * sizeof(float));
+        int *code0 = (int *)malloc((size_t)B * sizeof(int));
+        int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
+        for (int b = 0; b < B; b++) {
+            pos[b] = prompt_len[b]; active[b] = 1;
+            prev_tok[b] = (int *)malloc((size_t)GEN_CAP * sizeof(int));
+            chcodes[b] = (int *)malloc((size_t)GEN_CAP * 16 * sizeof(int));
+        }
+        memcpy(last_hidden, seed_hidden, (size_t)B * h * sizeof(float));
+        const float *tts_pad = ctx->cached_tts_pad_embed;
+        int n_active = B;
+
+        for (int frame = 0; frame < GEN_CAP && n_active > 0; frame++) {
+            /* 1. per-chunk codec head + sample code0 */
+            for (int b = 0; b < B; b++) {
+                if (!active[b]) { code0[b] = 0; continue; }
+                matvec_bf16(logits, ctx->codec_head_bf16, last_hidden + (size_t)b * h, vocab, h);
+                for (int t = 0; t < vocab; t++) { if (logits[t] > 100.0f) logits[t] = 100.0f; if (logits[t] < -100.0f) logits[t] = -100.0f; }
+                for (int t = 2048; t < vocab; t++) if (t != QWEN_TTS_CODEC_EOS) logits[t] = -1e30f;
+                if (frame < 2) logits[QWEN_TTS_CODEC_EOS] = -1e30f;
+                int ef = tcl[b] * 3, bs = ef * 2;
+                if (ef > 0 && frame > bs) { float bo = 0.5f * (frame - bs); if (bo > 10.0f) bo = 10.0f; logits[QWEN_TTS_CODEC_EOS] += bo; }
+                float ft = ctx->temperature; int ftk = ctx->top_k;
+                if (ctx->greedy_warmup > 0 && frame < ctx->greedy_warmup) { ft = 0.0f; ftk = 1; }
+                int c0 = qwen_tts_sample(logits, vocab, ft, ftk, ctx->top_p, ctx->rep_penalty, prev_tok[b], nprev[b]);
+                if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP) { active[b] = 0; n_active--; code0[b] = 0; continue; }
+                code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
+            }
+            if (n_active == 0) break;
+
+            /* 2. batched Code Predictor (lockstep; inactive use code0=0, ignored) */
+            qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes);
+
+            /* 3. per-chunk: record frame + build next-step embedding */
+            for (int b = 0; b < B; b++) {
+                float *se = step_embed + (size_t)b * h;
+                if (!active[b]) { memset(se, 0, (size_t)h * sizeof(float)); continue; }
+                int frame16[16]; frame16[0] = code0[b];
+                for (int g = 0; g < 15; g++) frame16[g + 1] = cpcodes[(size_t)b * 15 + g];
+                memcpy(chcodes[b] + (size_t)chframes[b] * 16, frame16, 16 * sizeof(int));
+                chframes[b]++;
+                lookup_codec_embed(ctx, code0[b], se);
+                for (int g = 0; g < 15; g++) {
+                    int cg = frame16[g + 1];
+                    if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
+                        qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
+                }
+                for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+            }
+
+            /* 4. batched ragged Talker step -> next last_hidden */
+            if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) break;
+
+            /* 5. advance each active chunk's position */
+            for (int b = 0; b < B; b++) if (active[b]) pos[b]++;
+        }
+
+        /* ---- Phase 3: decode each chunk (seam-free full decode) + concat ---- */
+        for (int b = 0; b < B; b++) {
+            if (chframes[b] <= 0) continue;
+            if ((g0 + b) > 0 && out_n > 0 && chunk_pause > 0) BG_APPEND(NULL, (size_t)(chunk_pause * SR));
+            float *aud = NULL; int an = 0;
+            if (qwen_speech_decoder_decode(ctx, chcodes[b], chframes[b], &aud, &an) == 0 && aud && an > 0)
+                BG_APPEND(aud, (size_t)an);
+            free(aud);
+        }
+
+        for (int b = 0; b < B; b++) { free(prev_tok[b]); free(chcodes[b]); }
+        free(pos); free(active); free(nprev); free(chframes); free(prev_tok); free(chcodes);
+        free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
+        free(prompt_len); free(tcl); free(seed_hidden);
+        qwen_batch_free(bb);
+    }
+
+    #undef BG_APPEND
+    *out_samples = out; *out_n_samples = (int)out_n;
     return 0;
 }
