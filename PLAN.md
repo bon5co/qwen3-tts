@@ -733,6 +733,18 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   unchanged); (2) prefill each chunk's prompt into bb's per-seq KV; (3) per-stream sampling (own RNG/rep-penalty per
 >   chunk) + ragged EOS (drop finished chunks, compact batch); (4) feed sampled codes through batched CP + per-chunk
 >   decoder → concat. Pair `--batch` with int4 (the M1 lever). THEN the Promessi-Sposi single-vs-batched timing test.
+> - **`--batch` MILESTONE B DONE (2026-06-08): batched compute wired in = the speedup.** B1 (commit after a6210d3):
+>   `qwen_batch_talker_step_ragged` — per-seq positions (`pos_arr[b]`) + `active[b]` (NULL=lockstep, back-compat). B3:
+>   `qwen_tts_generate_batch` (qwen_tts.c) — groups of ≤8 chunks; per group prefill each via the normal path (new gated
+>   `ctx->prefill_only` early-return captures KV+seed hidden), then ragged batched gen (per-stream sample/EOS + batched
+>   CP), then seam-free per-chunk decode + concat. `--batch` calls it for nc≥2, falls back to sequential on -2/error.
+>   **WIRING PROVEN: `QWEN_BATCH_FORCE_MATVEC=1` (bit-exact proj) → mel_corr 1.00000 vs single-stream.** Real matmat =
+>   valid alternative kernel (greedy fp-order trajectory fork, like int8; mel_corr ~0.68 vs single at temp0 — validate by
+>   EAR). **M1 measured (0.6B bf16 temp0): 3-chunk paragraph 29.3s→19.4s, RTF 1.30→0.74 (sub-realtime); grows with chunk
+>   count.** Additive (prefill_only gated; normal/compose/self-test unchanged). **NEXT: (1) int8/int4 in the batched step
+>   (B2) — the model's mmap-resident bf16 weights make it work today but WITHOUT quant speed; wire qwen_matmat_int8/q4_0
+>   into batch_proj using quantized weight fields → int4 is the M1 lever; (2) optional auto-activate `--batch` on long
+>   text; (3) Promessi-Sposi single-vs-batched A/B across bf16/int8/int4.**
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
