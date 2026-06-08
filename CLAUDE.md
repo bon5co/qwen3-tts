@@ -149,6 +149,35 @@ lookahead. Not implemented in phase 1.
 - If you optimize one path, verify no regression on others.
 - Favor meaningful speedups; avoid complexity for tiny wins.
 
+## Cross-Hardware Performance Workflow (perf / SIMD / batching epics)
+
+Dev box is **Apple M1** (the user's only fast-iteration device). M1 covers NEON + dotprod/SDOT
+but **not** bf16/i8mm (M2+), SVE (server ARM), or AVX-512/VNNI/BF16/AMX (x86). So for any
+performance/new-SIMD epic, the loop is:
+
+1. **Develop on M1** here (fast iteration). Newer-ISA kernels are `#ifdef`-guarded so M1 keeps
+   compiling the scalar/NEON fallback.
+2. **Keep it compile-clean for other ISAs without leaving M1:** `make check-isa` forces the
+   `-march` for the guarded BFMMLA/SMMLA/SME (ARM) and VNNI/BF16/AMX (x86) paths so syntax errors
+   surface NOW, not on the rented box.
+3. **Validate on real hardware** (we cannot fully test these on M1): rent/borrow the target, run
+   the one-command harness, read the numbers, **fix, loop**. This is expected — perf/SIMD epics
+   are *not* done until measured on real silicon.
+
+**The testing/benchmark make targets** (document any new one here + in `docs/hardware-testing.md`):
+- `make bench-matrix` / `make bench-matrix-full` — full per-box report: `--caps` + `--self-test`
+  (native + scalar fallback) + `--matmat-bench` + RTF matrix (single/batch[/stream/server] ×
+  bf16/int8/int4). Copy onto any rented ARM/x86 box. Quiet machine only.
+- `make matmat-bench` — batched matmat twins (`qwen_matmat_{bf16,int8,q4_0}`) vs B×matvec, per
+  precision/threads (no model needed).
+- `make check-isa` — compile-check the newer-ISA kernel paths (above).
+- `./qwen_tts --caps` — runtime SIMD-extension detection ("does it fire?"): ARM dotprod/bf16/i8mm/
+  SVE/SME, x86 AVX-512/VNNI/BF16/AMX. `./qwen_tts --self-test` — cross-ISA kernel correctness oracle.
+- Reference: **`docs/hardware-testing.md`** (which box, where to rent, the §7 per-ISA optimization
+  roadmap, the fill-in RTF matrix). Keep it updated as boxes are tested.
+
+Use **RTF + mel-corr** (not wall-clock, not md5) to compare across ISAs — fp-order differs benignly.
+
 ## Git Workflow
 
 **New features MUST be developed on feature branches, NOT on main.**

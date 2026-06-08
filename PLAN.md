@@ -756,20 +756,33 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (force sequential ref). **NEXT: (1) int8-SDOT batched twin (qwen_matmat_int8 integer-dot, the matmat-bench TODO) →
 >   makes int8+batch win on M1 too; (2) batched CP lm_head still bf16 in the FORWARD-feed path? no — fixed; (3) Promessi-
 >   Sposi A/B (have the tooling); (4) optional auto-activate --batch on long text; (5) validate batching on x86 (Ryzen/Turin).**
-> - **TODO (later, this branch) — `--batch` × {server, streaming} interaction.** Does enabling batching in
->   `--serve` / `--stream` help or hurt? Specifically: (a) TTFA — batching prefills ALL chunks before generating →
->   does first-audio latency get WORSE vs single-stream chunk-1-first? (b) throughput — does a `--serve` worker that
->   batches concurrent requests improve req/s? (c) is `--batch` even COMPATIBLE with `--stream` today (the orchestrator
->   decodes per-chunk post-hoc, not via the streaming decoder thread → likely NOT streaming-compatible yet — confirm +
->   decide if batched-streaming is worth wiring). Measure RTF/TTFA single vs batched in both modes (use bench_matrix.sh
->   `--full`). Likely outcome: batching is a THROUGHPUT lever (long-form/server), streaming is a LATENCY lever — they may
->   not compose; document the recommended mode per use-case.
-> - **TODO (later, this branch) — `--batch` × `.qvoice` (cloned/custom voices).** Verify batched long-form works with a
->   loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's prefill correctly apply the voice
->   prefix in the batched orchestrator (qwen_tts_generate prefill_only path)? Check fidelity (ear + mel-corr vs sequential
->   `.qvoice`) and RTF, across bf16/int8. Risk: the per-chunk cold-prefill (prev_prefill_len=0) must re-apply the voice
->   prefix each time — confirm it does, no voice drift across chunks. `make`-style A/B: silvio_17b.qvoice on 1.7B + a 0.6B
->   qvoice, single vs --batch.
+> - **TODO (later, this branch) — `--batch` × {server, streaming} interaction. EMPIRICAL STATUS CHECKED 2026-06-08:**
+>   `--batch` + `--serve` → the server **ignores --batch** (serve runs its own serial single-stream request loop; batching
+>   of CONCURRENT requests is NOT implemented). `--batch` + `--stream` → if the text splits to 1 chunk it falls back to
+>   sequential (which DOES stream); if 2+ chunks the batched orchestrator decodes per-chunk **post-hoc** (not via the
+>   streaming decoder thread) → **streaming is silently ignored, whole WAV written at end**. So today they DON'T compose.
+>   Open questions to decide: (a) TTFA — batching prefills ALL chunks before generating → first-audio worse vs single-
+>   stream chunk-1-first (measure); (b) is batched-streaming worth wiring (emit chunk-0's audio as soon as it EOSes while
+>   the rest keep stepping)? (c) server-side request batching = the real throughput play for `--serve` (separate, bigger
+>   feature). Likely doc outcome: **batching = throughput/long-form lever; streaming = latency lever — pick per use-case.**
+>   Test via `bench_matrix.sh --full` (today it benches single-stream server/streaming; extend to batched once wired).
+> - **TODO (later, this branch) — `--batch` × `.qvoice` + EMOTION mixing (user's "2 tests in 1", 2026-06-08).** Verify
+>   batched long-form works with a loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's
+>   cold-prefill (prev_prefill_len=0) correctly RE-APPLY the voice prefix in the batched orchestrator every time (no voice
+>   drift across chunks)? Check fidelity (ear + mel-corr vs sequential `.qvoice`) + RTF, bf16/int8. **AND** test combining
+>   `--batch` with `--emotion`/`--roughness` (the expressivity steering) — does the control-vector/steer apply per chunk
+>   in the batched path, and can we mix emotions cleanly across a long text? (the batched step reuses the same Talker/CP;
+>   steering is applied where? confirm it flows through). A/B: silvio_17b.qvoice on 1.7B + a 0.6B qvoice, single vs --batch,
+>   plain + with emotion. 2-in-1: qvoice-correctness AND emotion-in-batch.
+> - **TODO (perf epic) — REAL-HARDWARE validation campaign (needs rented/borrowed boxes; see docs/hardware-testing.md).**
+>   The cross-CPU/SIMD optimizations (BFMMLA/SMMLA/SME on ARM, VNNI/BF16/AMX on x86) can only be validated off-M1. Run
+>   `make bench-matrix` + `--caps` on each and paste results into docs/hardware-testing.md §5. Target boxes, in order of
+>   access: (1) **user's Ryzen 6800H mini-PC** (Zen3, AVX2 — already on LAN, `tests/x86_bench.sh`); (2) **AMD server VPS**
+>   (Scaleway EPYC Genoa/Turin = AVX-512+VNNI+BF16 — user has used Scaleway 9555P before); (3) **Mac mini M4** (rent/buy —
+>   bf16+i8mm+SME, the biggest untested ARM lever); (4) **a powerful ARM with max SIMD we support** (AWS Graviton3/4 =
+>   bf16+i8mm+SVE, or NVIDIA Grace = SVE2). For each: caps fires? self-test PASS (native+fallback)? RTF single/batch/
+>   stream/server × bf16/int8/int4? Then fill in the §7 newer-ISA twin and re-measure. This is the standing perf loop:
+>   **M1 dev → check-isa → rent → bench-matrix → fix → loop.**
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
