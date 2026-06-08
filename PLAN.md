@@ -745,6 +745,17 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (B2) — the model's mmap-resident bf16 weights make it work today but WITHOUT quant speed; wire qwen_matmat_int8/q4_0
 >   into batch_proj using quantized weight fields → int4 is the M1 lever; (2) optional auto-activate `--batch` on long
 >   text; (3) Promessi-Sposi single-vs-batched A/B across bf16/int8/int4.**
+> - **`--batch` B2 DONE (2026-06-08): int8/int4 inside the batched step.** `qwen_batch_proj_q` (precision-aware batched
+>   proj, dispatches q4>int8>bf16 via the matmat twins) wired into all Talker+CP projections; `cp_lm_argmax` fixes the
+>   batched CP lm_head (was bf16-hardcoded → forked the trajectory in quant mode — the one real bug, found via
+>   force_matvec). **WIRING PROVEN per precision: batched force_matvec == sequential split = mel_corr 1.00000 for bf16 AND
+>   int8 AND int4.** self-test + golden (0.6B/1.7B, bf16+int8) still 1.0. **M1 clean isolated (0.6B, 7-sentence ~36s
+>   audio, temp0): bf16 single 53.5s→batched 30.7s (RTF 1.48→0.78, 1.74× — the big win); int8 single 28.6s→batched 29.3s
+>   (RTF 0.89→0.82, ~break-even — int8-single already SDOT-fast/sub-realtime, little headroom + the int8 twin is f32-accum
+>   not SDOT); int4 slower on M1 (x86 lever).** Diagnostics: QWEN_BATCH_FORCE_MATVEC=1 (bit-exact proj), QWEN_BATCH_SEQ=1
+>   (force sequential ref). **NEXT: (1) int8-SDOT batched twin (qwen_matmat_int8 integer-dot, the matmat-bench TODO) →
+>   makes int8+batch win on M1 too; (2) batched CP lm_head still bf16 in the FORWARD-feed path? no — fixed; (3) Promessi-
+>   Sposi A/B (have the tooling); (4) optional auto-activate --batch on long text; (5) validate batching on x86 (Ryzen/Turin).**
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
