@@ -1043,10 +1043,92 @@ static void int8_mm_task(size_t tid, size_t nt, void *vc) {
     int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
     int8_matmat_slice(c->Y, c->W, c->scale, c->X, r0, r1, c->cols, c->B);
 }
+
+#if defined(__ARM_FEATURE_DOTPROD)
+/* ── int8 SDOT batched twin (#3) — weight-stationary native int8 dot ──────────
+ * Y[rows,B] = (W_int8 @ qXt^T) · scales. Activations are pre-quantized per column
+ * to int8 (qXt[b][cols], scale sx[b]); each weight 16-block is loaded ONCE and
+ * SDOT-dotted against all B activation blocks. Amortizes the weight read (bandwidth)
+ * AND keeps SDOT (compute) — unlike int8_matmat_slice, which dequants to f32 and
+ * loses SDOT, so int8+batch was SLOWER than int8-single on M1 (long-form A/B 0.81×). */
+static void int8_matmat_sdot_slice(float *Y, const int8_t *W, const float *scale,
+                                   const int8_t *qXt, const float *sx,
+                                   int r0, int r1, int cols, int B) {
+    qwen_ftz_on();
+    for (int r = r0; r < r1; r++) {
+        const int8_t *w = W + (size_t)r * cols;
+        int32x4_t acc[16];
+        for (int b = 0; b < B; b++) acc[b] = vdupq_n_s32(0);
+        int k = 0;
+        for (; k + 15 < cols; k += 16) {
+            int8x16_t wv = vld1q_s8(w + k);              /* weight block: loaded once */
+            for (int b = 0; b < B; b++)
+                acc[b] = vdotq_s32(acc[b], wv, vld1q_s8(qXt + (size_t)b * cols + k));
+        }
+        float s = scale[r];
+        for (int b = 0; b < B; b++) {
+            int32_t sum = vaddvq_s32(acc[b]);
+            const int8_t *qb = qXt + (size_t)b * cols;
+            for (int kk = k; kk < cols; kk++) sum += (int32_t)w[kk] * qb[kk];
+            Y[(size_t)r * B + b] = (float)sum * s * sx[b];
+        }
+    }
+}
+typedef struct { float *Y; const int8_t *W; const float *scale; const int8_t *qXt; const float *sx; int rows, cols, B; } int8_smm_ctx;
+static void int8_smm_task(size_t tid, size_t nt, void *vc) {
+    int8_smm_ctx *c = (int8_smm_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    int8_matmat_sdot_slice(c->Y, c->W, c->scale, c->qXt, c->sx, r0, r1, c->cols, c->B);
+}
+#endif /* __ARM_FEATURE_DOTPROD */
+
 void qwen_matmat_int8(float *Y, const int8_t *W, const float *scale,
                       const float *X, int rows, int cols, int B) {
     if (B <= 0) return;
     if (B > 64) B = 64;
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* SDOT batched path (#3) — OPT-IN (QWEN_INT8_SDOT_MM=1), default OFF.
+     * MEASURED slower on M1 than the f32-accum batched twin below: SDOT contracts
+     * over the reduction dim k, but batching wants to parallelize over B, so this
+     * does B sequential vdotq per weight block (B not vectorized) and loses to the
+     * f32-accum path that vectorizes over B. Kept as a bit-exact A/B reference (it
+     * equals B×int8-matvec-SDOT, self-test L2=0) for M2+/x86, where the RIGHT int8
+     * matrix-matrix primitive is i8mm SMMLA / AVX-512 VNNI (true int8 GEMM), not a
+     * looped SDOT. On M1, int8+batch doesn't win (SDOT-seq is already near-optimal);
+     * batching pays on bf16. See PLAN batching #3 finding. */
+    {
+        static int sdot_mm = -1;
+        if (sdot_mm < 0) { const char *e = getenv("QWEN_INT8_SDOT_MM"); sdot_mm = (e && e[0] == '1'); }
+        if (sdot_mm && B >= 2 && B <= 16) {
+            int8_t *qXt = (int8_t *)malloc((size_t)B * cols);
+            if (qXt) {
+                float sx[16];
+                for (int b = 0; b < B; b++) {
+                    float amax = 0.0f;
+                    for (int k = 0; k < cols; k++) { float a = fabsf(X[(size_t)k * B + b]); if (a > amax) amax = a; }
+                    int8_t *qb = qXt + (size_t)b * cols;
+                    if (amax == 0.0f) { memset(qb, 0, (size_t)cols); sx[b] = 0.0f; continue; }
+                    float inv = 127.0f / amax;
+                    for (int k = 0; k < cols; k++) {
+                        int v = (int)lrintf(X[(size_t)k * B + b] * inv);
+                        qb[k] = (int8_t)(v > 127 ? 127 : (v < -128 ? -128 : v));
+                    }
+                    sx[b] = amax / 127.0f;
+                }
+                int nt = g_n_threads;
+                if (nt > 1 && rows >= 256) {
+                    int8_smm_ctx c = { Y, W, scale, qXt, sx, rows, cols, B };
+                    qwen_parallel((size_t)nt, int8_smm_task, &c);
+                } else {
+                    int8_matmat_sdot_slice(Y, W, scale, qXt, sx, 0, rows, cols, B);
+                }
+                free(qXt);
+                return;
+            }
+        }
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         int8_mm_ctx c = { Y, W, scale, X, rows, cols, B };

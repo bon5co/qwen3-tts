@@ -786,6 +786,22 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   (force sequential ref). **NEXT: (1) int8-SDOT batched twin (qwen_matmat_int8 integer-dot, the matmat-bench TODO) →
 >   makes int8+batch win on M1 too; (2) batched CP lm_head still bf16 in the FORWARD-feed path? no — fixed; (3) Promessi-
 >   Sposi A/B (have the tooling); (4) optional auto-activate --batch on long text; (5) validate batching on x86 (Ryzen/Turin).**
+> - **★ BATCHING #2/#4/#3 DONE + MEASURED (2026-06-08, feat/server-batching, M1 0.6B):**
+>   - **#2 `--batch` × `.qvoice` (galatea_06b IT) + emotion**: batched-vs-sequential force_matvec **mel 1.00000** → cloned
+>     voice FAITHFUL across chunks (WDELTA/KV prefix re-applied per chunk), NO batching bug. `--emotion` flows through the
+>     batched path. BUT emotion-on-`.qvoice` renders WEAKLY even in SINGLE (preset ryan neu-vs-happy mel 0.45 strong; galatea
+>     qvoice 0.81 weak; --steer-weight 3.5 → 0.61 but distorts). NOT a batch bug → separate expressivity task (re-calibrate
+>     emotion vecs on qvoice hidden dist / inject differently; the strong WDELTA voice prefix overpowers the steer).
+>   - **#4 Promessi Sposi single-vs-batch (6 chunks)**: **bf16 batch 1.19× faster wall** (RTF 1.36→1.06, audiobook lever
+>     works); **int8 batch 0.81× SLOWER** (RTF 1.00→1.22) — int8-single SDOT-seq is already near-optimal.
+>   - **#3 int8-SDOT batched twin — DONE, MEASURED, conclusion: DEAD-END on M1.** Built `int8_matmat_sdot_slice`
+>     (weight-stationary, bit-exact: self-test L2=0 vs B×int8-matvec-SDOT). matmat-bench: SDOT-batched 0.40-0.60ms LOSES to
+>     f32-accum-batched 0.33-0.44ms AND to SDOT-seq 0.23-0.46ms. Reason: SDOT contracts over reduction-dim k, batching wants
+>     to parallelize over B → B sequential vdotq per weight block, B not vectorized. **Gated OPT-IN `QWEN_INT8_SDOT_MM=1`,
+>     default stays f32-accum (no regression).** VERDICT: int8+batch on M1 is break-even (SDOT-seq already near-optimal,
+>     int8 weights already halve bandwidth); **batching pays on bf16, not int8, on M1**. The real int8+batch win = **i8mm
+>     SMMLA (M2+) / AVX-512 VNNI (x86)** true int8 GEMM → write those guarded twins on rented hardware (§7 roadmap +
+>     real-HW campaign). The f32-accum batched int8 reading weights ONCE across B should still pay on bandwidth-bound x86.
 > - **TODO (later, this branch) — `--batch` × {server, streaming} interaction. EMPIRICAL STATUS CHECKED 2026-06-08:**
 >   `--batch` + `--serve` → the server **ignores --batch** (serve runs its own serial single-stream request loop; batching
 >   of CONCURRENT requests is NOT implemented). `--batch` + `--stream` → if the text splits to 1 chunk it falls back to
