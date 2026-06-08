@@ -714,9 +714,10 @@ static int run_batch(qwen_tts_ctx_t *ctx, const char *text, int target_words, in
 
     /* Milestone B: batched compute (chunks stepped together, weights reused). Falls
      * back to Milestone A (sequential render_spans) if the model can't use the bf16
-     * batched path or only one chunk. */
+     * batched path or only one chunk. QWEN_BATCH_SEQ=1 forces the sequential path
+     * (diagnostic: the per-chunk bit-exact reference for the batched output). */
     int rc;
-    if (nc >= 2) {
+    if (nc >= 2 && !getenv("QWEN_BATCH_SEQ")) {
         float *audio = NULL; int n = 0;
         rc = qwen_tts_generate_batch(ctx, chunks, nc, chunk_pause, &audio, &n);
         if (rc == 0 && audio && n > 0) {

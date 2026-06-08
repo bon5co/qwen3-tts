@@ -886,6 +886,17 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
  * path (steering IS supported). Mirrors cp_layer_body / cp_transformer_step.
  * ======================================================================== */
 
+/* Precision-aware CP lm_head argmax (B2): mirror the single-stream dispatch
+ * (q4 > int8 > bf16) so the batched codes match the quantized single-stream path
+ * — a bf16 lm_head in int8/int4 mode forks the trajectory (CP codes feed back). */
+static int cp_lm_argmax(qwen_tts_ctx_t *ctx, const float *normed, int g, int ch, int vocab) {
+    if (ctx->cp_lm_head_q4[g])
+        return qwen_argmax_matvec_q4_0(normed, ctx->cp_lm_head_q4[g], ch, vocab);
+    if (ctx->cp_lm_head_int8[g])
+        return qwen_argmax_matvec_int8(normed, ctx->cp_lm_head_int8[g], ctx->cp_lm_head_scale[g], ch, vocab);
+    return qwen_argmax_matvec_bf16(normed, ctx->cp_lm_head_bf16[g], ch, vocab);
+}
+
 static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                            float *x, float *x_norm, int pos, int layer) {
     qwen_tts_config_t *c = &ctx->config;
@@ -894,10 +905,10 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     int fm = bb->force_matvec;
     qwen_cp_layer_t *l = &ctx->cp_layers[layer];
 
-    /* x_norm = RMSNorm(x) already on entry. QKV (batched) */
-    qwen_batch_proj(bb->cp_q, l->wq_bf16, x_norm, cqd,  ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
-    qwen_batch_proj(bb->cp_k, l->wk_bf16, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
-    qwen_batch_proj(bb->cp_v, l->wv_bf16, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+    /* x_norm = RMSNorm(x) already on entry. QKV (batched, precision-aware) */
+    qwen_batch_proj_q(bb->cp_q, l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4, x_norm, cqd,  ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+    qwen_batch_proj_q(bb->cp_k, l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+    qwen_batch_proj_q(bb->cp_v, l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4, x_norm, ckvd, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++) {
         qwen_rms_norm_per_head(bb->cp_q + (size_t)b * cqd,  l->q_norm, 1, c->cp_num_heads,    c->cp_head_dim, eps);
         qwen_rms_norm_per_head(bb->cp_k + (size_t)b * ckvd, l->k_norm, 1, c->cp_num_kv_heads, c->cp_head_dim, eps);
@@ -911,17 +922,19 @@ static void batch_cp_layer(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                      bb->cp_kv_k + lbase, bb->cp_kv_v + lbase, 1, pos + 1,
                                      c->cp_num_heads, c->cp_num_kv_heads, c->cp_head_dim, ascale, pos);
     }
-    /* O projection (batched) + residual + post-attn norm */
-    qwen_batch_proj(bb->cp_proj, l->wo_bf16, bb->cp_attn, ch, cqd, cqd, B, fm, bb->cp_Xt, bb->cp_Yt);
+    /* O projection (batched, precision-aware) + residual + post-attn norm */
+    qwen_batch_proj_q(bb->cp_proj, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->cp_attn, ch, cqd, cqd, B, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++)
         qwen_rms_norm_residual(x_norm + (size_t)b * ch, x + (size_t)b * ch,
                                bb->cp_proj + (size_t)b * ch, l->post_attn_norm, ch, eps);
-    /* gate+up (batched) + SwiGLU per frame */
-    qwen_batch_proj(bb->cp_gate, l->gate_up_fused_bf16, x_norm, 2 * cint, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
+    /* gate+up (batched, precision-aware) + SwiGLU per frame */
+    qwen_batch_proj_q(bb->cp_gate, l->gate_up_fused_bf16, l->gate_up_fused_int8, l->gate_up_fused_scale,
+                      l->gate_up_fused_q4, x_norm, 2 * cint, ch, ch, B, fm, bb->cp_Xt, bb->cp_Yt);
     for (int b = 0; b < B; b++)
         qwen_swiglu_inplace(bb->cp_gate + (size_t)b * 2 * cint, bb->cp_swiglu_tmp, cint);
-    /* down (batched) */
-    qwen_batch_proj(bb->cp_proj, l->down_bf16, bb->cp_gate, ch, cint, 2 * cint, B, fm, bb->cp_Xt, bb->cp_Yt);
+    /* down (batched, precision-aware) */
+    qwen_batch_proj_q(bb->cp_proj, l->down_bf16, l->down_int8, l->down_scale, l->down_q4,
+                      bb->cp_gate, ch, cint, 2 * cint, B, fm, bb->cp_Xt, bb->cp_Yt);
     /* residual (+ next layer input norm, or plain add on last layer) */
     if (layer + 1 < c->cp_num_layers) {
         for (int b = 0; b < B; b++)
@@ -976,7 +989,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
     /* codebook 0 per frame (greedy argmax) */
     for (int b = 0; b < B; b++) {
         qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-        out_codes[(size_t)b * 15 + 0] = qwen_argmax_matvec_bf16(normed, ctx->cp_lm_head_bf16[0], ch, c->codebook_size);
+        out_codes[(size_t)b * 15 + 0] = cp_lm_argmax(ctx, normed, 0, ch, c->codebook_size);
     }
 
     /* codebooks 1-14 */
@@ -992,7 +1005,7 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         batch_cp_transformer_step(ctx, bb, cx, cxn, pos);
         for (int b = 0; b < B; b++) {
             qwen_rms_norm(normed, cx + (size_t)b * ch, ctx->cp_norm, 1, ch, c->rms_norm_eps);
-            out_codes[(size_t)b * 15 + g] = qwen_argmax_matvec_bf16(normed, ctx->cp_lm_head_bf16[g], ch, c->codebook_size);
+            out_codes[(size_t)b * 15 + g] = cp_lm_argmax(ctx, normed, g, ch, c->codebook_size);
         }
     }
     return 0;

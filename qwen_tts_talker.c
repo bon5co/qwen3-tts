@@ -845,6 +845,42 @@ static void batch_proj(qwen_batch_t *bb, float *dst, const uint16_t *W,
     qwen_batch_proj(dst, W, src, rows, cols, srcstride, bb->B, bb->force_matvec, bb->Xt, bb->Yt);
 }
 
+/* Precision-aware batched projection (B2): picks the kernel by which weight set is
+ * present, mirroring the single-stream dispatch — q4 (Wq) > int8 (Wi+Wscale) > bf16
+ * (Wb). The batched int8/int4 twins (qwen_matmat_int8/q4_0) read the weight ONCE for
+ * all B chunks; int4 amortizes the nibble unpack (the M1 lever). force_matvec /
+ * QWEN_BATCH_NOMATMUL falls back to B per-column matvecs (bit-exact diagnostic),
+ * still precision-correct. Shared by the batched Talker AND Code Predictor. */
+void qwen_batch_proj_q(float *dst,
+                       const uint16_t *Wb, const int8_t *Wi, const float *Wscale,
+                       const q4_0_block_t *Wq,
+                       const float *src, int rows, int cols, int srcstride,
+                       int B, int force_matvec, float *Xt, float *Yt) {
+    if (g_batch_nomatmul < 0) g_batch_nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
+    if (force_matvec || g_batch_nomatmul) {
+        for (int b = 0; b < B; b++) {
+            const float *s = src + (size_t)b * srcstride; float *d = dst + (size_t)b * rows;
+            if (Wq)      qwen_matvec_q4_0(d, Wq, s, rows, cols);
+            else if (Wi) qwen_matvec_int8(d, Wi, Wscale, s, rows, cols);
+            else         qwen_matvec_bf16(d, Wb, s, rows, cols);
+        }
+    } else {
+        batch_gather(Xt, src, B, cols, srcstride);
+        if (Wq)      qwen_matmat_q4_0(Yt, Wq, Xt, rows, cols, B);
+        else if (Wi) qwen_matmat_int8(Yt, Wi, Wscale, Xt, rows, cols, B);
+        else         qwen_matmat_bf16(Yt, Wb, Xt, rows, cols, B);
+        batch_scatter(dst, Yt, B, rows);
+    }
+}
+/* bb-scratch wrapper for the Talker step. */
+static void batch_proj_q(qwen_batch_t *bb, float *dst,
+                         const uint16_t *Wb, const int8_t *Wi, const float *Wscale,
+                         const q4_0_block_t *Wq,
+                         const float *src, int rows, int cols, int srcstride) {
+    qwen_batch_proj_q(dst, Wb, Wi, Wscale, Wq, src, rows, cols, srcstride,
+                      bb->B, bb->force_matvec, bb->Xt, bb->Yt);
+}
+
 qwen_batch_t *qwen_batch_alloc(qwen_tts_ctx_t *ctx, int B, int kv_max) {
     qwen_tts_config_t *c = &ctx->config;
     if (B < 1 || B > 64 || kv_max < 1) return NULL;
@@ -929,10 +965,10 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
         /* 1. input RMSNorm (per sequence) */
         for (int b = 0; b < B; b++)
             qwen_rms_norm(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h, l->input_norm, 1, h, eps);
-        /* 2. QKV (batched) */
-        batch_proj(bb, bb->q, l->wq_bf16, bb->x_norm, qd,  h, h);
-        batch_proj(bb, bb->k, l->wk_bf16, bb->x_norm, kvd, h, h);
-        batch_proj(bb, bb->v, l->wv_bf16, bb->x_norm, kvd, h, h);
+        /* 2. QKV (batched, precision-aware) */
+        batch_proj_q(bb, bb->q, l->wq_bf16, l->wq_int8, l->wq_scale, l->wq_q4, bb->x_norm, qd,  h, h);
+        batch_proj_q(bb, bb->k, l->wk_bf16, l->wk_int8, l->wk_scale, l->wk_q4, bb->x_norm, kvd, h, h);
+        batch_proj_q(bb, bb->v, l->wv_bf16, l->wv_int8, l->wv_scale, l->wv_q4, bb->x_norm, kvd, h, h);
         /* 3-5. per-head norm, RoPE, append KV — per sequence (at its own position) */
         for (int b = 0; b < B; b++) {
             if (!ACTIVE_B(b)) continue;
@@ -954,18 +990,20 @@ static int batch_talker_step_impl(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                          bb->kv_k + lbase, bb->kv_v + lbase, 1, pos + 1,
                                          c->num_heads, c->num_kv_heads, c->head_dim, scale, pos);
         }
-        /* 7. O projection (batched) */
-        batch_proj(bb, bb->proj_out, l->wo_bf16, bb->attn_out, h, qd, qd);
+        /* 7. O projection (batched, precision-aware) */
+        batch_proj_q(bb, bb->proj_out, l->wo_bf16, l->wo_int8, l->wo_scale, l->wo_q4, bb->attn_out, h, qd, qd);
         /* 8. residual + post-attn RMSNorm (per seq; x += proj_out in place) */
         for (int b = 0; b < B; b++)
             qwen_rms_norm_residual(bb->x_norm + (size_t)b * h, bb->x + (size_t)b * h,
                                    bb->proj_out + (size_t)b * h, l->post_attn_norm, h, eps);
-        /* 9. gate+up (batched) + SwiGLU per seq */
-        batch_proj(bb, bb->gate, l->gate_up_fused_bf16, bb->x_norm, 2 * inter, h, h);
+        /* 9. gate+up (batched, precision-aware) + SwiGLU per seq */
+        batch_proj_q(bb, bb->gate, l->gate_up_fused_bf16, l->gate_up_fused_int8, l->gate_up_fused_scale,
+                          l->gate_up_fused_q4, bb->x_norm, 2 * inter, h, h);
         for (int b = 0; b < B; b++)
             qwen_swiglu_inplace(bb->gate + (size_t)b * 2 * inter, bb->swiglu_tmp, inter);
-        /* 10. down (batched) — swiglu output is the first `inter` of each 2*inter row */
-        batch_proj(bb, bb->proj_out, l->down_bf16, bb->gate, h, inter, 2 * inter);
+        /* 10. down (batched, precision-aware) — swiglu output is first `inter` of each 2*inter row */
+        batch_proj_q(bb, bb->proj_out, l->down_bf16, l->down_int8, l->down_scale, l->down_q4,
+                          bb->gate, h, inter, 2 * inter);
         /* 11. residual (+ next layer's input norm, or plain add on the last layer) */
         if (layer + 1 < c->num_layers) {
             for (int b = 0; b < B; b++)

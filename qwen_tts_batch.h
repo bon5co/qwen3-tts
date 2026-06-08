@@ -39,6 +39,15 @@ void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
                      int rows, int cols, int srcstride, int B, int force_matvec,
                      float *Xt, float *Yt);
 
+/* Precision-aware batched projection (B2): dispatches q4 (Wq) > int8 (Wi+Wscale) >
+ * bf16 (Wb) by which weight set is non-NULL, using the batched matmat twins (weights
+ * read once across B). Uses bb's own scratch/width. Shared by batched Talker + CP. */
+void qwen_batch_proj_q(float *dst,
+                       const uint16_t *Wb, const int8_t *Wi, const float *Wscale,
+                       const q4_0_block_t *Wq,
+                       const float *src, int rows, int cols, int srcstride,
+                       int B, int force_matvec, float *Xt, float *Yt);
+
 /* Single-stream Code Predictor (defined in qwen_tts_code_predictor.c) — declared here
  * so the batched self-test can use it as the reference. */
 int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *out_codes);
