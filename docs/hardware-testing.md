@@ -21,10 +21,22 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 | `./qwen_tts --self-test` | cross-ISA kernel correctness oracle (bf16/int8/int4 matmul + matmat twins vs f32 ref). Run twice: native, then `QWEN_NO_SDOT=1 QWEN_NO_VNNI=1` for the fallback |
 | `make matmat-bench` | batched matmat twins (`qwen_matmat_{bf16,int8,q4_0}`) vs B×matvec, per precision/threads (no model) |
 | `make bench-matrix` | **the per-box report**: caps + self-test (native+fallback) + matmat-bench + RTF matrix single/batch × bf16/int8/int4 |
-| `make bench-matrix-full` | same + streaming + server modes |
+| `make bench-matrix-full` | same + streaming + **server request-batching throughput** |
+| `make bench-server` | **server request-batching THROUGHPUT** alone (M concurrent clients vs single-stream, per precision) — the vLLM-style lever |
+| `make test-serve-all` | server **correctness** gate (incl. batching: per-request mel 1.0, continuous admission, streaming compose) |
 | `make check-isa` | compile-check the newer-ISA kernel paths (BFMMLA/SMMLA/SME ; VNNI/BF16/AMX) on the dev box, before the hardware exists |
 
-`tests/bench_matrix.sh <model_dir> [--full]` is the underlying script — copy it onto any rented box.
+Scripts (copy onto any rented box): `tests/bench_matrix.sh <model> [--full]`,
+`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`.
+
+### The 2-command rented-box workflow
+
+```bash
+make blas && ./qwen_tts --caps && ./qwen_tts --self-test   # build + does-it-fire + correct?
+make bench-matrix-full                                       # ALL numbers: RTF single/batch/stream + server-batching throughput
+```
+Optionally `make test-serve-all` once for the server correctness gate. Paste the
+`bench-matrix-full` block + `--caps` into §5 below. Quiet machine only.
 
 ---
 
@@ -161,9 +173,29 @@ for i in 1 2 3; do timeout 60 curl -s localhost:8000/v1/tts \
   -d "{\"text\":\"$TXT\",\"seed\":$SEED,\"speaker\":\"$V\",\"language\":\"$L\"}" -o /tmp/sv$i.wav; done
 pkill -9 -f "qwen_tts.*--serve"
 
+# (e) server REQUEST-BATCHING throughput — N users stepped together vs single-stream
+#     (the vLLM-style lever; speedup ~N on a bandwidth-bound box, ~1 on bandwidth-rich M1)
+make bench-server          # or: bash tests/serve_batch_bench.sh $D 8900 4 4 4
+
 # kernel-level: batched matmat twins vs B*matvec, per precision (no model needed)
 make matmat-bench
 ```
+
+RTF = wall-seconds / audio-seconds (lower = faster; <1.0 = sub-realtime). Use **RTF, not wall-clock**,
+to compare (chunked synthesis emits slightly more audio). For correctness across ISA, compare
+`--self-test` PASS + audio **mel-corr** (≥0.98), never md5 (cross-ISA fp-order differs benignly).
+
+**Server request-batching throughput** (`make bench-server`) — the key metric for PRODUCT 2. `speedup`
+= (M × single_wall) / burst_wall for M concurrent clients at `--batch-size N`. On M1 (bandwidth-rich,
+bf16) ≈ 1 (no win — one synthesis already saturates DRAM); the real ~N× lands on bandwidth-bound x86
+EPYC / Sapphire (AVX-512/VNNI) and is the reason PRODUCT 2 must be measured on rented silicon. Fill in:
+
+| box | batch_N | clients_M | bf16 speedup | int8 speedup | int4 speedup | notes |
+|---|---|---|---|---|---|---|
+| M1 8-core (ref) | 4 | 4 | ~1.0 | ~1.0 | ~1.0 | bandwidth-bound; correctness-only |
+| _Zen5 Turin_ | 4 | 4 | | | | int8/int4 throughput target |
+| _Graviton3/Grace_ | 4 | 4 | | | | bf16+i8mm+SVE |
+
 
 RTF = wall-seconds / audio-seconds (lower = faster; <1.0 = sub-realtime). Use **RTF, not wall-clock**,
 to compare (chunked synthesis emits slightly more audio). For correctness across ISA, compare

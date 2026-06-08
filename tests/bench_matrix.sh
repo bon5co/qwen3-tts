@@ -86,8 +86,13 @@ if [ "$FULL" = "1" ]; then
   pkill -9 -f "qwen_tts.*--serve" 2>/dev/null
   rm -f /tmp/bm_sv.wav
   echo
+
+  echo "### 7. Server request-batching THROUGHPUT (the x86 lever) ###"
+  bash tests/serve_batch_bench.sh "$MODEL" 8901 4 4 4 2>&1 | sed 's/^/  /'
+  echo
 fi
 
 hr
 echo "  Paste this block + the --caps output into docs/hardware-testing.md (§5 matrix)."
+echo "  Correctness gate (separate, run once): make test-serve-all"
 hr

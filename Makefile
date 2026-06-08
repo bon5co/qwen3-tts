@@ -389,6 +389,12 @@ bench-matrix: $(TARGET)
 bench-matrix-full: $(TARGET)
 	@bash tests/bench_matrix.sh $(MODEL_SMALL) --full
 
+# Server request-batching THROUGHPUT (the x86/ARM lever from this session): M
+# concurrent clients vs single-stream, per precision (bf16/int8/int4). Speedup ~N
+# on a bandwidth-bound box, ~1 on bandwidth-rich M1. Quiet machine only.
+bench-server: $(TARGET)
+	@bash tests/serve_batch_bench.sh $(MODEL_SMALL)
+
 # Compile-check the newer-ISA kernel paths that are #ifdef'd OUT on M1 (so their
 # syntax is verified NOW, before any M2+/AVX-512 hardware). Forces the -march so the
 # guarded BFMMLA/SMMLA/VNNI/BF16 paths actually compile; does NOT run (the host may
