@@ -738,11 +738,16 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
 /* ---- Batched matmat: Y[rows,B] = W[rows,cols] @ X[cols,B] (the batching /
  * spec-decode-verify primitive). Each weight element is loaded ONCE and FMA'd
  * into all B accumulators, so W streams from DRAM exactly once regardless of B
- * (X[k][0..B] is contiguous; acc[] stays L1/register-resident for B<=64).
+ * (X[k][0..B] is contiguous).
  *
- * Multi-ISA, same dispatch discipline as the rest of the engine: vectorize over
- * the B (accumulator) dimension — AVX-512 (16-wide) -> AVX2 (8) -> NEON (4) ->
- * scalar tail. The bf16 weight decode is scalar (1 per element, amortized over B).
+ * Two implementations, dispatched on B by bf16_matmat_slice():
+ *  - FIXED-B specializations (B in {1..8,16}) = the production-quality path:
+ *    accumulators are register-resident (named scalars, the compile-time inner
+ *    loop unrolls), rows blocked 2 at a time, broadcast-FMA auto-vectorized to
+ *    the target ISA by -march=native. This is where the weight-stationary win is.
+ *  - GENERIC fallback (other B) = explicit NEON/AVX2/AVX-512 over the B lanes but
+ *    with an L1-resident acc[] (slower; correctness safety net only).
+ * The bf16 weight decode is scalar (a single shift, amortized over the B FMAs).
  *
  * TODO (newer ISAs, annotate-now / exploit-later): the bf16 decode + FMA could use
  *   - ARM bf16 BFDOT/BFMMLA (Apple M2+, Neoverse V1/V2, NVIDIA Grace, DGX Spark) and
@@ -751,8 +756,14 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
  *   - x86 AVX-512-BF16 (VDPBF16PS) to fuse decode+FMA; AVX-512-VNNI for int8 batched.
  * Add an int8/int4 batched twin (qwen_matmat_int8/_int4) — that's where batching
  * pays most (it amortizes the unpack). See docs/batching.md. */
-static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
-                              int r0, int r1, int cols, int B) {
+/* Generic batched matmat (any B up to 64). Vectorizes over the B (accumulator)
+ * dimension. Used as the FALLBACK for B values without a compile-time
+ * specialization below. NOTE: `acc[64]` is indexed by a runtime b, so it lives
+ * in L1 (load/store every k) rather than registers — correct but slow. The
+ * weight-stationary win is realized by the fixed-B specializations, where the
+ * accumulators are register-resident; this generic path is just a safety net. */
+static void bf16_matmat_generic(float *Y, const uint16_t *W, const float *X,
+                                int r0, int r1, int cols, int B) {
     for (int r = r0; r < r1; r++) {
         const uint16_t *w = W + (size_t)r * cols;
         float *y = Y + (size_t)r * B;
@@ -780,6 +791,88 @@ static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
             for (; b < B; b++) acc[b] += wv * xk[b];
         }
         for (int b = 0; b < B; b++) y[b] = acc[b];
+    }
+}
+
+/* Compile-time-B specializations — the production-quality batched matmat.
+ *
+ * With B a compile-time constant the inner `for (j<BV)` fully unrolls, so the
+ * BV accumulators become NAMED scalars the compiler register-allocates (not an
+ * L1 array), and the broadcast-FMA over the B lanes auto-vectorizes to whatever
+ * the target ISA has (-march=native picks NEON / AVX2 / AVX-512 / scalar). This
+ * is the multi-ISA story for the fixed-B path: one portable body, the compiler
+ * emits the right SIMD — and the weight `w*v` streams from DRAM exactly once and
+ * is FMA'd into all BV register-resident accumulators (weight-stationary).
+ *
+ * Rows are blocked 2 at a time so each X[k][0..B] load feeds two weight rows
+ * (mirrors the production `bf16_matvec_fused` 2-rows-at-a-time discipline) and
+ * gives two independent FMA chains to hide latency.
+ *
+ * Specialized for B in {1..8, 16} (the natural chunk counts for splitting one
+ * long text into 2/3/4/6/8 parallel streams; the bench uses B=8). Other B fall
+ * back to bf16_matmat_generic. The bf16 decode stays scalar (a single shift,
+ * amortized over BV FMAs); a future ARM BFDOT / x86 AVX-512-BF16 twin could fuse
+ * decode+FMA (see TODO above). */
+#define DEFINE_MATMAT_FIXED_B(BV)                                              \
+static void bf16_matmat_b##BV(float *Y, const uint16_t *W, const float *X,     \
+                              int r0, int r1, int cols) {                      \
+    int r = r0;                                                               \
+    for (; r + 1 < r1; r += 2) {                                              \
+        const uint16_t *w0 = W + (size_t)r * cols;                            \
+        const uint16_t *w1 = W + (size_t)(r + 1) * cols;                      \
+        float *y0 = Y + (size_t)r * (BV);                                     \
+        float *y1 = Y + (size_t)(r + 1) * (BV);                               \
+        float a[BV], b[BV];                                                   \
+        for (int j = 0; j < (BV); j++) { a[j] = 0.0f; b[j] = 0.0f; }          \
+        for (int k = 0; k < cols; k++) {                                      \
+            float w0v = bf16_to_f32(w0[k]);                                   \
+            float w1v = bf16_to_f32(w1[k]);                                   \
+            const float *xk = X + (size_t)k * (BV);                           \
+            for (int j = 0; j < (BV); j++) {                                  \
+                float xv = xk[j];                                            \
+                a[j] += w0v * xv;                                            \
+                b[j] += w1v * xv;                                            \
+            }                                                                 \
+        }                                                                     \
+        for (int j = 0; j < (BV); j++) { y0[j] = a[j]; y1[j] = b[j]; }        \
+    }                                                                         \
+    for (; r < r1; r++) {                                                     \
+        const uint16_t *w = W + (size_t)r * cols;                             \
+        float *y = Y + (size_t)r * (BV);                                      \
+        float acc[BV];                                                        \
+        for (int j = 0; j < (BV); j++) acc[j] = 0.0f;                         \
+        for (int k = 0; k < cols; k++) {                                      \
+            float wv = bf16_to_f32(w[k]);                                     \
+            const float *xk = X + (size_t)k * (BV);                           \
+            for (int j = 0; j < (BV); j++) acc[j] += wv * xk[j];              \
+        }                                                                     \
+        for (int j = 0; j < (BV); j++) y[j] = acc[j];                         \
+    }                                                                         \
+}
+DEFINE_MATMAT_FIXED_B(1)
+DEFINE_MATMAT_FIXED_B(2)
+DEFINE_MATMAT_FIXED_B(3)
+DEFINE_MATMAT_FIXED_B(4)
+DEFINE_MATMAT_FIXED_B(5)
+DEFINE_MATMAT_FIXED_B(6)
+DEFINE_MATMAT_FIXED_B(7)
+DEFINE_MATMAT_FIXED_B(8)
+DEFINE_MATMAT_FIXED_B(16)
+#undef DEFINE_MATMAT_FIXED_B
+
+static void bf16_matmat_slice(float *Y, const uint16_t *W, const float *X,
+                              int r0, int r1, int cols, int B) {
+    switch (B) {
+        case 1:  bf16_matmat_b1 (Y, W, X, r0, r1, cols); return;
+        case 2:  bf16_matmat_b2 (Y, W, X, r0, r1, cols); return;
+        case 3:  bf16_matmat_b3 (Y, W, X, r0, r1, cols); return;
+        case 4:  bf16_matmat_b4 (Y, W, X, r0, r1, cols); return;
+        case 5:  bf16_matmat_b5 (Y, W, X, r0, r1, cols); return;
+        case 6:  bf16_matmat_b6 (Y, W, X, r0, r1, cols); return;
+        case 7:  bf16_matmat_b7 (Y, W, X, r0, r1, cols); return;
+        case 8:  bf16_matmat_b8 (Y, W, X, r0, r1, cols); return;
+        case 16: bf16_matmat_b16(Y, W, X, r0, r1, cols); return;
+        default: bf16_matmat_generic(Y, W, X, r0, r1, cols, B); return;
     }
 }
 typedef struct { float *Y; const uint16_t *W; const float *X; int rows, cols, B; } bf16_mm_ctx;

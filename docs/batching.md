@@ -90,6 +90,43 @@ decode like `bf16_matvec_fused`) AND (2) validated on a **memory-bound x86 box**
 single-stream is bandwidth-starved and read-once amortization actually pays. On M1, single-stream wins.
 This confirms the standing finding: M1 is compute-bound; batching is an x86/throughput lever at best.
 
+## ✅ CORRECTION (2026-06-08): register-blocked matmat → batching WINS on M1 (~2×)
+
+The "4–12× slower / x86-only" conclusion above was an **artifact of the naive matmat**, exactly as
+condition (1) predicted. Rewrote `bf16_matmat_slice` to production quality: **compile-time-B
+specializations** (`bf16_matmat_b1..b8,b16`) where the BV accumulators are register-resident (the
+unrolled inner `for(j<BV)` makes them named scalars, not the spilling `acc[64]`), rows blocked 2 at a
+time, and the broadcast-FMA auto-vectorizes per ISA under `-march=native`. The naive intrinsic loop is
+kept only as `bf16_matmat_generic` (fallback for un-specialized B). Self-test still PASS (matmat(B=8)
+vs B×matvec L2_rel ~3e-7); golden untouched (opt-in path).
+
+Re-ran `--batch-bench` (0.6B, M1, K=50):
+
+| | single-stream (B× sequential) | batched | speedup |
+|---|---|---|---|
+| **4 threads** | 11.9 frames/s | 25.1 frames/s | **2.10× (was 0.24×)** |
+| 1 thread | 11.2 frames/s | 9.9 frames/s | 0.88× (was 0.08×) |
+
+**B-sweep at 4 threads** (the natural "split one paragraph into N parallel chunks" counts):
+
+| B | 2 | 3 | 4 | 6 | 8 | 16 |
+|---|---|---|---|---|---|---|
+| speedup | 1.87× | 2.01× | **2.23×** | 1.59× | 2.21× | 1.60× |
+
+**The finding flips: batching is a WIN on M1 at the default 4 threads** — even a 2-way split gives
+1.87×, the sweet spot (B≈4–8) ~2.2×. Why it now wins where it lost: single-stream re-reads the weights
+B× (once per sequence), which saturates the shared memory controller across 4 cores → bandwidth-bound;
+the batched matmat reads weights ONCE → ~B× less DRAM traffic. At 1 thread it's still ~break-even (0.88×)
+because a single core isn't bandwidth-starved and the hand-tuned `bf16_matvec_fused` is a hair tighter
+per-FMA than the auto-vectorized matmat — but nobody runs 1 thread. The plateau ~2× is the bf16 ceiling
+the premise microbench predicted; **lower precision (int4/int8) should push past it** (next section), and
+a bandwidth-bound x86 box should do as well or better. **This is the audiobook/long-text lever:** split a
+long paragraph into 2–4 chunks, step them batched → ~2× wall-clock vs sequential, reusing the weights.
+
+**Revised decision: building the `--batch` integration IS worth it on M1** (not x86-only). Remaining work:
+per-stream sampling + ragged-EOS + a chunk scheduler (split text, keep the batch full, re-stitch audio via
+`render_spans`), then the int8/int4 batched twins. Validate on the Ryzen/Turin boxes where it should pay more.
+
 ## Batching × PRECISION (int8 / int4 / int2)
 
 Re-ran the bench storing weights at their real byte size (`make batching-bench`, 4-thread).

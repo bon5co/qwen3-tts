@@ -699,21 +699,40 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   `--batch-test`: **CP wiring 0/120 codes differ (bit-exact) AND CP matmat 0/120 differ** — greedy argmax absorbs
 >   the fp-order noise → batched CP yields IDENTICAL audio codes. So both batched COMPUTE kernels (Talker+CP) are
 >   built + validated; golden 1.0 (additive).
->   **⚠️ STOP / KEY FINDING (b51469c, `--batch-bench` real model 0.6B B=8 K=50): batched compute is 4-12× SLOWER on M1**
->   (4T 0.24×, 1T 0.08×). The premise microbench mispredicted (it compared two naive kernels). The PRODUCTION
->   `qwen_matvec_bf16` is heavily optimized (8-wide NEON, 2 rows/iter, register-resident multi-accumulators); our
->   `bf16_matmat_slice` is naive (scalar decode + acc[64] in L1 NOT registers, load/store every k) + gather/scatter.
->   On M1 (compute-bound, high per-core BW) B×production-matvec beats it. **DECISION: do NOT build the full --batch
->   integration on M1.** The 2 batched kernels are built+correct (reusable). Batching needs (1) a production-quality
->   register-blocked batched matmat AND (2) a memory-bound x86 box (Ryzen/Turin/Zen5) to pay. Confirms M1 = compute-bound;
->   batching is an x86/THROUGHPUT lever at best. NEXT (only if pursued): optimize the matmat → re-run --batch-bench on
->   x86 → IF it wins there, then build the integration (sampling/ragged-EOS/scheduler/--batch). Else park as x86-only.
+>   **⚠️→✅ FINDING REVERSED (2026-06-08): batching WINS ~2× on M1 once the matmat is register-blocked.** The earlier
+>   STOP (b51469c: "4-12× SLOWER, 4T 0.24× / 1T 0.08×, x86-only") was an ARTIFACT of the naive `bf16_matmat_slice`
+>   (scalar decode + `acc[64]` in L1 NOT registers, load/store every k) — exactly the condition it flagged. FIX
+>   (2026-06-08): rewrote it as compile-time-B specializations `bf16_matmat_b1..b8,b16` — BV accumulators register-
+>   resident (unrolled `for(j<BV)` → named scalars), rows blocked 2 at a time, broadcast-FMA auto-vectorized per ISA
+>   under -march=native; naive intrinsic loop kept ONLY as `bf16_matmat_generic` fallback. Self-test still PASS
+>   (matmat(B=8) vs B×matvec L2_rel ~3e-7); golden untouched (opt-in). **Re-bench 0.6B M1 K=50: 4 threads 0.24×→2.10×;
+>   1 thread 0.08×→0.88×.** B-sweep @4T: B=2 1.87×, B=3 2.01×, B=4 2.23× (sweet spot), B=8 2.21× (B=6/16 dip ~1.6× =
+>   noise/reg-pressure). Why it flips: single-stream re-reads weights B× → saturates the shared mem controller across 4
+>   cores (bandwidth-bound); batched reads weights ONCE. ~2× = the bf16 ceiling (premise microbench was right); int4/int8
+>   should push past it, x86 (bandwidth-bound) ≥ this. **DECISION REVERSED: the `--batch` integration IS worth building
+>   on M1** — it's the AUDIOBOOK/long-text lever (split a paragraph into 2–4 chunks, step batched → ~2× wall-clock vs
+>   sequential, reusing weights). NEXT: (1) per-stream sampling + ragged-EOS + chunk scheduler (split text / keep batch
+>   full / re-stitch via render_spans) → wire `--batch`; (2) int8/int4 batched twins (`qwen_matmat_int8/_int4` — batching
+>   pays most at low precision); (3) validate on Ryzen/Turin. See docs/batching.md "CORRECTION (2026-06-08)".
 > - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
 >   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
 >   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
 >   code0 (Medusa/Eagle OUT — need trained heads); (C) CP residual spec (risky, quality-sensitive); (D) spec-decode ⊂
 >   batching (the parallel-verify IS a batched forward → build batching first). **DECISION NUMBER = 0.6B↔1.7B code0
 >   acceptance rate** — cheap instrument-only experiment (reuse quant-ladder teacher-forcing rails) to run FIRST.
+> - **MTP DEEP-DIVE (TODO, user 2026-06-08) — a dedicated analysis task, NOT this session.** Question to answer
+>   precisely, with code citations: (1) **What MTP is in THIS model and how it works** — the weights contain a
+>   `small_to_mtp_projection` + the Code Predictor (15 RVQ residual passes/frame). Is that a true Multi-Token-Prediction
+>   head (predicts *future frames* à la DeepSeek-V3 / Qwen3 MTP) or only the INTRA-frame residual quantizer (predicts the
+>   15 residual codebooks of the CURRENT frame)? Read the HF config / `MODEL.md` / the projection wiring to settle it —
+>   current belief (line ~712) is INTRA-frame, NOT a next-frame speculator, but verify against the actual tensor graph.
+>   (2) **Do we USE it today, and how?** Trace where `small_to_mtp_projection` feeds in `qwen_tts_code_predictor.c` /
+>   `qwen_tts.c` — confirm it's the CP path we already run every frame (yes/no, with line refs), or dead weight we ignore.
+>   (3) **Would it help SPECULATIVE DECODING / speed?** IF there is any next-frame-predictive capacity in the MTP head,
+>   it could draft the next frame's code0 for a batched verify (spec-decode ⊂ batching — see the bullet above). IF it's
+>   purely the intra-frame residual predictor, it does NOT give free next-frame drafts and the spec-decode lever stays
+>   the cross-model 0.6B→1.7B code0 idea. Deliverable: `docs/mtp-analysis.md` + a verdict line in PLAN. Cheap, instrument-
+>   /read-only; gate the spec-decode work on its conclusion. Don't conflate with the `feat/batching` matmat work.
 > - **Quant:** int2 / int3 where we know it's viable (q2 already exists for the roughness path — extend as a
 >   real quant tier?). Measure quality cliff per codebook (we have the quant-ladder instrument). NOTE: int4+batching
 >   synergy (above) raises the value of a solid int4 path.
