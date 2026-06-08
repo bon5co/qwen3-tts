@@ -670,6 +670,32 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
                                   const qwen_batch_req_t *reqs, int nc,
                                   float **out_samples, int *out_n_samples);
 
+/* ── Continuous request-batching driver (vLLM-style, S2) ────────────────────
+ * A persistent frame-stepping loop over up to `max_batch` slots. When a slot's
+ * request hits EOS it is finalized (decoded → delivered) and the freed slot is
+ * immediately refilled with a queued request (compact+refill / continuous
+ * batching) — no waiting for the slowest in a group. The host (server) supplies
+ * a job source + delivery sink via callbacks; the driver owns ctx + the batch
+ * state and is the sole synthesizer. */
+typedef struct {
+    void *ud;
+    /* Pull the next BATCH request. Fill *req + *tag (opaque handle the host uses
+     * to route the response). Return 1 if one was dequeued, 0 if none. When
+     * block!=0 the driver is fully idle and the callback MAY block until a job
+     * arrives or shutdown (return 0 on shutdown). req->text must stay valid until
+     * on_done is called for that tag (the driver does not copy it). */
+    int (*next_job)(void *ud, qwen_batch_req_t *req, void **tag, int block);
+    /* Deliver a finished request's audio (malloc'd samples, host frees) or NULL
+     * on failure. The driver is done with `tag` after this returns. */
+    void (*on_done)(void *ud, void *tag, float *samples, int n_samples);
+    /* Return non-zero while the server should keep running. */
+    int (*running)(void *ud);
+} qwen_batch_sink_t;
+
+/* Run the continuous-batching loop until running()==0 and the queue drains.
+ * Returns 0 on clean exit, -2 if the model can't use the bf16 batched path. */
+int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int max_batch, qwen_batch_sink_t *sink);
+
 /* Write WAV file */
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
 

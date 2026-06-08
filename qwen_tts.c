@@ -1987,3 +1987,167 @@ int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
 
     return 0;
 }
+
+/* ── Continuous-batching driver (S2) ─────────────────────────────────────────
+ * Persistent frame-stepping loop over `B` slots. Free slots are refilled from the
+ * job source every frame (continuous/vLLM-style); EOS'd requests are decoded and
+ * delivered immediately, freeing their slot for the next queued request — no
+ * waiting for the slowest in a static group. */
+int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
+    if (B < 1) B = 1;
+    if (ctx->layers[0].wq_bf16 == NULL) return -2;   /* bf16 batched step only */
+    int h = ctx->config.hidden_size;
+    int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
+    int num_layers = ctx->config.num_layers;
+    int vocab = ctx->config.codec_vocab_size;
+    int cb = ctx->config.codebook_size;
+    float eps = ctx->config.rms_norm_eps;
+    int GEN_CAP = ctx->max_tokens; if (GEN_CAP > 600) GEN_CAP = 600; if (GEN_CAP < 32) GEN_CAP = 32;
+    const int MAXPROMPT = 512;                       /* per-slot prompt KV budget */
+    int kv_max = MAXPROMPT + GEN_CAP + 4;
+    int force_matvec = getenv("QWEN_BATCH_FORCE_MATVEC") ? 1 : 0;
+
+    qwen_batch_t *bb = qwen_batch_alloc(ctx, B, kv_max);
+    if (!bb) return -1;
+    bb->force_matvec = force_matvec;
+
+    /* per-slot state */
+    uint8_t *active = (uint8_t *)calloc(B, 1);
+    void **tag = (void **)calloc(B, sizeof(void *));
+    int *pos = (int *)calloc(B, sizeof(int));
+    int *tcl = (int *)calloc(B, sizeof(int));
+    float *p_temp = (float *)malloc((size_t)B * sizeof(float));
+    int *p_topk = (int *)malloc((size_t)B * sizeof(int));
+    float *p_topp = (float *)malloc((size_t)B * sizeof(float));
+    float *p_rep = (float *)malloc((size_t)B * sizeof(float));
+    int *p_gw = (int *)malloc((size_t)B * sizeof(int));
+    uint32_t *rng = (uint32_t *)malloc((size_t)B * sizeof(uint32_t));
+    int *nprev = (int *)calloc(B, sizeof(int));
+    int *chframes = (int *)calloc(B, sizeof(int));
+    int *sframe = (int *)calloc(B, sizeof(int));   /* per-slot frame counter since admit */
+    int **prev_tok = (int **)malloc((size_t)B * sizeof(int *));
+    int **chcodes = (int **)malloc((size_t)B * sizeof(int *));
+    float *last_hidden = (float *)calloc((size_t)B * h, sizeof(float));
+    float *logits = (float *)malloc((size_t)vocab * sizeof(float));
+    float *step_embed = (float *)malloc((size_t)B * h * sizeof(float));
+    int *code0 = (int *)malloc((size_t)B * sizeof(int));
+    int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
+    for (int b = 0; b < B; b++) {
+        prev_tok[b] = (int *)malloc((size_t)GEN_CAP * sizeof(int));
+        chcodes[b] = (int *)malloc((size_t)GEN_CAP * 16 * sizeof(int));
+    }
+    const float *tts_pad = ctx->cached_tts_pad_embed;
+    int n_active = 0;
+
+    #define FINALIZE_SLOT(b) do {                                                  \
+        float *aud = NULL; int an = 0;                                             \
+        if (chframes[b] > 0 &&                                                     \
+            qwen_speech_decoder_decode(ctx, chcodes[b], chframes[b], &aud, &an) == 0 \
+            && aud && an > 0) sink->on_done(sink->ud, tag[b], aud, an);            \
+        else { free(aud); sink->on_done(sink->ud, tag[b], NULL, 0); }             \
+        active[b] = 0; tag[b] = NULL; n_active--;                                  \
+    } while (0)
+
+    while (sink->running(sink->ud) || n_active > 0) {
+        /* ---- admit queued jobs into free slots ---- */
+        for (int b = 0; b < B; b++) {
+            if (active[b]) continue;
+            if (!sink->running(sink->ud)) break;
+            int block = (n_active == 0);   /* block only when fully idle (no spin) */
+            qwen_batch_req_t req;
+            void *t = NULL;
+            if (!sink->next_job(sink->ud, &req, &t, block)) {
+                if (block) break;          /* shutdown while idle */
+                continue;                  /* nothing queued right now */
+            }
+            /* prefill this request (single-stream prefill_only), capture KV into slot b */
+            int sv_spk = ctx->speaker_id, sv_lang = ctx->language_id;
+            ctx->speaker_id = req.speaker_id; ctx->language_id = req.language_id;
+            ctx->prev_prefill_len = 0; ctx->prefill_only = 1;
+            int prc = qwen_tts_generate(ctx, req.text, NULL, NULL);
+            ctx->prefill_only = 0;
+            ctx->speaker_id = sv_spk; ctx->language_id = sv_lang;
+            int pl = ctx->kv_len;
+            if (prc != 0 || pl <= 0 || pl > MAXPROMPT) {
+                sink->on_done(sink->ud, t, NULL, 0);   /* reject (prefill fail / too long) */
+                continue;
+            }
+            for (int L = 0; L < num_layers; L++) {
+                size_t dst = ((size_t)b * num_layers + L) * kv_max * kvd;
+                memcpy(bb->kv_k + dst, ctx->kv_cache_k + (size_t)L * ctx->kv_max * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+                memcpy(bb->kv_v + dst, ctx->kv_cache_v + (size_t)L * ctx->kv_max * kvd, (size_t)pl * kvd * sizeof(uint16_t));
+            }
+            qwen_rms_norm(last_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
+            tcl[b] = ctx->bg_text_content_len;
+            pos[b] = pl;
+            p_temp[b] = req.temperature; p_topk[b] = req.top_k; p_topp[b] = req.top_p;
+            p_rep[b] = req.rep_penalty; p_gw[b] = req.greedy_warmup; rng[b] = req.seed;
+            nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
+            tag[b] = t; active[b] = 1; n_active++;
+        }
+
+        if (n_active == 0) {
+            if (!sink->running(sink->ud)) break;
+            continue;
+        }
+
+        /* ---- one frame: per-slot codec head + sample ---- */
+        for (int b = 0; b < B; b++) {
+            if (!active[b]) { code0[b] = 0; continue; }
+            matvec_bf16(logits, ctx->codec_head_bf16, last_hidden + (size_t)b * h, vocab, h);
+            for (int t = 0; t < vocab; t++) { if (logits[t] > 100.0f) logits[t] = 100.0f; if (logits[t] < -100.0f) logits[t] = -100.0f; }
+            for (int t = 2048; t < vocab; t++) if (t != QWEN_TTS_CODEC_EOS) logits[t] = -1e30f;
+            int sf = sframe[b];
+            if (sf < 2) logits[QWEN_TTS_CODEC_EOS] = -1e30f;
+            int ef = tcl[b] * 3, bs = ef * 2;
+            if (ef > 0 && sf > bs) { float bo = 0.5f * (sf - bs); if (bo > 10.0f) bo = 10.0f; logits[QWEN_TTS_CODEC_EOS] += bo; }
+            float ft = p_temp[b]; int ftk = p_topk[b];
+            if (p_gw[b] > 0 && sf < p_gw[b]) { ft = 0.0f; ftk = 1; }
+            qwen_set_seed(rng[b]);
+            int c0 = qwen_tts_sample(logits, vocab, ft, ftk, p_topp[b], p_rep[b], prev_tok[b], nprev[b]);
+            rng[b] = qwen_get_seed();
+            if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP || pos[b] >= kv_max - 1) {
+                FINALIZE_SLOT(b); code0[b] = 0; continue;
+            }
+            code0[b] = c0; prev_tok[b][nprev[b]++] = c0;
+        }
+        if (n_active == 0) continue;
+
+        /* ---- batched CP over all slots (inactive use code0=0) ---- */
+        qwen_batch_cp_predict(ctx, bb, last_hidden, code0, cpcodes);
+
+        /* ---- record frame + build next embedding ---- */
+        for (int b = 0; b < B; b++) {
+            float *se = step_embed + (size_t)b * h;
+            if (!active[b]) { memset(se, 0, (size_t)h * sizeof(float)); continue; }
+            int frame16[16]; frame16[0] = code0[b];
+            for (int g = 0; g < 15; g++) frame16[g + 1] = cpcodes[(size_t)b * 15 + g];
+            memcpy(chcodes[b] + (size_t)chframes[b] * 16, frame16, 16 * sizeof(int));
+            chframes[b]++;
+            lookup_codec_embed(ctx, code0[b], se);
+            for (int g = 0; g < 15; g++) {
+                int cg = frame16[g + 1];
+                if (ctx->cp_codec_emb_bf16[g] && cg >= 0 && cg < cb)
+                    qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
+            }
+            for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+        }
+
+        /* ---- batched ragged Talker step over active slots ---- */
+        if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) {
+            /* fatal step error: fail all active slots */
+            for (int b = 0; b < B; b++) if (active[b]) { sink->on_done(sink->ud, tag[b], NULL, 0); active[b] = 0; tag[b] = NULL; n_active--; }
+            break;
+        }
+        for (int b = 0; b < B; b++) if (active[b]) { pos[b]++; sframe[b]++; }
+    }
+
+    #undef FINALIZE_SLOT
+    for (int b = 0; b < B; b++) { free(prev_tok[b]); free(chcodes[b]); }
+    free(active); free(tag); free(pos); free(tcl);
+    free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
+    free(nprev); free(chframes); free(sframe); free(prev_tok); free(chcodes);
+    free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
+    qwen_batch_free(bb);
+    return 0;
+}

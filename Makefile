@@ -783,7 +783,12 @@ test-serve-repro: $(TARGET)
 test-serve-batch: $(TARGET)
 	@bash tests/serve_batch.sh $(MODEL_SMALL)
 
-test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch
+# Continuous admission: N=6 requests at max_batch=2 must all complete as the
+# scheduler refills slots freed by EOS'd requests (peak admitted > batch width).
+test-serve-continuous: $(TARGET)
+	@bash tests/serve_continuous_stress.sh $(MODEL_SMALL) 8786 6 2
+
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -922,7 +927,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
