@@ -659,6 +659,7 @@ typedef struct {
     float rep_penalty;
     uint32_t seed;
     int   greedy_warmup;
+    int   want_stream;    /* 1 = stream this request's frames incrementally (S3) */
 } qwen_batch_req_t;
 
 /* Step `nc` independent requests together; each writes its OWN audio buffer into
@@ -685,9 +686,15 @@ typedef struct {
      * arrives or shutdown (return 0 on shutdown). req->text must stay valid until
      * on_done is called for that tag (the driver does not copy it). */
     int (*next_job)(void *ud, qwen_batch_req_t *req, void **tag, int block);
-    /* Deliver a finished request's audio (malloc'd samples, host frees) or NULL
-     * on failure. The driver is done with `tag` after this returns. */
+    /* Non-streaming: deliver a finished request's full audio (malloc'd, host
+     * frees) or NULL on failure. For a streaming request this is the END marker
+     * (samples=NULL,n=0) → host finishes the chunked response. Driver is done
+     * with `tag` after this returns. */
     void (*on_done)(void *ud, void *tag, float *samples, int n_samples);
+    /* Streaming only (req.want_stream): one incremental PCM chunk for `tag` as
+     * its frame is decoded (driver frees `samples` after this returns). May be
+     * NULL → driver won't stream even if want_stream is set. */
+    void (*on_chunk)(void *ud, void *tag, float *samples, int n_samples);
     /* Return non-zero while the server should keep running. */
     int (*running)(void *ud);
 } qwen_batch_sink_t;

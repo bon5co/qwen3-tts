@@ -1414,11 +1414,14 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
 /* Incremental streaming decode: process only new_frames through VQ→pre-transformer
  * (using KV cache), cache latent output, run conv decoder on windowed latent.
  * Returns only NEW audio samples (not previously emitted ones). */
-int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
+/* Explicit-state variant: streams using the caller-owned `st` instead of the
+ * single ctx->sd_stream. Lets the continuous-batching driver keep B independent
+ * per-slot streaming decoder states (weights in ctx->speech_dec + ctx->config are
+ * read-only, shared safely). */
+int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st,
                                           const int *new_codes, int new_frames,
                                           float **audio_out, int *n_samples) {
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
-    qwen_sd_stream_state_t *st = &ctx->sd_stream;
     qwen_tts_config_t *c = &ctx->config;
 
     int cb_dim = QWEN_TTS_CODEBOOK_DIM;
@@ -1851,4 +1854,12 @@ int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
     *audio_out = new_audio;
     *n_samples = new_samples;
     return 0;
+}
+
+/* Back-compat wrapper: stream using the single ctx->sd_stream state. */
+int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx,
+                                          const int *new_codes, int new_frames,
+                                          float **audio_out, int *n_samples) {
+    return qwen_speech_decoder_decode_streaming_st(ctx, &ctx->sd_stream,
+                                                   new_codes, new_frames, audio_out, n_samples);
 }

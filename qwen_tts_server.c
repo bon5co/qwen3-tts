@@ -663,7 +663,8 @@ enum { JOB_BATCH = 0, JOB_SINGLE = 1 };
 typedef struct batch_job {
     int fd;
     int kind;              /* JOB_BATCH (preset voice, batchable) or JOB_SINGLE */
-    int is_stream;         /* JOB_SINGLE: route to handle_tts_stream */
+    int is_stream;         /* stream this request (batched streaming or single worker) */
+    int header_sent;       /* JOB_BATCH streaming: chunked header already written */
     char *text;            /* owned (JOB_BATCH) */
     char *body;            /* owned (JOB_SINGLE: re-parsed on scheduler ctx) */
     qwen_batch_req_t req;  /* JOB_BATCH: req.text aliases ->text */
@@ -815,13 +816,17 @@ static void *reader_main(void *arg) {
             int needs_single = 0;
             char *text = parse_batch_req(ra->ctx, body, &j->req, &needs_single);
             if (!text) { send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)"); close(fd); free(j); free(buf); continue; }
-            if (is_stream || needs_single) {
-                /* single-stream path on a dedicated worker (clone ctx) — won't stall the batch */
+            if (needs_single) {
+                /* instruct / voice_design can't batch → dedicated worker (clone ctx) */
                 j->kind = JOB_SINGLE; j->is_stream = is_stream;
                 j->body = strdup(body); j->text = text;  /* text freed with job */
                 jq_push(ra->jq_single, j);
             } else {
-                j->kind = JOB_BATCH; j->text = text; j->req.text = j->text;
+                /* preset voice → continuous batch; stream requests are batched AND
+                 * streamed (S3): each slot's frame is emitted as produced. */
+                j->kind = JOB_BATCH; j->is_stream = is_stream;
+                j->req.want_stream = is_stream;
+                j->text = text; j->req.text = j->text;
                 jq_push(ra->jq, j);
             }
         } else {
@@ -851,18 +856,47 @@ static int sink_next_job(void *ud, qwen_batch_req_t *req, void **tag, int block)
     return 1;
 }
 
-/* on_done: deliver this request's audio + close its connection. */
+/* Write one float PCM buffer as an HTTP chunk (s16le). */
+static void send_pcm_chunk(int fd, const float *samples, int n) {
+    int16_t *pcm = (int16_t *)malloc((size_t)n * sizeof(int16_t));
+    if (!pcm) return;
+    for (int i = 0; i < n; i++) {
+        float s = samples[i]; if (s < -1.0f) s = -1.0f; if (s > 1.0f) s = 1.0f;
+        pcm[i] = (int16_t)(s * 32767);
+    }
+    int data_len = n * 2;
+    char ch[32]; int chlen = snprintf(ch, sizeof(ch), "%x\r\n", data_len);
+    write(fd, ch, chlen); write(fd, pcm, data_len); write(fd, "\r\n", 2);
+    free(pcm);
+}
+
+/* on_chunk (streaming): emit one incremental PCM chunk for this request. */
+static void sink_on_chunk(void *ud, void *tag, float *samples, int n_samples) {
+    (void)ud;
+    batch_job_t *j = (batch_job_t *)tag;
+    if (n_samples <= 0 || !samples) return;
+    if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
+    send_pcm_chunk(j->fd, samples, n_samples);
+}
+
+/* on_done: finish this request + close its connection. Streaming → chunked end;
+ * non-streaming → full WAV. */
 static void sink_on_done(void *ud, void *tag, float *samples, int n_samples) {
     sink_ctx_t *sc = (sink_ctx_t *)ud;
     batch_job_t *j = (batch_job_t *)tag;
-    respond_wav(j->fd, samples, n_samples);
-    free(samples);
+    if (j->is_stream) {
+        if (!j->header_sent) { send_chunked_header(j->fd); j->header_sent = 1; }
+        send_chunked_end(j->fd);
+    } else {
+        respond_wav(j->fd, samples, n_samples);
+        free(samples);
+    }
     close(j->fd);
+    int streamed = j->is_stream;
     job_free(j);
     sc->done++;
-    if (n_samples > 0)
-        fprintf(stderr, "[BATCH] done #%d (%.2fs audio, in-flight admitted=%d)\n",
-                sc->done, (float)n_samples / QWEN_TTS_SAMPLE_RATE, sc->admitted);
+    fprintf(stderr, "[BATCH] done #%d (%s, in-flight admitted=%d)\n",
+            sc->done, streamed ? "streamed" : "wav", sc->admitted);
 }
 
 static int sink_running(void *ud) {
@@ -876,7 +910,8 @@ static void *scheduler_main(void *arg) {
     sched_arg_t *sa = (sched_arg_t *)arg;
     sink_ctx_t sc = { .jq = sa->jq, .running = (int *)&server_running, .admitted = 0, .done = 0 };
     qwen_batch_sink_t sink = {
-        .ud = &sc, .next_job = sink_next_job, .on_done = sink_on_done, .running = sink_running,
+        .ud = &sc, .next_job = sink_next_job, .on_done = sink_on_done,
+        .on_chunk = sink_on_chunk, .running = sink_running,
     };
     qwen_tts_serve_continuous(sa->ctx, sa->max_batch, &sink);
     return NULL;

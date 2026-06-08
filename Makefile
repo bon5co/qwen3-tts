@@ -788,7 +788,12 @@ test-serve-batch: $(TARGET)
 test-serve-continuous: $(TARGET)
 	@bash tests/serve_continuous_stress.sh $(MODEL_SMALL) 8786 6 2
 
-test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous
+# Per-request streaming composed with batching (vLLM-style): concurrent /v1/tts/stream
+# requests batched AND streamed; streamed PCM mel-corr ~1.0 vs single-stream.
+test-serve-stream-batch: $(TARGET)
+	@bash tests/serve_stream_batch.sh $(MODEL_SMALL)
+
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -927,7 +932,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \

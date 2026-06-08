@@ -227,6 +227,7 @@ extern void qwen_cp_microbench_report(int frames);
 #endif
 extern int qwen_speech_decoder_decode(qwen_tts_ctx_t *ctx, const int *codes, int n_frames, float **audio_out, int *n_samples);
 extern int qwen_speech_decoder_decode_streaming(qwen_tts_ctx_t *ctx, const int *new_codes, int new_frames, float **audio_out, int *n_samples);
+extern int qwen_speech_decoder_decode_streaming_st(qwen_tts_ctx_t *ctx, qwen_sd_stream_state_t *st, const int *new_codes, int new_frames, float **audio_out, int *n_samples);
 extern void qwen_sd_stream_init(qwen_sd_stream_state_t *st);
 extern void qwen_sd_stream_free(qwen_sd_stream_state_t *st);
 extern int qwen_tts_sample(float *logits, int vocab_size, float temp, int top_k, float top_p, float rep_penalty, int *prev_tokens, int n_prev);
@@ -2032,6 +2033,10 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     float *step_embed = (float *)malloc((size_t)B * h * sizeof(float));
     int *code0 = (int *)malloc((size_t)B * sizeof(int));
     int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
+    /* per-slot streaming decoder state (S3): when a slot's request wants streaming
+     * we decode its frames incrementally with its own state and emit via on_chunk. */
+    uint8_t *want_stream = (uint8_t *)calloc(B, 1);
+    qwen_sd_stream_state_t *sstate = (qwen_sd_stream_state_t *)calloc(B, sizeof(qwen_sd_stream_state_t));
     for (int b = 0; b < B; b++) {
         prev_tok[b] = (int *)malloc((size_t)GEN_CAP * sizeof(int));
         chcodes[b] = (int *)malloc((size_t)GEN_CAP * 16 * sizeof(int));
@@ -2039,12 +2044,19 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     const float *tts_pad = ctx->cached_tts_pad_embed;
     int n_active = 0;
 
+    /* Finalize slot b: streaming → free state + end-of-stream marker (frames were
+     * already emitted via on_chunk); non-streaming → full decode + deliver. */
     #define FINALIZE_SLOT(b) do {                                                  \
-        float *aud = NULL; int an = 0;                                             \
-        if (chframes[b] > 0 &&                                                     \
-            qwen_speech_decoder_decode(ctx, chcodes[b], chframes[b], &aud, &an) == 0 \
-            && aud && an > 0) sink->on_done(sink->ud, tag[b], aud, an);            \
-        else { free(aud); sink->on_done(sink->ud, tag[b], NULL, 0); }             \
+        if (want_stream[b]) {                                                      \
+            qwen_sd_stream_free(&sstate[b]); want_stream[b] = 0;                   \
+            sink->on_done(sink->ud, tag[b], NULL, 0);                             \
+        } else {                                                                   \
+            float *aud = NULL; int an = 0;                                         \
+            if (chframes[b] > 0 &&                                                 \
+                qwen_speech_decoder_decode(ctx, chcodes[b], chframes[b], &aud, &an) == 0 \
+                && aud && an > 0) sink->on_done(sink->ud, tag[b], aud, an);        \
+            else { free(aud); sink->on_done(sink->ud, tag[b], NULL, 0); }         \
+        }                                                                          \
         active[b] = 0; tag[b] = NULL; n_active--;                                  \
     } while (0)
 
@@ -2083,6 +2095,8 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             p_temp[b] = req.temperature; p_topk[b] = req.top_k; p_topp[b] = req.top_p;
             p_rep[b] = req.rep_penalty; p_gw[b] = req.greedy_warmup; rng[b] = req.seed;
             nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
+            want_stream[b] = (req.want_stream && sink->on_chunk) ? 1 : 0;
+            if (want_stream[b]) qwen_sd_stream_init(&sstate[b]);
             tag[b] = t; active[b] = 1; n_active++;
         }
 
@@ -2131,19 +2145,34 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                     qwen_bf16_accum_f32(se, ctx->cp_codec_emb_bf16[g] + (size_t)cg * h, h);
             }
             for (int j = 0; j < h; j++) se[j] += tts_pad[j];
+
+            /* S3: stream this frame incrementally to the slot's connection. */
+            if (want_stream[b]) {
+                float *aud = NULL; int an = 0;
+                if (qwen_speech_decoder_decode_streaming_st(ctx, &sstate[b],
+                        chcodes[b] + (size_t)(chframes[b] - 1) * 16, 1, &aud, &an) == 0
+                    && aud && an > 0) {
+                    sink->on_chunk(sink->ud, tag[b], aud, an);
+                }
+                free(aud);
+            }
         }
 
         /* ---- batched ragged Talker step over active slots ---- */
         if (qwen_batch_talker_step_ragged(ctx, bb, step_embed, pos, active, last_hidden) != 0) {
             /* fatal step error: fail all active slots */
-            for (int b = 0; b < B; b++) if (active[b]) { sink->on_done(sink->ud, tag[b], NULL, 0); active[b] = 0; tag[b] = NULL; n_active--; }
+            for (int b = 0; b < B; b++) if (active[b]) {
+                if (want_stream[b]) { qwen_sd_stream_free(&sstate[b]); want_stream[b] = 0; }
+                sink->on_done(sink->ud, tag[b], NULL, 0); active[b] = 0; tag[b] = NULL; n_active--;
+            }
             break;
         }
         for (int b = 0; b < B; b++) if (active[b]) { pos[b]++; sframe[b]++; }
     }
 
     #undef FINALIZE_SLOT
-    for (int b = 0; b < B; b++) { free(prev_tok[b]); free(chcodes[b]); }
+    for (int b = 0; b < B; b++) { if (want_stream[b]) qwen_sd_stream_free(&sstate[b]); free(prev_tok[b]); free(chcodes[b]); }
+    free(want_stream); free(sstate);
     free(active); free(tag); free(pos); free(tcl);
     free(p_temp); free(p_topk); free(p_topp); free(p_rep); free(p_gw); free(rng);
     free(nprev); free(chframes); free(sframe); free(prev_tok); free(chcodes);
