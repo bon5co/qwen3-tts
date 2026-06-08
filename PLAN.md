@@ -798,6 +798,20 @@ greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spo
 >   pick per use-case.** Test via `bench_matrix.sh --full`. DESIGN DECISION (user 2026-06-08, agreed): **streaming stays
 >   single-stream** (latency lever, one progressive sequence — nothing to batch within one request); batching belongs in
 >   the SERVER as concurrent-request batching (below).
+> - **★ S1 DONE (2026-06-08, branch feat/server-batching) — SERVER REQUEST-BATCHING, dynamic batching working + validated
+>   on M1.** Built: (a) `qwen_tts_generate_batch_multi()` — the reusable engine: N independent requests (own text/speaker/
+>   language/sampling/seed) → N SEPARATE outputs, per-slot sampling params + per-slot RNG state (swap g_seed in/out per slot
+>   per frame via new `qwen_get_seed()`) so each request reproduces single-stream bit-for-bit. (b) `qwen_tts_serve_batched()`
+>   (`--batch-size N`, N≥2) — ONE scheduler thread owns ctx + is the sole synthesizer; a reader pool parses HTTP into jobs
+>   (read-only on ctx); opportunistic batching with ZERO added latency (a batch synth takes seconds → concurrent requests
+>   pile up → next batch drains them, no linger window); instruct/voice_design/stream fall back to single jobs on the
+>   scheduler. VALIDATED M1 0.6B, 3 concurrent users (ryan/IT, vivian/EN, serena/IT): force_matvec temp0 → each response
+>   mel_corr **1.00000** vs its own single-stream, cross-talk A↔C **0.21** (per-request params plumbed, zero cross-talk,
+>   `[BATCH] 3 req` in one batch); production matmat path → 2 concurrent batched aggregate **RTF 0.95** on M1 bf16, stream
+>   fallback works. temp>0 matmat trajectory fork is the known-benign fp-order fork (force_matvec for bit-repro). Test:
+>   `make test-serve-batch` (tests/serve_batch.sh). **NEXT: S2 continuous batching (admit into freed slots) + S3 per-request
+>   SSE streaming compose; then validate THROUGHPUT on x86 EPYC (M1 is correctness-only — bandwidth-bound).**
+>   Per-request `.qvoice`/quant switching is out of scope (shared weights) — one loaded voice/quant per server instance.
 > - **TODO (BIG — the real server throughput feature) — SERVER REQUEST-BATCHING (continuous/dynamic batching).** User's
 >   idea (2026-06-08) and the intended use of the batched kernels: N concurrent requests from DIFFERENT users (different
 >   text/voice/params) stepped TOGETHER through Talker+CP (weight-stationary) → ~N× server throughput on bandwidth-bound

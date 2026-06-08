@@ -778,7 +778,12 @@ test-serve-repro: $(TARGET)
 
 # ── Combined server tests ──
 
-test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent
+# vLLM-style request-batching server: per-request correctness (force_matvec mel 1.0),
+# zero cross-talk, real batching ([BATCH] N req), production matmat + stream fallback.
+test-serve-batch: $(TARGET)
+	@bash tests/serve_batch.sh $(MODEL_SMALL)
+
+test-serve-all: test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch
 	@echo "=== All server tests passed ==="
 
 # ── RTF Benchmarks ──
@@ -917,7 +922,7 @@ test-en: test-small-en
 test-it-ryan: test-small-it
 
 .PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
-        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-all \
+        test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \
         test-small test-small-en test-small-it test-small-vivian test-small-stream test-small-stdout \
