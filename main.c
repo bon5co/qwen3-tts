@@ -863,6 +863,8 @@ int main(int argc, char **argv) {
     int batch_dry = 0;                /* --batch-dry: print the chunking and exit (no synth) */
     int run_batch_test = 0;           /* --batch-test: verify batched Talker step vs single-stream, exit */
     int run_batch_bench = 0;          /* --batch-bench: batched-compute throughput vs single-stream, exit */
+    int batch_multi_test = 0;         /* --batch-multi-test N: run N copies of the request through the
+                                         server batch-multi engine, write bm_<i>.wav each, exit */
     int seed = -1;       /* -1 = use time-based seed */
     float max_duration = 0;  /* 0 = no limit */
     int voice_design = 0;
@@ -931,6 +933,7 @@ int main(int argc, char **argv) {
         {"compose-pause", required_argument, 0, 1035},
         {"batch-test",    no_argument,       0, 1036},
         {"batch-bench",   no_argument,       0, 1037},
+        {"batch-multi-test", required_argument, 0, 1042},
         {"help",          no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -985,6 +988,7 @@ int main(int argc, char **argv) {
             case 1041: batch_mode = 1; batch_dry = 1; break;
             case 1036: run_batch_test = 1; break;
             case 1037: run_batch_bench = 1; break;
+            case 1042: batch_multi_test = atoi(optarg); if (batch_multi_test < 1) batch_multi_test = 1; break;
             case 1016: list_voices_dir = optarg; break;
             case 1017: delete_voice = optarg; break;
             case 'S': silent = 1; break;
@@ -2229,6 +2233,49 @@ int main(int argc, char **argv) {
         qwen_tts_unload(ctx);
         return rc;
     }
+    /* --batch-multi-test N: run N independent requests (same text, seed+i per slot)
+     * through the server batch-multi engine, write bm_<i>.wav each. Compare each to a
+     * single-stream run with --seed (seed+i) to validate per-slot RNG independence +
+     * no cross-talk. Exits. */
+    if (batch_multi_test > 0) {
+        int B = batch_multi_test;
+        qwen_batch_req_t *reqs = (qwen_batch_req_t *)calloc(B, sizeof(qwen_batch_req_t));
+        for (int b = 0; b < B; b++) {
+            reqs[b].text = text;
+            reqs[b].speaker_id = ctx->speaker_id;
+            reqs[b].language_id = ctx->language_id;
+            reqs[b].temperature = ctx->temperature;
+            reqs[b].top_k = ctx->top_k;
+            reqs[b].top_p = ctx->top_p;
+            reqs[b].rep_penalty = ctx->rep_penalty;
+            reqs[b].seed = ctx->seed + (uint32_t)b;
+            reqs[b].greedy_warmup = ctx->greedy_warmup;
+        }
+        float **outs = (float **)calloc(B, sizeof(float *));
+        int *outn = (int *)calloc(B, sizeof(int));
+        double t0 = 0;
+        int rc = qwen_tts_generate_batch_multi(ctx, reqs, B, outs, outn);
+        if (rc != 0) {
+            fprintf(stderr, "batch-multi-test: engine returned %d\n", rc);
+        } else {
+            for (int b = 0; b < B; b++) {
+                char fn[64]; snprintf(fn, sizeof(fn), "bm_%d.wav", b);
+                if (outs[b] && outn[b] > 0) {
+                    qwen_tts_write_wav(fn, outs[b], outn[b], QWEN_TTS_SAMPLE_RATE);
+                    fprintf(stderr, "  slot %d (seed %u): %d samples -> %s\n",
+                            b, reqs[b].seed, outn[b], fn);
+                } else {
+                    fprintf(stderr, "  slot %d (seed %u): EMPTY\n", b, reqs[b].seed);
+                }
+                free(outs[b]);
+            }
+        }
+        (void)t0;
+        free(outs); free(outn); free(reqs);
+        qwen_tts_unload(ctx);
+        return rc;
+    }
+
     /* --batch-bench: measure batched-compute throughput vs single-stream, then exit. */
     if (run_batch_bench) {
         int rc = qwen_batch_bench(ctx);

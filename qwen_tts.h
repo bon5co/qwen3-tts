@@ -640,6 +640,36 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text,
 int qwen_tts_generate_batch(qwen_tts_ctx_t *ctx, char **chunks, int nc,
                             float chunk_pause, float **out_samples, int *out_n_samples);
 
+/* ── Server request-batching (vLLM-style) ──────────────────────────────────
+ * One independent request per batch slot: different text, speaker, language and
+ * sampling params, producing SEPARATE outputs. This is the engine the concurrent
+ * server steps N users' requests through Talker+CP together (weight-stationary).
+ * Distinct from --batch (which splits ONE long text into chunks and concatenates).
+ *
+ * Per-request voice is limited to PRESET speakers (carried in the prompt → per-seq
+ * KV via prefill). A loaded custom .qvoice / quant mode is per-SERVER (shared
+ * weights), set at startup; not switchable per slot. */
+typedef struct {
+    const char *text;
+    int   speaker_id;     /* preset speaker for this request */
+    int   language_id;    /* language id for this request */
+    float temperature;
+    int   top_k;
+    float top_p;
+    float rep_penalty;
+    uint32_t seed;
+    int   greedy_warmup;
+} qwen_batch_req_t;
+
+/* Step `nc` independent requests together; each writes its OWN audio buffer into
+ * out_samples[i] (malloc'd, caller frees) and out_n_samples[i]. Per-slot sampling
+ * params + per-slot RNG state reproduce single-stream output bit-for-bit. Returns
+ * -2 if the model can't use the bf16 batched path. nc is capped internally per
+ * group (GMAX); the server scheduler controls admission. */
+int qwen_tts_generate_batch_multi(qwen_tts_ctx_t *ctx,
+                                  const qwen_batch_req_t *reqs, int nc,
+                                  float **out_samples, int *out_n_samples);
+
 /* Write WAV file */
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate);
 

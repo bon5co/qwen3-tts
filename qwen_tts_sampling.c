@@ -34,6 +34,11 @@ static float rand_uniform(void) {
 
 void qwen_set_seed(uint32_t seed) { g_seed = seed; }
 
+/* Read back the current RNG state. The batched-multi engine swaps RNG state
+ * per slot per frame (set seed[b], sample, save seed[b]) so each request
+ * reproduces the single-stream RNG sequence bit-for-bit even at temp>0. */
+uint32_t qwen_get_seed(void) { return g_seed; }
+
 /* Softmax with temperature */
 static void softmax(float *logits, int n, float temp) {
     float max_val = logits[0];
