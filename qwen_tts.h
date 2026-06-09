@@ -569,8 +569,15 @@ typedef struct qwen_tts_ctx {
     float *ml_steer;         /* [(num_layers+1) * hidden] per-layer steer, or NULL. */
     int    ml_steer_layers;  /* num_layers+1 */
     int    ml_steer_dim;     /* hidden */
-    float  ml_steer_weight;  /* injection scale */
+    float  ml_steer_weight;  /* injection scale (base, per-frame schedule applied on top) */
     int    ml_steer_l0, ml_steer_l1;  /* inclusive layer range to inject (e.g. 21..25) */
+    /* Per-frame application SCHEDULE (the fix for the energy-collapse spiral): a fixed
+     * additive bias every autoregressive frame compounds toward silence. Instead apply a
+     * decaying / first-N-frames "mood-set" pulse. The gen loop sets ml_steer_w_eff before
+     * each talker step; talker_step uses w_eff (NOT ml_steer_weight) and is 0 during prefill. */
+    float  ml_steer_decay;   /* per-frame multiplier g: eff = weight * g^frame (1.0 = no decay) */
+    int    ml_steer_frames;  /* apply only first N generation frames (0 = all frames) */
+    float  ml_steer_w_eff;   /* runtime: effective weight for the current talker step (0 = off) */
 
     /* Audio output buffer */
     float *audio_buf;

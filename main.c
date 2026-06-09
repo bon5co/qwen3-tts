@@ -19,6 +19,31 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
+/* bf16<->f32 helpers (local; for partial-strength WDELTA interpolation on .qvoice load) */
+static inline float main_bf16_to_f32(uint16_t bf) {
+    uint32_t bits = (uint32_t)bf << 16; float v; memcpy(&v, &bits, sizeof(v)); return v;
+}
+static inline uint16_t main_f32_to_bf16(float v) {
+    uint32_t bits; memcpy(&bits, &v, sizeof(bits)); return (uint16_t)(bits >> 16);
+}
+
+/* TARGETED WDELTA scale: apply base_alpha (<1) ONLY to the deep Talker attn/mlp projection
+ * weights (layers [l0,l1]) where the instruct/emotion response is gated. Keep FULL voice
+ * (alpha=1) on embeddings, text/codec projections, norms, early identity layers, and ALL
+ * code_predictor.* tensors — those carry timbre/gender, and uniform dilution flips them
+ * (observed: voice turning female / 'Chinese accent'). */
+static float qvoice_tensor_alpha(const char *tname, float base_alpha, int l0, int l1) {
+    if (base_alpha == 1.0f) return 1.0f;
+    const char *p = strstr(tname, "talker.model.layers.");   /* NOT talker.code_predictor.* */
+    if (!p) return 1.0f;
+    int layer = -1;
+    if (sscanf(p + 20, "%d", &layer) != 1) return 1.0f;       /* 20 = strlen("talker.model.layers.") */
+    if (layer < l0 || layer > l1) return 1.0f;                /* identity/early layers -> full voice */
+    if ((strstr(tname, ".self_attn.") || strstr(tname, ".mlp.")) && strstr(tname, "_proj.weight"))
+        return base_alpha;                                    /* attn/mlp projections only */
+    return 1.0f;                                              /* layernorms / q_norm / k_norm */
+}
+
 /* Print info about a .qvoice file. Returns 0 on success. */
 static int print_qvoice_info(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -877,6 +902,8 @@ int main(int argc, char **argv) {
     const char *ml_steer_path = NULL;  /* --ml-steer: multi-layer Talker emotion steer (.qlsteer) */
     float ml_steer_weight = 8.0f;      /* --ml-weight */
     int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
+    float ml_decay = 1.0f;             /* --ml-decay: per-frame weight multiplier (1.0=none) */
+    int ml_frames = 0;                 /* --ml-frames: apply only first N gen frames (0=all) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
@@ -911,6 +938,13 @@ int main(int argc, char **argv) {
     const char *target_cv_dir = NULL;
     int ctx_greedy_warmup = 0;
     float max_ref_duration = 30.0f;  /* default: use first 30s of ref audio */
+    float voice_strength = 1.0f;     /* --voice-strength: scale .qvoice WDELTA (1=full voice, <1=blend
+                                        toward CV model = less fidelity but more instruct/emotion response) */
+    int vs_l0 = 11, vs_l1 = 27;      /* --vs-layers: Talker layer range diluted by --voice-strength
+                                        (deep attn/mlp only; identity tensors stay at full voice) */
+    int icl_only = 0;                /* --icl-only: load a .qvoice's ICL prefix (speaker-emb + ref-codes)
+                                        but SKIP the WDELTA weight-swap → keep the instruct-capable CV weights
+                                        intact = clone-via-ICL + full instruct (the "graft" experiment) */
     int use_int8 = 0;
     int use_int4 = 0;
     static struct option long_options[] = {
@@ -939,6 +973,9 @@ int main(int argc, char **argv) {
         {"save-voice",    required_argument, 0, 1011},
         {"load-voice",    required_argument, 0, 1012},
         {"max-ref-duration", required_argument, 0, 1013},
+        {"voice-strength", required_argument, 0, 1049},
+        {"vs-layers",     required_argument, 0, 1050},
+        {"icl-only",      no_argument,       0, 1051},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"list-voices",   required_argument, 0, 1016},
@@ -954,6 +991,8 @@ int main(int argc, char **argv) {
         {"ml-steer",      required_argument, 0, 1044},
         {"ml-weight",     required_argument, 0, 1045},
         {"ml-range",      required_argument, 0, 1046},
+        {"ml-decay",      required_argument, 0, 1047},
+        {"ml-frames",     required_argument, 0, 1048},
         {"self-test",     no_argument,       0, 1027},
         {"matmat-bench",  no_argument,       0, 1038},
         {"roughness",     required_argument, 0, 1028},
@@ -1002,6 +1041,9 @@ int main(int argc, char **argv) {
             case 1011: save_voice = optarg; break;
             case 1012: load_voice = optarg; break;
             case 1013: max_ref_duration = (float)atof(optarg); break;
+            case 1049: voice_strength = (float)atof(optarg); break;
+            case 1050: { int a,b; if (sscanf(optarg,"%d-%d",&a,&b)==2){vs_l0=a;vs_l1=b;} break; }
+            case 1051: icl_only = 1; break;
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
             case 1022: voice_name = optarg; break;
@@ -1013,6 +1055,8 @@ int main(int argc, char **argv) {
             case 1044: ml_steer_path = optarg; break;
             case 1045: ml_steer_weight = atof(optarg); break;
             case 1046: { int a, b; if (sscanf(optarg, "%d-%d", &a, &b) == 2) { ml_l0 = a; ml_l1 = b; } break; }
+            case 1047: ml_decay = (float)atof(optarg); break;
+            case 1048: ml_frames = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
             case 1038: run_matmat_bench = 1; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
@@ -1068,6 +1112,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --list-voices <dir>        List .qvoice files in directory\n");
                 fprintf(stderr, "  --delete-voice <path>      Delete a .qvoice file\n");
                 fprintf(stderr, "  --max-ref-duration <secs>  Max ref audio for embedding (default: 30, 0=all)\n");
+                fprintf(stderr, "  --voice-strength <a>       .qvoice WDELTA scale (1=full voice; <1=more emotion, less fidelity)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
@@ -1233,7 +1278,13 @@ int main(int argc, char **argv) {
     }
 
     /* Multi-layer emotion steer (.qlsteer), if requested */
-    if (ml_steer_path) load_ml_steer(ctx, ml_steer_path, ml_steer_weight, ml_l0, ml_l1);
+    if (ml_steer_path) {
+        load_ml_steer(ctx, ml_steer_path, ml_steer_weight, ml_l0, ml_l1);
+        ctx->ml_steer_decay = ml_decay; ctx->ml_steer_frames = ml_frames;
+        if (ml_decay != 1.0f || ml_frames > 0)
+            fprintf(stderr, "ML-steer schedule: decay=%.3f/frame, first-frames=%d (0=all)\n",
+                    ml_decay, ml_frames);
+    }
 
     /* Set parameters */
     ctx->temperature = temperature;
@@ -1563,7 +1614,13 @@ int main(int argc, char **argv) {
                         fseek(vf, -1, SEEK_CUR);
                         is_wdelta = 1;
                     }
-                    if ((magic_read == 5 && memcmp(wfull_magic, "WFULL", 5) == 0) || is_wdelta) {
+                    if (icl_only && ((magic_read == 5 && memcmp(wfull_magic, "WFULL", 5) == 0) || is_wdelta)) {
+                        /* --icl-only: SKIP the entire WDELTA/WFULL weight-swap. The speaker-embedding +
+                         * ref-codes ICL prefix were already loaded above; leaving the model's own (CV)
+                         * weights intact lets us clone via ICL WITHOUT losing CV's instruct capability. */
+                        if (!silent)
+                            fprintf(stderr, "  --icl-only: skipping WDELTA weight-swap (ICL prefix only, CV weights intact)\n");
+                    } else if ((magic_read == 5 && memcmp(wfull_magic, "WFULL", 5) == 0) || is_wdelta) {
                         /* WDELTA: validate target model.
                          * Format v2: "WDLT" + target_hidden_size(u32) + n_tensors(u32) + ...
                          * Format v1 (legacy): "WDLT" + n_tensors(u32) + ... (no target_h)
@@ -1760,8 +1817,19 @@ int main(int argc, char **argv) {
                                         fread(lz4_data, 1, compressed_size, vf) == compressed_size) {
                                         LZ4_decompress_safe((const char *)lz4_data, (char *)delta16,
                                                              (int)compressed_size, (int)(n16 * sizeof(int16_t)));
-                                        for (size_t i = 0; i < n16; i++)
-                                            result[i] = (uint16_t)((int)cv_orig[i] + (int)delta16[i]);
+                                        float a = qvoice_tensor_alpha(tname, voice_strength, vs_l0, vs_l1);
+                                        if (a == 1.0f) {
+                                            for (size_t i = 0; i < n16; i++)
+                                                result[i] = (uint16_t)((int)cv_orig[i] + (int)delta16[i]);
+                                        } else {
+                                            /* Partial voice on this tensor: real-value lerp CV -> cloned
+                                             * by alpha (more instruct/emotion response, less fidelity). */
+                                            for (size_t i = 0; i < n16; i++) {
+                                                float vc  = main_bf16_to_f32(cv_orig[i]);
+                                                float vcl = main_bf16_to_f32((uint16_t)((int)cv_orig[i] + (int)delta16[i]));
+                                                result[i] = main_f32_to_bf16(vc + a * (vcl - vc));
+                                            }
+                                        }
                                         *target_ptr = result;
                                         loaded++;
                                         wfull_bytes += compressed_size;

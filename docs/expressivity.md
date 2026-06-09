@@ -17,9 +17,57 @@
 >   --instruct "Speak deeply sad and heartbroken, a slow broken voice on the verge of tears." \
 >   --text "Allora ti racconto una cosa successa oggi." -o sad.wav
 > ```
-> The `ryan` preset cross-speaks EN/IT/FR/ES well. **Caveat:** works on **preset** voices; a cloned
-> `.qvoice` resists instruct (the WDELTA weight-delta fossilizes the voice) — making clones emote is an
-> open research problem (naive activation steering via `QWEN_ACT_MAP`/`--ml-steer` collapses energy).
+> The `ryan` preset cross-speaks EN/IT/FR/ES well.
+
+> ## ★★ Emotion on a CLONED voice — the `--icl-only` graft (ear-validated 2026-06-09)
+> A normal `.qvoice` **resists instruct**: loading it SWAPS the CustomVoice (CV) weights for the
+> base-cloned weights, and the base weights follow an instruct ~**3.8× weaker** (measured: emotion
+> relative-shift 25% preset → 6.6% qvoice). The voice is faithful but emotionally frozen — and forcing it
+> (activation `--ml-steer`, or scaling the WDELTA via `--voice-strength`) either collapses energy or, on a
+> clone, distorts timbre/language ("Romanian-accent" / gender flips), because emotion & identity share weights.
+>
+> **The fix: keep the CV weights, graft only the clone's ICL prefix.** `--icl-only` loads a `.qvoice`'s
+> speaker-embedding + reference codec tokens (the in-context "voice prompt") but **SKIPS the WDELTA
+> weight-swap**. The instruct-capable CV weights stay intact, so the model does intelligent *mix-and-match*:
+> timbre/identity from the ICL prefix × emotion from the instruct.
+>
+> ```bash
+> # Galatea (a cloned .qvoice) speaking Italian, genuinely SAD — stays Galatea, adds a natural sigh:
+> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_17b.qvoice --icl-only \
+>   -l Italian --seed 42 -T 0.9 \
+>   --instruct "Speak in a sad, sorrowful, gloomy and downcast tone, voice low and heavy, on the verge of tears." \
+>   --text "Non posso credere a quello che mi è successo oggi, è incredibile." -o sad.wav
+> ```
+> Measured vs the frozen `.qvoice`: instruct response 6.6%→**12.6%** (≈2×), per-emotion movement reaches
+> preset grade (angry mel-vs-neutral 0.57→**0.35**), and emotions are **distinct** again (qvoice ang≈sad
+> 0.74 collapsed → graft 0.42; the matrix even tracks real relations, happy≈excited). At T0.9 it produced a
+> spontaneous trembling sigh before "è incredibile" — preset-grade paralinguistics on a clone.
+>
+> **Recipe knobs (ear-validated on Galatea):**
+> - `--icl-only` (load the `.qvoice` on the **CustomVoice** model, NOT base) + **English** instruct.
+> - **Temp ≈ 0.9 is the sweet spot.** T1.5 over-creates: stretches/drags words and adds spurious "eh…"
+>   interjections. T0.9 = clean, faithful, controlled natural expression. (It speaks the text faithfully —
+>   it does NOT paraphrase.)
+> - **Sad: just use a plain concise sad instruct at T0.9.** The low temp already avoids the word-stretching;
+>   adding an explicit "keep a natural pace, don't drag" to the instruct counter-intuitively made it SLOWER
+>   (ear-tested) — keep the instruct short.
+> - **Limit:** a naturally calm cloned voice gives *irritated/passive-aggressive* anger and a *veiled*
+>   sadness, not screaming rage (instruct response is ~half a preset's) — a structural ceiling of cloning.
+>
+> **What the graft CAN vs CANNOT mod (Galatea, ear-validated):** the ICL prefix is a strong speaker-IDENTITY
+> anchor, so the graft changes things *orthogonal* to identity but not identity itself:
+> - ✅ **Language** — Galatea wishing happy birthday in Spanish / German, keeping her timbre (cross-lingual
+>   clone, the official "Clone" feature).
+> - ✅ **Emotion / tone** — sad, angry (passive-aggressive), happy, excited — distinct and preset-grade.
+> - ❌ **Speaker identity** — gender / age / dialect barely move (the ICL prefix pins the speaker); higher temp
+>   doesn't unlock it, just adds artifacts. "young" → mostly faster speech; "feminine" on a male clone → an
+>   effeminate version of the same man, not a new female. (NB the `it_galatea_fasol` reference is actually
+>   **Riccardo Fasol, a male narrator** — "Galatea" is the book title — so our clone is correctly a man.)
+>
+> **Older clone levers (kept, default-off, for experiments):** CP control-vectors, `--voice-strength`
+> (targeted WDELTA scaling via `--vs-layers`), multi-layer `--ml-steer`. The `--icl-only` graft above is the
+> recommended way to emote a clone. NEXT (PLAN.md "official models re-analysis"): graft directly on a fresh
+> `--ref-audio` clone, on the VoiceDesign model, and whether CV/VD can ingest ref-audio natively.
 
 Qwen3-TTS's built-in `--instruct` at the default temp barely changes delivery (see the recipe above to
 fix that). This engine also adds two CPU-side levers that act directly on the

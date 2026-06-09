@@ -1257,6 +1257,10 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     /* Reset KV cache to the reusable prefix length */
     ctx->kv_len = delta_start;
 
+    /* No emotion steering during prefill (the gen loop sets w_eff per frame). Reset here
+     * so a server-reused ctx doesn't inherit the previous request's effective weight. */
+    ctx->ml_steer_w_eff = 0.0f;
+
     double t_prefill = time_ms();
     if (delta_start < prefill_len) {
         if (delta_start > 0) {
@@ -1529,6 +1533,16 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
                     frame, step_embed[0], step_embed[1], step_embed[2], step_embed[3], step_embed[4]);
             fprintf(stderr, "  [frame %d] PRE last_hidden[:5]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
                     frame, last_hidden[0], last_hidden[1], last_hidden[2], last_hidden[3], last_hidden[4]);
+        }
+        /* Multi-layer emotion steer schedule: per-frame effective weight (mood-set pulse,
+         * not a constant bias). 0 during prefill (set here, per generation frame). */
+        if (ctx->ml_steer && ctx->ml_steer_weight != 0.0f) {
+            if (ctx->ml_steer_frames > 0 && frame >= ctx->ml_steer_frames) {
+                ctx->ml_steer_w_eff = 0.0f;
+            } else {
+                float g = ctx->ml_steer_decay > 0.0f ? ctx->ml_steer_decay : 1.0f;
+                ctx->ml_steer_w_eff = ctx->ml_steer_weight * powf(g, (float)frame);
+            }
         }
         double t_step_start = time_ms();
         if (qwen_talker_step(ctx, step_embed, last_hidden) != 0) {

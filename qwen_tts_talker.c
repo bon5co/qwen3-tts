@@ -594,10 +594,10 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
          * additive bias every frame drives the autoregressive loop into an
          * energy-collapse spiral (fades to silence) — norm-preservation fixes that.
          * Then re-norm the next layer's input so the rotation propagates. */
-        if (ctx->ml_steer && ctx->ml_steer_weight != 0.0f &&
+        if (ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f &&
             layer >= ctx->ml_steer_l0 && layer <= ctx->ml_steer_l1) {
             const float *sv = ctx->ml_steer + (size_t)layer * ctx->ml_steer_dim;
-            float w = ctx->ml_steer_weight;
+            float w = ctx->ml_steer_w_eff;
             float n0 = 0.0f, n1 = 0.0f;
             for (int i = 0; i < h; i++) n0 += ctx->dec_x[i] * ctx->dec_x[i];
             for (int i = 0; i < h; i++) ctx->dec_x[i] += w * sv[i];
