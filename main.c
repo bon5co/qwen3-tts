@@ -878,6 +878,197 @@ static int run_compose(qwen_tts_ctx_t *ctx, const char *spec, const char *langua
     return rc;
 }
 
+/* Apply a `<lang>.expr` micro-file: an additive emotion/expressivity weight delta
+ * (the fine-tune's L16-26 attn+gate change) on TOP of the currently-loaded talker
+ * weights. The file body is a standard "WDLT" stream (same encoding as the .qvoice
+ * WDELTA section): int16 bit-pattern deltas + LZ4. Reconstruct result = current + delta
+ * (mod 2^16 on the bf16 bits) → on a CV preset or an --icl-only graft (CV weights intact)
+ * this restores the fine-tuned weights EXACTLY on the changed tensors. Composable with a
+ * voice (the voice's ICL/x-vector loads separately; this only touches the backbone weights).
+ * Returns 0 on success (>=1 tensor applied), -1 on error. */
+static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_weight, int silent) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Error: cannot open --expr file %s\n", path); return -1; }
+    char magic[4];
+    char lang[16] = {0};
+    uint32_t version = 0, reserved = 0;
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "QEXP", 4) != 0) {
+        fprintf(stderr, "Error: %s is not a valid .expr file (bad magic)\n", path);
+        fclose(f); return -1;
+    }
+    fread(&version, sizeof(uint32_t), 1, f);
+    fread(lang, 1, 16, f);
+    fread(&reserved, sizeof(uint32_t), 1, f);
+    char wmagic[4];
+    if (fread(wmagic, 1, 4, f) != 4 || memcmp(wmagic, "WDLT", 4) != 0) {
+        fprintf(stderr, "Error: %s missing WDLT stream\n", path);
+        fclose(f); return -1;
+    }
+    uint32_t target_h = 0, n_tensors = 0;
+    fread(&target_h, sizeof(uint32_t), 1, f);
+    fread(&n_tensors, sizeof(uint32_t), 1, f);
+    if ((int)target_h != ctx->config.hidden_size) {
+        fprintf(stderr, "Error: .expr is for hidden=%u but model has hidden=%d (model/.expr mismatch)\n",
+                target_h, ctx->config.hidden_size);
+        fclose(f); return -1;
+    }
+
+    int nl = ctx->config.num_layers;
+    int inter = ctx->config.intermediate_size;
+    int loaded = 0;
+
+    for (uint32_t t = 0; t < n_tensors; t++) {
+        uint16_t name_len;
+        if (fread(&name_len, sizeof(uint16_t), 1, f) != 1) break;
+        char tname[256] = {0};
+        if (name_len >= 256) break;
+        fread(tname, 1, name_len, f);
+        uint32_t data_bytes;
+        fread(&data_bytes, sizeof(uint32_t), 1, f);
+        uint8_t dtype_flag = 0;
+        uint32_t comp_size = 0;
+        fread(&dtype_flag, 1, 1, f);
+        fread(&comp_size, sizeof(uint32_t), 1, f);
+
+        /* Resolve tname -> the weight pointer to override. bf16 weight matrices use the
+         * int16-delta path (dtype 4); RMSNorm weights are f32 in the engine and use raw
+         * f32 replacement (dtype 0). */
+        void **target_ptr = NULL;
+        int is_f32 = 0;
+        if (strcmp(tname, "talker.model.text_embedding.weight") == 0)
+            target_ptr = (void **)&ctx->tok_embeddings_bf16;
+        else if (strcmp(tname, "talker.text_projection.linear_fc1.weight") == 0)
+            target_ptr = (void **)&ctx->text_proj_fc1_bf16;
+        else if (strcmp(tname, "talker.text_projection.linear_fc2.weight") == 0)
+            target_ptr = (void **)&ctx->text_proj_fc2_bf16;
+        else if (strcmp(tname, "talker.model.codec_embedding.weight") == 0)
+            target_ptr = (void **)&ctx->codec_embedding_bf16;
+        else if (strcmp(tname, "talker.codec_head.weight") == 0)
+            target_ptr = (void **)&ctx->codec_head_bf16;
+        else {
+            int layer = -1;
+            sscanf(tname, "talker.model.layers.%d.", &layer);
+            if (layer >= 0 && layer < nl) {
+                qwen_talker_layer_t *l = &ctx->layers[layer];
+                char *suffix = strstr(tname, "self_attn.");
+                if (!suffix) suffix = strstr(tname, "mlp.");
+                if (suffix) {
+                    if (strstr(suffix, "q_proj.weight"))      target_ptr = (void **)&l->wq_bf16;
+                    else if (strstr(suffix, "k_proj.weight")) target_ptr = (void **)&l->wk_bf16;
+                    else if (strstr(suffix, "v_proj.weight")) target_ptr = (void **)&l->wv_bf16;
+                    else if (strstr(suffix, "o_proj.weight")) target_ptr = (void **)&l->wo_bf16;
+                    else if (strstr(suffix, "gate_proj.weight")) target_ptr = (void **)&l->gate_bf16;
+                    else if (strstr(suffix, "up_proj.weight"))   target_ptr = (void **)&l->up_bf16;
+                    else if (strstr(suffix, "down_proj.weight")) target_ptr = (void **)&l->down_bf16;
+                    else if (strstr(suffix, "q_norm.weight")) { target_ptr = (void **)&l->q_norm; is_f32 = 1; }
+                    else if (strstr(suffix, "k_norm.weight")) { target_ptr = (void **)&l->k_norm; is_f32 = 1; }
+                    else if (strstr(suffix, "input_layernorm.weight"))      { target_ptr = (void **)&l->input_norm; is_f32 = 1; }
+                    else if (strstr(suffix, "post_attention_layernorm.weight")) { target_ptr = (void **)&l->post_attn_norm; is_f32 = 1; }
+                }
+            }
+        }
+
+        if (target_ptr && is_f32 && dtype_flag == 0) {
+            /* RMSNorm f32 replacement: read the full f32 array and swap the pointer. */
+            void *buf = malloc(comp_size);
+            if (buf && fread(buf, 1, comp_size, f) == comp_size) {
+                *target_ptr = buf;
+                loaded++;
+            } else {
+                free(buf);
+                fseek(f, comp_size, SEEK_CUR);
+            }
+        } else if (target_ptr && !is_f32 && dtype_flag == 4) {
+            size_t n16 = data_bytes / 2;
+            uint8_t *lz4_data = (uint8_t *)malloc(comp_size);
+            int16_t *delta16 = (int16_t *)malloc(n16 * sizeof(int16_t));
+            uint16_t *result = (uint16_t *)malloc(data_bytes);
+            const uint16_t *cur = (const uint16_t *)*target_ptr;
+            if (lz4_data && delta16 && result && cur &&
+                fread(lz4_data, 1, comp_size, f) == comp_size &&
+                LZ4_decompress_safe((const char *)lz4_data, (char *)delta16,
+                                    (int)comp_size, (int)(n16 * sizeof(int16_t))) == (int)(n16 * sizeof(int16_t))) {
+                for (size_t i = 0; i < n16; i++)
+                    result[i] = (uint16_t)((int)cur[i] + (int)delta16[i]);
+                *target_ptr = result;
+                loaded++;
+            } else {
+                free(result);
+            }
+            free(lz4_data); free(delta16);
+        } else if (target_ptr && !is_f32 && dtype_flag == 5) {
+            /* LoRA factors: payload = u32 r, u32 in, u32 out, f32 scale, A[r*in] f32, B[out*r] f32.
+             * Reconstruct delta = scale*(B@A) [out,in] and add to the bf16 weight, row by row. */
+            uint8_t *pl = (uint8_t *)malloc(comp_size);
+            if (pl && fread(pl, 1, comp_size, f) == comp_size && comp_size >= 16) {
+                uint32_t r, n_in, n_out; float scale;
+                memcpy(&r, pl, 4); memcpy(&n_in, pl + 4, 4);
+                memcpy(&n_out, pl + 8, 4); memcpy(&scale, pl + 12, 4);
+                scale *= expr_weight;   /* --expr-weight: dose the LoRA delta (factored only) */
+                const float *A  = (const float *)(pl + 16);                       /* [r, in]  */
+                const float *Bm = (const float *)(pl + 16 + (size_t)r * n_in * 4);/* [out, r] */
+                const uint16_t *cur = (const uint16_t *)*target_ptr;
+                uint16_t *result = (uint16_t *)malloc((size_t)n_out * n_in * sizeof(uint16_t));
+                float *drow = (float *)malloc((size_t)n_in * sizeof(float));
+                int ok = (size_t)16 + (size_t)r*(n_in+n_out)*4 == (size_t)comp_size;
+                if (result && drow && cur && ok) {
+                    for (uint32_t o = 0; o < n_out; o++) {
+                        for (uint32_t i = 0; i < n_in; i++) drow[i] = 0.0f;
+                        for (uint32_t k = 0; k < r; k++) {
+                            float bok = scale * Bm[(size_t)o * r + k];
+                            const float *Ar = A + (size_t)k * n_in;
+                            for (uint32_t i = 0; i < n_in; i++) drow[i] += bok * Ar[i];
+                        }
+                        const uint16_t *cr = cur + (size_t)o * n_in;
+                        uint16_t *rr = result + (size_t)o * n_in;
+                        for (uint32_t i = 0; i < n_in; i++)
+                            rr[i] = main_f32_to_bf16(main_bf16_to_f32(cr[i]) + drow[i]);
+                    }
+                    *target_ptr = result; loaded++;
+                } else { free(result); }
+                free(drow);
+            }
+            free(pl);
+        } else {
+            /* Unknown tensor or unsupported dtype — skip its payload. */
+            fseek(f, comp_size, SEEK_CUR);
+        }
+    }
+    fclose(f);
+
+    /* Rebuild gate_up_fused for talker layers (gate_proj changed). */
+    int h = ctx->config.hidden_size;
+    for (int li = 0; li < nl; li++) {
+        qwen_talker_layer_t *l = &ctx->layers[li];
+        if (l->gate_bf16 && l->up_bf16 && l->gate_up_fused_bf16) {
+            size_t row_bytes = (size_t)h * sizeof(uint16_t);
+            for (int r = 0; r < inter; r++) {
+                memcpy(l->gate_up_fused_bf16 + (size_t)(2*r)*h,   l->gate_bf16 + (size_t)r*h, row_bytes);
+                memcpy(l->gate_up_fused_bf16 + (size_t)(2*r+1)*h, l->up_bf16   + (size_t)r*h, row_bytes);
+            }
+        }
+    }
+
+    /* In INT8 mode the quantized weights were built from the pre-delta bf16 —
+     * re-quantize from the overridden bf16 so the delta is honored (mirrors the
+     * .qvoice WDELTA path). NOTE: int4 (Q4_0) re-quant after weight override is not
+     * yet wired here — .expr in --int4 mode would ignore the delta (TODO). */
+    if (loaded > 0 && ctx->use_int8) {
+        extern void qwen_talker_quantize_int8(qwen_tts_ctx_t *ctx);
+        extern void qwen_cp_quantize_int8(qwen_tts_ctx_t *ctx);
+        if (!silent) fprintf(stderr, "  Re-quantizing INT8 from .expr-overridden weights...\n");
+        qwen_talker_quantize_int8(ctx);
+        qwen_cp_quantize_int8(ctx);
+    } else if (loaded > 0 && ctx->use_int4 && !silent) {
+        fprintf(stderr, "  Warning: --expr in --int4 mode does not yet re-quantize; delta ignored.\n");
+    }
+
+    if (!silent)
+        fprintf(stderr, "Expressivity: applied %d/%u tensors from %s (lang=%s)\n",
+                loaded, n_tensors, path, lang[0] ? lang : "?");
+    return loaded > 0 ? 0 : -1;
+}
+
 int main(int argc, char **argv) {
     const char *model_dir = NULL;
     const char *text = NULL;
@@ -932,6 +1123,8 @@ int main(int argc, char **argv) {
     int xvector_only = 0;
     const char *save_voice = NULL;
     const char *load_voice = NULL;
+    const char *expr_path = NULL;    /* --expr: additive expressivity weight delta (<lang>.expr) */
+    float expr_weight = 1.0f;        /* --expr-weight: dose a factored-LoRA .expr (1=as trained) */
     const char *list_voices_dir = NULL;
     const char *delete_voice = NULL;
     const char *voice_name = NULL;
@@ -982,6 +1175,8 @@ int main(int argc, char **argv) {
         {"icl-only",      no_argument,       0, 1051},
         {"icl-frames",    required_argument, 0, 1052},
         {"graft",         no_argument,       0, 1053},
+        {"expr",          required_argument, 0, 1054},
+        {"expr-weight",   required_argument, 0, 1055},
         {"silent",        no_argument,       0, 'S'},
         {"debug",         no_argument,       0, 'D'},
         {"list-voices",   required_argument, 0, 1016},
@@ -1052,6 +1247,8 @@ int main(int argc, char **argv) {
             case 1051: icl_only = 1; break;
             case 1052: icl_frames = atoi(optarg); break;
             case 1053: graft = 1; icl_only = 1; break;  /* --graft implies --icl-only (skip WDELTA too) */
+            case 1054: expr_path = optarg; break;        /* --expr <lang>.expr expressivity delta */
+            case 1055: expr_weight = atof(optarg); break;/* --expr-weight: scale factored-LoRA delta */
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
             case 1022: voice_name = optarg; break;
@@ -1123,6 +1320,8 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --voice-strength <a>       .qvoice WDELTA scale (1=full voice; <1=more emotion, less fidelity)\n");
                 fprintf(stderr, "  --icl-frames <N>           Cap ICL ref frames (dilute prosody anchor; more emotion; 0=all)\n");
                 fprintf(stderr, "  --graft                    Ignore lite .qvoice ref_codes; clone via x-vector (emotive; use with --instruct)\n");
+                fprintf(stderr, "  --expr <file>              Apply a <lang>.expr expressivity weight delta on top (composable with any voice; 1.7B)\n");
+                fprintf(stderr, "  --expr-weight <m>          Dose a factored-LoRA .expr (1=as trained, 0.6=subtler, 1.3=stronger)\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
@@ -2359,6 +2558,19 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Voice profile created. Use --load-voice to generate speech.\n");
         qwen_tts_unload(ctx);
         return 0;
+    }
+
+    /* --expr: apply the expressivity weight delta on top of the loaded (preset/clone)
+     * weights. After the voice block + before any generation/serve dispatch, so single,
+     * batch and server paths all use the expressivity-enhanced backbone. 1.7B only. */
+    if (expr_path) {
+        if (ctx->config.hidden_size < 2048) {
+            fprintf(stderr, "Warning: --expr is only supported on the 1.7B model (ignored)\n");
+        } else if (apply_expr_file(ctx, expr_path, expr_weight, silent) != 0) {
+            fprintf(stderr, "Error: failed to apply --expr file %s\n", expr_path);
+            qwen_tts_unload(ctx);
+            return 1;
+        }
     }
 
     /* --batch-test: verify the OPT-IN batched Talker step matches single-stream, then exit. */

@@ -171,6 +171,32 @@ Works with `--instruct`, streaming, and the HTTP server.
 
 > Full guide: delta vs standard, format internals, troubleshooting → [docs/custom-voices.md](docs/custom-voices.md)
 
+### Expressivity packs `.expr` (per-language emotion, 1.7B)
+
+A tiny, composable **expressivity adapter** that makes any voice — a preset or a cloned
+`.qvoice` — speak a language more naturally **and** emote, without shipping a second multi-GB
+model. It's a small LoRA delta on the Talker's emotion layers, applied at load with `--expr`.
+
+```bash
+# preset voice + Italian expressivity pack
+./qwen_tts -d qwen3-tts-1.7b -s vivian -l Italian -T 1.1 \
+    --expr presets/expr/italian_r32.expr \
+    --instruct "Speak with hot, furious anger, sharp and forceful." \
+    --text "Allora, lascia che ti spieghi come stanno le cose." -o angry.wav
+
+# cloned voice (graft) — use the higher-rank pack for clones
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/myvoice.qvoice --icl-only -l Italian -T 1.1 \
+    --expr presets/expr/italian_r64.expr --instruct "..." --text "..." -o out.wav
+```
+
+- **Preset → `_r32` pack; cloned voice → `_r64`** (a clone's identity damps emotion, so it needs
+  more capacity). `--expr-weight <m>` doses it (1.0 = as trained, 0.6 = subtler).
+- Instruct in **English/Chinese**, spoken text in the target language, temperature **1.1–1.3**.
+- `.expr` files are artifacts (host on releases); **train your own for any language** with the
+  reusable recipe in [`training/expressivity-lora/`](training/expressivity-lora/).
+
+> How it works (which layers, why it's only ~16–63 MB, the file format) → [docs/expressivity-lora.md](docs/expressivity-lora.md)
+
 ### HTTP Server
 
 ```bash
@@ -319,6 +345,7 @@ total throughput on bandwidth-bound boxes. Measure it on your CPU with `make ben
 | [Server request-batching](docs/server-batching.md) | vLLM-style `--batch-size N`: serve N concurrent users together, continuous batching, per-request streaming |
 | [VoiceDesign](docs/voice-design.md) | Creating voices from text descriptions |
 | [Expressivity](docs/expressivity.md) | `--emotion` compound moods + presets, mood blending, `--roughness`, `--rate`/`--volume`, building your own control vectors |
+| [Expressivity packs `.expr`](docs/expressivity-lora.md) | Per-language emotion LoRA: which layers, why it's ~16–63 MB, file format, `--expr`/`--expr-weight`, per-voice rank. Train your own: [`training/expressivity-lora/`](training/expressivity-lora/) |
 | [Inline markup](docs/markup.md) | Audiobook/podcast tags in `--text`: `[sad]`/`[excited]` mid-text emotion switches, `[sigh]`/`[huff]` fillers, `[pause:400ms]` |
 | [Quantization](docs/quantization.md) | INT8/INT4, comparison table, recommendations |
 | [Performance](docs/performance.md) | RTF benchmarks, component breakdown, CPU vs GPU, optimization history |
