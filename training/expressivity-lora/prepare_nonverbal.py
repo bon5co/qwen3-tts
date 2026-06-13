@@ -56,8 +56,9 @@ _STRIP = re.compile("[\U0000FE00-\U0000FE0F\U0001F3FB-\U0001F3FF\U0000200D]")  #
 
 
 def map_text(text, hist, kept, dropped):
-    """Replace inline emoji with markers; strip unknowns. Mutates the counters."""
-    out, i = [], 0
+    """Replace inline emoji with markers; strip unknowns. Mutates the counters.
+    Returns (clean_text, markers_present_set)."""
+    out, i, markers = [], 0, set()
     for m in _EMOJI_RE.finditer(text):
         out.append(text[i:m.start()])
         base = _STRIP.sub("", m.group(0))
@@ -67,11 +68,12 @@ def map_text(text, hist, kept, dropped):
             # pad with spaces so the marker is a standalone token, then squeeze later
             out.append(f" {mark} ")
             kept[base] += 1
+            markers.add(mark)
         else:
             dropped[base] += 1   # unknown emoji -> stripped (append nothing)
         i = m.end()
     out.append(text[i:])
-    return re.sub(r"\s+", " ", "".join(out)).strip()
+    return re.sub(r"\s+", " ", "".join(out)).strip(), markers
 
 
 def main():
@@ -85,6 +87,12 @@ def main():
     ap.add_argument("--max-rows", type=int, default=0, help="cap rows for a quick smoke (0 = all)")
     ap.add_argument("--keep-unmapped", action="store_true",
                     help="keep rows whose ONLY nonverbal emoji were unmapped/stripped")
+    ap.add_argument("--cap-per-marker", type=int, default=0,
+                    help="balance: cap clips per marker; skip a clip if ALL its markers are at cap "
+                         "(0 = off). Tames the breath-heavy distribution that over-forces the LoRA.")
+    ap.add_argument("--neutral", type=int, default=0,
+                    help="ANCHOR: keep up to N marker-FREE (plain) clips as emotion=neutral/instruct='' "
+                         "(0 = old behaviour: drop all plain clips). The plain baseline = 'force less'.")
     ap.add_argument("--histogram", action="store_true",
                     help="scan emoji frequency and EXIT (no audio written) — run this first")
     ap.add_argument("--out_dir", default="data_nv")
@@ -99,7 +107,7 @@ def main():
 
     if args.histogram:
         for ex in ds:
-            map_text(ex[args.text_col] or "", hist, kept, dropped)
+            map_text(ex[args.text_col] or "", hist, kept, dropped)[0]
         print(f"emoji histogram over {len(ds)} rows of {args.hf}[{args.split}]:")
         for cp, n in hist.most_common():
             mark = EMOJI_MARKER.get(cp, "  (UNMAPPED -> stripped)")
@@ -110,35 +118,49 @@ def main():
     import librosa, soundfile as sf
     wav_dir = os.path.join(args.out_dir, "wav24k"); os.makedirs(wav_dir, exist_ok=True)
     out_jsonl = os.path.join(args.out_dir, "train_raw.jsonl")
-    rows, skipped_q, skipped_nonv = 0, 0, 0
-    n_written = 0
+    skipped_q, skipped_nonv, skipped_cap = 0, 0, 0
+    n_written, n_neutral = 0, 0
+    marker_clips = Counter()   # clips written that contain each marker (for --cap-per-marker)
+
+    def write_clip(ex, idx, text, emo):
+        a = ex["audio"]   # {'bytes': <encoded>, 'path': ...} (decode disabled -> no torchcodec)
+        wav, sr = sf.read(io.BytesIO(a["bytes"]), dtype="float32", always_2d=False)
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)   # stereo -> mono
+        y = librosa.resample(wav, orig_sr=sr, target_sr=24000) if sr != 24000 else wav
+        out = os.path.join(wav_dir, f"{idx:06d}.wav")
+        sf.write(out, y, 24000, subtype="PCM_16")
+        f.write(json.dumps({"audio": out, "text": text, "ref_audio": out,
+                            "instruct": "", "emotion": emo}, ensure_ascii=False) + "\n")
+
     with open(out_jsonl, "w") as f:
         for idx, ex in enumerate(ds):
-            if args.max_rows and n_written >= args.max_rows:
-                break
             if args.min_dnsmos and (ex.get("dnsmos") or 0) < args.min_dnsmos:
                 skipped_q += 1; continue
-            raw = ex[args.text_col] or ""
-            n_before = sum(kept.values())
-            text = map_text(raw, hist, kept, dropped)
-            had_marker = sum(kept.values()) > n_before
-            if not had_marker and not args.keep_unmapped:
-                skipped_nonv += 1; continue   # no usable nonverbal -> not useful for THIS LoRA
-            a = ex["audio"]   # {'bytes': <encoded>, 'path': ...} (decode disabled -> no torchcodec)
-            wav, sr = sf.read(io.BytesIO(a["bytes"]), dtype="float32", always_2d=False)
-            if wav.ndim > 1:
-                wav = wav.mean(axis=1)   # stereo -> mono
-            y = librosa.resample(wav, orig_sr=sr, target_sr=24000) if sr != 24000 else wav
-            out = os.path.join(wav_dir, f"{idx:06d}.wav")
-            sf.write(out, y, 24000, subtype="PCM_16")
-            emo = (ex.get(args.emotion_col) or "neutral").strip().lower()
-            f.write(json.dumps({"audio": out, "text": text, "ref_audio": out,
-                                "instruct": "", "emotion": emo}, ensure_ascii=False) + "\n")
-            n_written += 1
+            text, markers = map_text(ex[args.text_col] or "", hist, kept, dropped)
 
-    print(f"wrote {n_written} rows -> {out_jsonl}")
-    print(f"  skipped: {skipped_q} low-DNSMOS (<{args.min_dnsmos}), {skipped_nonv} no-nonverbal")
-    print(f"  markers kept: {dict(Counter({EMOJI_MARKER[c]: n for c, n in kept.items()}))}")
+            if not markers and not args.keep_unmapped:
+                # PLAIN clip -> use as the neutral anchor (force less), up to --neutral
+                if args.neutral and n_neutral < args.neutral:
+                    write_clip(ex, idx, text, "neutral"); n_neutral += 1
+                else:
+                    skipped_nonv += 1
+                continue
+
+            # MARKED clip — balance: skip if ALL its markers already hit the cap
+            if args.cap_per_marker and markers and all(marker_clips[m] >= args.cap_per_marker for m in markers):
+                skipped_cap += 1; continue
+            for m in markers:
+                marker_clips[m] += 1
+            emo = (ex.get(args.emotion_col) or "neutral").strip().lower()
+            write_clip(ex, idx, text, emo)
+            n_written += 1
+            if args.max_rows and n_written >= args.max_rows:
+                break
+
+    print(f"wrote {n_written} marked + {n_neutral} neutral = {n_written + n_neutral} rows -> {out_jsonl}")
+    print(f"  skipped: {skipped_q} low-DNSMOS, {skipped_nonv} plain(no-anchor), {skipped_cap} over-cap")
+    print(f"  marker CLIP counts (balanced): {dict(marker_clips)}")
     if dropped:
         print(f"  emoji stripped (unmapped): {sum(dropped.values())} occ across {len(dropped)} kinds "
               f"-> rerun with --histogram to inspect")
