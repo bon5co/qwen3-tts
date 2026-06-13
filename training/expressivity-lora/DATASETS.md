@@ -231,9 +231,12 @@ constraint they're now USABLE. Ranked by quality + downloadability:
 
 ### Priority order (relaxed license → rank by downloadability + base-need)
 1. **🇷🇺 RU — RESD** — instant HF download, MIT, RU non-native (needs data most). **In training now.**
-2. **🇯🇵 JA — JVNV** — instant HF download, 6 emotions studio, light. But JA may be **near-native** in
-   Qwen3-TTS → **free ear-check of base JA (ryan/vivian) FIRST**; likely only an *emotion* LoRA needed.
-   Second target precisely because it's the other instant-download set.
+2. **🇯🇵 JA — ✅ RESOLVED: ship base+instruct, NO LoRA.** Hypothesis CONFIRMED (ear, user 2026-06-13):
+   base JA is near-native/excellent; a JVNV LoRA only DEGRADES it (happy rushes, angry mismatches). Tried
+   two trainings (JVNV-only, then JVNV+300 JSUT neutral anchor to fix the no-neutral over-forcing, loss
+   3.91) — both worse than base. JVNV's no-neutral was a real flaw (fixed in v2) but the verdict held:
+   **JA doesn't need a language LoRA**, emotion comes from EN-instruct+temp on the base. Not worth more
+   compute. (`prepare_jvnv.py`/`prepare_jsut_neutral.py` kept as tooling; pack shelved, don't ship.)
 3. **🇧🇷 PT — ✅ DONE, no dataset** — use the **Spanish pack on PT text** (Romance transfer, ear-confirmed);
    shipped as `portuguese_bb027_r32.expr`. VERBO is dead; no PT corpus needed.
 4. **🇰🇷 KO — ETOD** — well-tagged/light/studio (4 emotions + transcripts), usable now. **5% sample is
@@ -250,7 +253,7 @@ constraint they're now USABLE. Ranked by quality + downloadability:
 | 🇷🇺 RU | `russian_bb027_r32.expr` | RESD (MIT) | 4.64 | **0.2** (full rushes the pace; 0.2 ≈ natural, base-like duration) |
 | 🇰🇷 KO | `korean_bb027_r32.expr` | ETOD 5% (NC) | 4.30 | **~0.6–1.0** (duration stable at full; sad@0.6+EN-instruct = TOP) |
 | 🇧🇷 PT | `portuguese_bb027_r32.expr` | = Spanish pack (transfer) | — | **~0.6** |
-| 🇯🇵 JA | `japanese_bb027_r32.expr` | JVNV (CC-BY-SA) | _training_ | _TBD after A/B_ |
+| 🇯🇵 JA | ❌ **NO LoRA — ship base+instruct** | (JVNV experiment) | 3.91 | — (base is better; LoRA degrades) |
 All broad-band L00-27 r32, 1.7B, ~90MB factored. Apply: `-l <Lang> --expr <pack> --expr-weight <w>` +
 EN instruct (`-I`) at `-T 1.1` for emotion. RU's low weight = the LoRA over-forces pace on a non-native
 language; KO/PT don't (KO native-ish, PT rides the Spanish pack).
