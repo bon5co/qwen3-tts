@@ -90,3 +90,61 @@ the spontaneous ones need ASR.
 For each: aim for ≥ a few hundred clips across ≥ several speakers and the full emotion set; map each
 emotion to a vivid **English** instruct (see `prepare_manifest.py`'s `EMOTION_INSTRUCT`); then run the
 4-step pipeline. More & varied data → richer expressivity and better language-prosody/timbre.
+
+---
+
+# Paralinguistics (nonverbal vocalizations) — sighs / laughs / breaths
+
+A SEPARATE track from the emotion packs above: train a LoRA that emits **non-verbal vocalizations
+INLINE inside running speech** (speech → `[sigh]` → speech). This needs corpora where the event is
+**transcribed inline** within the sentence — NOT isolated SFX clips (VocalSound / AudioSet "Laughter"
+classes train a *classifier*, useless for TTS). Ingestion: **`prepare_nonverbal.py`** (sibling of
+`prepare_manifest.py`; handles HF in-memory audio + emoji→`[marker]` inline mapping).
+
+## Survey verdict (2026-06-12, deep-research, 18 sources, adversarially verified)
+
+**No dataset is permissive + inline-tagged + multilingual + clean all at once** — every candidate
+fails ≥1 axis, and **there is ZERO cross-lingual inline-paralinguistic data**: only **English** and
+**Mandarin** inline corpora exist (no IT/DE/ES/FR tagged inline).
+
+| dataset | inline tags? | license | lang | audio | verdict |
+|---|---|---|---|---|---|
+| **NonverbalTTS** (`deepvk/NonverbalTTS`) | ✅ **best** — 10 events mid-sentence, as **EMOJI** (🤣🌬😤…) | ⚠️ **CC BY-NC-SA** annot. + audio inherits VoxCeleb/Expresso (HF `apache-2.0` tag is **contradicted** by the README/paper — treat as **research-only**) | EN | VoxCeleb=YouTube (not studio) + Expresso | **#1 for the THEORY proof** (not shippable) |
+| **NVSpeech** ([arXiv 2508.04195](https://arxiv.org/html/2508.04195v1)) | ✅ true inline tokens `"…funny [Laughter]"` | ⚠️ unverified; manual subset Private, auto-labeled Public | **ZH only** | unverified | largest (573h); ZH-only |
+| **Expresso** (Meta) | ❌ non_verbal/laughing are **STYLE clips**, not inline | ❌ **CC BY-NC** | EN | ✅ 48kHz studio | clean but NC + not inline |
+| **LibriTTS-R** ([OpenSLR 141](https://www.openslr.org/141/)) | ❌ **zero** paralinguistic tags | ✅ **CC BY 4.0 (shippable!)** | EN | ✅ 24kHz clean | the only commercial base → **auto-tag it ourselves** |
+| EARS / RAVDESS / IEMOCAP / Switchboard-Fisher | ❌ clips or 2 fixed sents | ❌ NC / LDC research-only | EN | EARS 48k; SWB 8kHz tel. | **eliminated** |
+
+**Net:** everything with inline tags is research-only; the only commercial-clean base (LibriTTS-R)
+has no tags. → **plan: validate the theory on NonverbalTTS first; if it works, build a SHIPPABLE
+corpus by auto-tagging LibriTTS-R (breath/laugh detection) or revisit NVSpeech/newer sets.**
+
+**Cross-lingual hypothesis (the reason this track is worth it):** paralinguistics are ~**language-
+independent** (a sigh is a sigh — the *opposite* of emotion, which we measured to be language-specific).
+So an **EN-trained** paralinguistic LoRA may **transfer onto Italian/other-language speech** → we may
+not need per-language tagged data. **This is the #1 thing the proof must test.**
+
+**Follow-ups not yet audited** (could improve the cross-lingual/license picture):
+**Emilia-NV** (`amphion/Emilia-NV`, "NV"=nonverbal, Emilia is large + multilingual) and Meta's
+**SeamlessExpressive**. Also the richer EN candidates (LibriTTS-R as the shippable auto-tag base; any
+2024-26 expressive EN set) for the "which to actually use" decision *after* the theory is validated.
+
+## Usage — NonverbalTTS proof
+
+```bash
+# 1. Inspect the REAL emoji taxonomy first (don't trust a hand-copied table):
+python3 prepare_nonverbal.py --histogram          # prints emoji freq + how each maps
+# 2. Build the inline-tagged 24kHz manifest (drop low-DNSMOS clips for cleanliness):
+python3 prepare_nonverbal.py --split train --min-dnsmos 3.0 --out_dir data_nv
+# 3-4. Then the SAME downstream as the emotion packs:
+#   upstream prepare_data.py (add audio_codes) -> train_lora.py (L16-26) -> export_expr.py
+```
+
+The emoji→marker map lives in `prepare_nonverbal.py` (`EMOJI_MARKER`). Unknown emoji are **stripped**
+(raw emoji disturb the model and do nothing useful passed through). The SAME map is intended to also
+power a **user-facing emoji-in-prompt** feature (known emoji in `--text` → our `[marker]`; unknown →
+strip) — to be wired C-side, see PLAN.
+
+> ⚠️ **NonverbalTTS is research/prototype ONLY** (CC BY-NC-SA + VoxCeleb/Expresso audio terms). Use it
+> to prove the LoRA learns nonverbals and that EN→IT transfer works; do **not** ship a pack trained on
+> it. For a shippable pack, auto-tag a permissive base (LibriTTS-R, CC BY 4.0) instead.
