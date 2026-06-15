@@ -988,8 +988,21 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
                 fread(lz4_data, 1, comp_size, f) == comp_size &&
                 LZ4_decompress_safe((const char *)lz4_data, (char *)delta16,
                                     (int)comp_size, (int)(n16 * sizeof(int16_t))) == (int)(n16 * sizeof(int16_t))) {
-                for (size_t i = 0; i < n16; i++)
-                    result[i] = (uint16_t)((int)cur[i] + (int)delta16[i]);
+                if (expr_weight == 1.0f) {
+                    /* exact reconstruction: ft_bits = cur_bits + delta_bits (mod 2^16) */
+                    for (size_t i = 0; i < n16; i++)
+                        result[i] = (uint16_t)((int)cur[i] + (int)delta16[i]);
+                } else {
+                    /* --expr-weight dosing on a DENSE delta: scale in FLOAT space,
+                     * base + w*(ft - base). cur=base bf16; ft=base+delta (bit add, modular,
+                     * correct even if the extract wrapped). w>1 amplifies, w<1 dampens. */
+                    for (size_t i = 0; i < n16; i++) {
+                        uint16_t ft_bits = (uint16_t)((int)cur[i] + (int)delta16[i]);
+                        float base_f = main_bf16_to_f32(cur[i]);
+                        float ft_f   = main_bf16_to_f32(ft_bits);
+                        result[i] = main_f32_to_bf16(base_f + expr_weight * (ft_f - base_f));
+                    }
+                }
                 *target_ptr = result;
                 loaded++;
             } else {
@@ -1326,7 +1339,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --icl-frames <N>           Cap ICL ref frames (dilute prosody anchor; more emotion; 0=all)\n");
                 fprintf(stderr, "  --graft                    Ignore lite .qvoice ref_codes; clone via x-vector (emotive; use with --instruct)\n");
                 fprintf(stderr, "  --expr <file>              Apply a <lang>.expr expressivity weight delta on top (composable with any voice; 1.7B)\n");
-                fprintf(stderr, "  --expr-weight <m>          Dose a factored-LoRA .expr (1=as trained, 0.6=subtler, 1.3=stronger)\n");
+                fprintf(stderr, "  --expr-weight <m>          Dose a .expr (factored LoRA AND dense): 1=as trained, 0.6=subtler, 1.5=stronger\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
