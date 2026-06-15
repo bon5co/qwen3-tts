@@ -8,6 +8,8 @@ A lightweight, cross-platform C inference engine for [Qwen3-TTS](https://github.
 
 The engine runs the complete TTS pipeline: BPE tokenization, a 28-layer causal transformer (Talker), a multi-pass code predictor, and a convolutional speech decoder. Weights are memory-mapped directly from safetensors files in BF16, so loading is near-instant and memory usage stays low.
 
+> 📍 **Where does a voice live in the model?** See **[`docs/speaker-map.md`](docs/speaker-map.md)** for a readable map of which layers/stages carry timbre vs language/prosody vs emotion (and how the preset voices like `ryan` work). Essential background for voice cloning and expressivity.
+
 ## Audio Samples
 
 All samples generated with the 0.6B model (RTF ~1.3–1.7, Apple M1):
