@@ -91,6 +91,7 @@ help:
 	@echo "  make test-large-int8 - Run 1.7B INT8 tests (Italian + English, seed 42)"
 	@echo "  make test-large-int4 - Run 1.7B INT4 tests (Italian + English, seed 42)"
 	@echo "  make test-large-quant - Run all 1.7B quantization tests (INT8 + INT4)"
+	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -367,6 +368,15 @@ test-emotion: $(TARGET)
 	@echo "  PASS: standalone --volume/--rate"
 	@echo "PASS: expressivity/emotion smoke"
 	@echo ""
+
+# Emotion × voice × temp LISTENING matrix for the L16-26 emotion LoRA. Prints, per clip,
+# a comment (voice/emotion/temp/.expr + instruct) + the FULL command + a `cd ... && afplay` link,
+# so you can verify what produced each sound (e.g. SMALL ICL file, NOT the heavy qvoice WDELTA).
+# All 7 EMOVO emotions (incl. disgust/fear/surprise) on { galatea SMALL-ICL clone, ryan preset }
+# × { T0.9, T1.1 }. Override the pack with EXPR=... (e.g. the r32 instead of r64).
+EXPR ?= presets/expr/italian_l1626_r64.expr
+test-lora-it: $(TARGET)
+	@bash tests/lora_matrix.sh Italian $(EXPR)
 
 test-batch: $(TARGET)
 	@echo "=== Batched Talker step correctness (opt-in path vs single-stream) ==="

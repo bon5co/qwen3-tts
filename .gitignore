@@ -38,6 +38,11 @@ scripts/dgx_*
 # expressivity artifacts (host on GH release/HF, do not commit big binaries)
 qwen3-tts-1.7b-expr/
 presets/expr/*.expr
+# BUT track the ear-validated emotion-band (L16-26) packs in git — the regression of
+# 2026-06-15 was caused by a validated .expr being gitignored, overwritten and lost with
+# no backup (see regression_lora.md). Tracking the *_l1626_* packs prevents a recurrence.
+# (Broad-band *_bb027_* and paralinguistic_* experiments stay ignored — heavy + unvalidated.)
+!presets/expr/*_l1626_*.expr
 !training/expressivity-lora/*.py
 # local training data (prep outputs: wav24k + manifests + codes) — never commit
 training/expressivity-lora/data*/
