@@ -1524,6 +1524,10 @@ int main(int argc, char **argv) {
     if (speaker_id >= 0) ctx->speaker_id = speaker_id;
     if (language) ctx->language_id = qwen_tts_language_id(language);
     if (seed >= 0) ctx->seed = (uint32_t)seed;
+    /* Echo the resolved seed so a good (esp. emotional) take is reproducible: without --seed the
+     * engine uses a time-based seed (qwen_tts.c: ctx->seed=time(NULL)) that would otherwise be
+     * invisible. Pass the printed value back via --seed to reproduce/curate "good seeds". */
+    if (!silent) fprintf(stderr, "seed: %u%s\n", ctx->seed, seed >= 0 ? "" : " (auto/time-based)");
     if (max_duration > 0) ctx->max_tokens = (int)(max_duration * 12.5f);
     if (ctx_greedy_warmup > 0) ctx->greedy_warmup = ctx_greedy_warmup;
     if (icl_frames > 0) ctx->icl_frames_cap = icl_frames;
