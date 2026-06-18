@@ -45,6 +45,25 @@ push the `.expr` harder for the same emotional movement). See `docs/icl-graft-po
   cap vivian ≤ w1.0 except anger.
 - → preset default: **w1.0 globally, bump anger to w1.2**. x-vector-clone default: **T1.3 + per-emotion above**.
 
+### Spanish & Romance transfer (ES / PT / FR) — `spanish_csp.expr`
+The Italian CSP pack **transfers to Romance languages with NO retraining** — Spanish/Portuguese/French are close
+to Italian and the model's EN→Romance switch is strong. Ear-validated on **Spanish** (2026-06-18): same WIN
+weights, `-l Spanish`, **English** instruct, **T1.3**. Shipped as `spanish_csp.expr` = byte-identical WIN weights
+with the header language relabeled to Spanish (the `.expr` lang field is informational, not enforced against `-l`).
+
+```bash
+./qwen_tts -d qwen3-tts-1.7b -s ryan -l Spanish -T 1.3 \
+  --expr presets/expr/spanish_csp.expr --expr-weight 1.6 \
+  -I "Speak with hot, furious anger, sharp and forceful." \
+  --text "No puedo creer lo que ha pasado hoy." -o anger_es.wav
+```
+- **All emotions: w1.6, T1.3** on the `ryan` preset (anger window 1.5–1.7; **>1.8 goes metallic, <1.4 whispers**).
+- **Use the 2-block WIN pack, NOT the 4-block `topk4` on presets:** topk4 over-steers a clean preset and **drifts
+  the language** (sad → French). topk4 is only for voices that already drift.
+- **Seed matters:** at T1.3 a few unlucky seeds land on a glitch trajectory (e.g. disgust glitched on seed 777,
+  clean on every other seed). The engine now prints the resolved `seed:` — capture a good one, or sweep with
+  `tests/seed_sweep.sh`. Verified **deterministic** (a given seed reproduces bit-for-bit), NOT a memory bug.
+
 ### Clone fidelity tiers — pick by need (nothing is deprecated)
 | Tier | How | Size | Use when |
 |------|-----|------|----------|
