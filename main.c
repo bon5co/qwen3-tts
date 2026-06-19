@@ -1673,9 +1673,25 @@ int main(int argc, char **argv) {
                     fclose(vf); qwen_tts_unload(ctx); return 1;
                 }
                 if (n_ref_frames > 0) {
-                    int n_codes = (int)n_ref_frames * 16;
+                    /* Leaks-audit fix (#2 CRIT): n_ref_frames is untrusted (read from file).
+                     * The old `int n_codes = (int)n_ref_frames*16` overflowed (signed UB) for
+                     * n_ref_frames > ~134M, yielding a negative/undersized malloc and then an
+                     * out-of-bounds fread = heap overflow (no NULL-check either). Cap to a sane
+                     * max (ref is 12.5 Hz; 1e6 frames ≈ 22 h, 64 MB), use size_t, NULL-check.
+                     * A truncated/lying-but-in-range count is still caught by the fread mismatch. */
+                    const uint32_t MAX_REF_FRAMES = 1000000u;
+                    if (n_ref_frames > MAX_REF_FRAMES) {
+                        fprintf(stderr, "Error: .qvoice ref frame count %u exceeds max %u (corrupt file?)\n",
+                                n_ref_frames, MAX_REF_FRAMES);
+                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                    }
+                    size_t n_codes = (size_t)n_ref_frames * 16;
                     ctx->cached_ref_codes = (int *)malloc(n_codes * sizeof(int));
-                    if (fread(ctx->cached_ref_codes, sizeof(int), n_codes, vf) != (size_t)n_codes) {
+                    if (!ctx->cached_ref_codes) {
+                        fprintf(stderr, "Error: out of memory allocating %zu ref codes\n", n_codes);
+                        fclose(vf); qwen_tts_unload(ctx); return 1;
+                    }
+                    if (fread(ctx->cached_ref_codes, sizeof(int), n_codes, vf) != n_codes) {
                         free(ctx->cached_ref_codes);
                         ctx->cached_ref_codes = NULL;
                         fclose(vf); qwen_tts_unload(ctx); return 1;
