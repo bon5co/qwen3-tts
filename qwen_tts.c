@@ -18,6 +18,7 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdatomic.h>   /* leaks-audit #6: _Atomic flag for the cross-thread cb_aborted */
 
 int qwen_verbose = 0;
 
@@ -377,7 +378,8 @@ typedef struct {
     /* Streaming callback (if set, audio goes to callback instead of buffer) */
     qwen_tts_audio_cb audio_cb;
     void *audio_cb_userdata;
-    int   cb_aborted;       /* set to 1 if callback returns non-zero */
+    _Atomic int cb_aborted; /* set to 1 if callback returns non-zero (leaks-audit #6: read by the
+                             * main thread + written by the decoder thread → atomic, not a plain int) */
 
     /* Context for decoder */
     qwen_tts_ctx_t *ctx;

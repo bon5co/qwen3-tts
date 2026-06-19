@@ -108,6 +108,12 @@ static int read_request(int fd, char *buf, int buf_size) {
                 char *cl = strcasestr(buf, "Content-Length:");
                 if (cl) content_length = atoi(cl + 15);
                 else content_length = 0;
+                /* leaks-audit #10: clamp the untrusted Content-Length. The buffer is fixed
+                 * (buf_size), so a body that can't fit is capped rather than waited on (limits a
+                 * slowloris-style hold); a negative/garbage value is treated as 0. A full fix would
+                 * also set a socket read timeout (SO_RCVTIMEO) at accept time — follow-up. */
+                if (content_length < 0) content_length = 0;
+                if (content_length > buf_size - 1) content_length = buf_size - 1;
             }
         }
 

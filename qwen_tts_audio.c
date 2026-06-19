@@ -148,7 +148,10 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
         int16_t sample = (int16_t)(s * 32767);
         fwrite(&sample, 2, 1, f);
     }
-    fclose(f);
+    /* leaks-audit #8: detect a short write / disk-full instead of returning success on a
+     * silently-truncated WAV. ferror() catches any failed fwrite above; fclose flushes. */
+    int werr = ferror(f);
+    if (fclose(f) != 0 || werr) return -1;
     return 0;
 }
 
