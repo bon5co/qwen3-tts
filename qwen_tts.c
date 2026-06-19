@@ -670,8 +670,26 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     return qwen_tts_load_ex(model_dir, 0, 0, 0);
 }
 
+/* Leaks-audit #3: record a malloc'd override buffer so unload frees it. Growable list. */
+void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr) {
+    if (!ctx || !ptr) return;
+    if (ctx->n_owned_overrides >= ctx->cap_owned_overrides) {
+        int nc = ctx->cap_owned_overrides ? ctx->cap_owned_overrides * 2 : 64;
+        void **t = (void **)realloc(ctx->owned_overrides, (size_t)nc * sizeof(void *));
+        if (!t) return;   /* OOM: skip tracking this one (leak it) rather than crash */
+        ctx->owned_overrides = t;
+        ctx->cap_owned_overrides = nc;
+    }
+    ctx->owned_overrides[ctx->n_owned_overrides++] = ptr;
+}
+
 void qwen_tts_unload(qwen_tts_ctx_t *ctx) {
     if (!ctx) return;
+    /* Leaks-audit #3: free the WDELTA/WOVR/--expr override buffers that replaced mmap pointers.
+     * A worker clone shares this list (shallow copy) and must be freed BEFORE its base (same
+     * contract as cp_steer_vec), so only the base reaches here with the list populated. */
+    for (int i = 0; i < ctx->n_owned_overrides; i++) free(ctx->owned_overrides[i]);
+    free(ctx->owned_overrides);
     /* Free malloc'd fused weights (gate_up are the only malloc'd weight copies) */
     for (int i = 0; i < ctx->config.num_layers; i++) free(ctx->layers[i].gate_up_fused_bf16);
     for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].gate_up_fused_bf16);

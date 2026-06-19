@@ -983,7 +983,7 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
             /* RMSNorm f32 replacement: read the full f32 array and swap the pointer. */
             void *buf = malloc(comp_size);
             if (buf && fread(buf, 1, comp_size, f) == comp_size) {
-                *target_ptr = buf;
+                *target_ptr = buf; qwen_track_override(ctx, buf);
                 loaded++;
             } else {
                 free(buf);
@@ -1014,7 +1014,7 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
                         result[i] = main_f32_to_bf16(base_f + expr_weight * (ft_f - base_f));
                     }
                 }
-                *target_ptr = result;
+                *target_ptr = result; qwen_track_override(ctx, result);
                 loaded++;
             } else {
                 free(result);
@@ -1048,7 +1048,7 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
                         for (uint32_t i = 0; i < n_in; i++)
                             rr[i] = main_f32_to_bf16(main_bf16_to_f32(cr[i]) + drow[i]);
                     }
-                    *target_ptr = result; loaded++;
+                    *target_ptr = result; qwen_track_override(ctx, result); loaded++;
                 } else { free(result); }
                 free(drow);
             }
@@ -1826,6 +1826,10 @@ int main(int argc, char **argv) {
                                 ctx->text_proj_fc1_bias = fc1_b;
                                 ctx->text_proj_fc2_bf16 = fc2;
                                 ctx->text_proj_fc2_bias = fc2_b;
+                                /* leaks-audit #3: these malloc'd overrides replace mmap ptrs → unload must free them
+                                 * (the fail-path `else` below frees them only when NOT assigned → no double-free). */
+                                qwen_track_override(ctx, fc1);  qwen_track_override(ctx, fc1_b);
+                                qwen_track_override(ctx, fc2);  qwen_track_override(ctx, fc2_b);
                                 /* Override codec_embedding: need owned copy since original is mmap'd */
                                 int full_codec_vocab = ctx->config.codec_vocab_size;
                                 uint16_t *ce_full = (uint16_t *)malloc((size_t)full_codec_vocab * h * sizeof(uint16_t));
@@ -1835,7 +1839,7 @@ int main(int argc, char **argv) {
                                     /* Override codebook entries 0-2047 with source model's */
                                     int copy_entries = cv < full_codec_vocab ? cv : full_codec_vocab;
                                     memcpy(ce_full, ce, (size_t)copy_entries * h * sizeof(uint16_t));
-                                    ctx->codec_embedding_bf16 = ce_full;
+                                    ctx->codec_embedding_bf16 = ce_full; qwen_track_override(ctx, ce_full);  /* leaks-audit #3 */
                                 }
                                 free(ce);
                                 /* Recompute tts_pad/bos/eos with new text_projection
@@ -2121,7 +2125,7 @@ int main(int argc, char **argv) {
                                                 result[i] = main_f32_to_bf16(vc + a * (vcl - vc));
                                             }
                                         }
-                                        *target_ptr = result;
+                                        *target_ptr = result; qwen_track_override(ctx, result);  /* leaks-audit #3 */
                                         loaded++;
                                         wfull_bytes += compressed_size;
                                     } else {
@@ -2143,7 +2147,7 @@ int main(int argc, char **argv) {
                                     /* WFULL: raw data, just read and replace */
                                     void *buf = malloc(compressed_size);
                                     if (buf && fread(buf, 1, compressed_size, vf) == compressed_size) {
-                                        *target_ptr = buf;
+                                        *target_ptr = buf; qwen_track_override(ctx, buf);  /* leaks-audit #3 */
                                         loaded++;
                                         wfull_bytes += compressed_size;
                                     } else {

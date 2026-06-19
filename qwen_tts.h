@@ -413,6 +413,12 @@ typedef struct qwen_tts_ctx {
     /* Cached ICL data (for .qvoice save/load) */
     int *cached_ref_codes;       /* [cached_ref_n_frames × 16] codec tokens from speech encoder */
     int cached_ref_n_frames;     /* Number of reference codec frames */
+    /* Override weight buffers (WDELTA/WOVR/--expr) that REPLACED mmap pointers — tracked so unload
+     * frees them (leaks-audit #3). A worker clone shares this list via the shallow `*w=*base` copy;
+     * only the base's unload frees it (qwen_tts_free_clone leaves it, like cp_steer_vec). */
+    void **owned_overrides;
+    int    n_owned_overrides;
+    int    cap_owned_overrides;
     int icl_frames_cap;          /* --icl-frames N: cap ICL ref frames to dilute the prosody
                                     anchor (more emotion room). 0 = use all (default). */
     int graft_mode;              /* --graft: ignore cached ref_codes on a lite .qvoice and clone
@@ -629,6 +635,10 @@ qwen_tts_ctx_t *qwen_tts_load_ex(const char *model_dir, int silent, int use_int8
 
 /* Unload model and free resources */
 void qwen_tts_unload(qwen_tts_ctx_t *ctx);
+
+/* Track a malloc'd weight-override buffer (WDELTA/WOVR/--expr) so qwen_tts_unload frees it
+ * (leaks-audit #3). No-op on NULL. */
+void qwen_track_override(qwen_tts_ctx_t *ctx, void *ptr);
 
 /* Concurrent server support: clone a loaded context into an independent worker
  * context that SHARES read-only weights/voice/RoPE but owns fresh per-request
