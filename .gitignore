@@ -46,3 +46,9 @@ presets/expr/*.expr
 !training/expressivity-lora/*.py
 # local training data (prep outputs: wav24k + manifests + codes) — never commit
 training/expressivity-lora/data*/
+
+# Old experimental DENSE L16-26 multi/multitag packs (pre-CSP experiments, NOT shipped).
+# The current Italian emotion winners are the CSP packs (italian_csp*.expr) hosted on HF.
+# Re-ignored AFTER the !*_l1626_* exception (last-match wins) so the broad glob doesn't sweep them into git.
+presets/expr/italian_multi_l1626_dense.expr
+presets/expr/italian_multitag_l1626_dense.expr
