@@ -100,6 +100,49 @@ needs. Note: the dense `.expr` bit-delta applies cleanly only on CV-intact weigh
 4. **Orchestrator** (`dgx_csp_italian.sh`): runs all of the above on the DGX, ISOLATED in `runs/csp_italian/`
    (own data/markers/outputs — never collides with other runs). `SMART=1 TRAIN_JUDGE=1 nohup bash dgx_csp_italian.sh`.
 
+## Why only 2–4 layers? (representation vs control)
+
+A common confusion: our activation-map work showed emotion is **spread across ~11 layers** — so why does
+CSP-FT fine-tune only **2 (or 4)** of them? Because *where emotion is **represented*** and *how many layers you
+must **train** to **control** it* are two different things.
+
+**1. Representation is distributed; control is sparse.** The act-map found emotion *magnitude* in the mid
+layers (L06–11) and emotion *identity* — what separates joy from sadness — in the **late** layers (**L21–25**).
+That's where the signal is *readable*. But to *move* the emotion you only need to retrain the **few most causal
+layers** — the ones whose weights, when nudged, shift the output the most. The signal passing through 11 layers
+does **not** mean you must train 11.
+
+**2. CSP-FT = probe → rank → train the causal few, FREEZE the rest.** The whole point of Characteristic-Specific
+Partial Fine-Tuning ([arXiv 2501.14273](https://arxiv.org/abs/2501.14273)) is parsimony: a probe ranks layers by
+how much training them moves the characteristic, you keep the **top-k**, and you **freeze everything else — above
+all the pronunciation layers**. Training *more* layers is not free: it bleeds into pronunciation and other
+abilities (negative transfer) with diminishing returns. The paper's headline is exactly this — *fewer, well-chosen
+layers beat full fine-tuning* on clean speech (CER 1.2% vs 3.9% full-FT). So "minimal but the *right* minimal"
+is the design, and the **probe** is what makes the few layers the *right* few rather than a random few.
+
+Nicely, the probe independently landed on **L22, 23** (peak), i.e. **inside the late identity band L21–25** the
+act-map had flagged — two different methods, same region.
+
+**3. So what were the "11"?** That was the **older** recipe ([[project_lora_band_l1626]] / `docs/expressivity-lora.md`):
+a hand-picked **dense band L16–26** (= 11 layers, 16…26) trained densely as a block. CSP-FT is the refinement of
+it: of those 11, the probe shows you really only need the **2–4 most causal** to move emotion, and training fewer
+keeps pronunciation cleaner. The CSP 2–4 sit *inside* that band — they are its causal core.
+
+**4. Why we keep both 2 and 4 — the "capacity ladder".** It is not that 2 is universally right; it's a
+force-vs-safety trade:
+
+| Pack | Probe top-k | Trained blocks | Force | Best for |
+|------|-------------|----------------|-------|----------|
+| **WIN** | top-2 | 22, 23 | gentler, cleanest | presets / voices that already speak the language well |
+| **topk4** | top-4 | 22, 23, 25, 26 | stronger pull | voices that **drift** (e.g. `vivian`, clones) — but **over-steers a clean preset** (drifts the language) |
+
+More trained blocks = more steering force, but more risk of damaging language/pronunciation. The probe gives you
+the **ranked order**; you pick **how many** by how much push the voice needs. That's the whole knob.
+
+> One line: emotion is **read** across ~11 layers, but it is **controlled** by training the **2–4 most causal**
+> of them and **freezing the rest** to protect pronunciation. That trade — minimal causal layers + freeze — is
+> all of CSP-FT.
+
 ## Reproduce the .expr from the checkpoint
 
 ```bash
