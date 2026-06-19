@@ -160,7 +160,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
             const char *cp_close = strchr(cp_open, '}');
             if (cp_close) {
                 long cp_len = cp_close - cp_open + 1; char *cp_json = (char *)malloc(cp_len + 1);
-                if (!cp_json) { free(talker_only_json); free(tc_json); free(json); return -1; }  /* leaks-audit #9 */
+                if (!cp_json) { free(tc_json); free(json); return -1; }  /* leaks-audit #9 (talker_only_json already freed at line 152) */
                 memcpy(cp_json, cp_open, cp_len); cp_json[cp_len] = '\0';
                 c->cp_hidden_size = json_get_int(cp_json, "hidden_size", 1024);
                 c->cp_num_layers = json_get_int(cp_json, "num_hidden_layers", 5);
@@ -173,7 +173,6 @@ static int load_config(qwen_tts_ctx_t *ctx) {
             }
         }
     }
-    free(talker_only_json);   /* leaks-audit #9 bonus: was never freed (one-time load leak) */
     free(tc_json); free(json);
 
     snprintf(path, sizeof(path), "%s/speech_tokenizer/config.json", ctx->model_dir);
