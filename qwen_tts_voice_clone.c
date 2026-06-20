@@ -614,17 +614,9 @@ static void se_res2net_block_forward(
         mean[c] = sum / in_len;
     }
 
-    /* SE conv1 (channels→se_ch) + ReLU */
+    /* SE conv1 (channels→se_ch) + ReLU.
+     * kernel=1 Conv1d on the length-1 mean = matmul [se_ch, channels] x [channels] → [se_ch]. */
     float *se1 = (float *)aligned_malloc(se_ch * sizeof(float));
-    for (int i = 0; i < se_ch; i++) {
-        float val = se_conv1_b[i];
-        for (int c = 0; c < channels; c++)
-            val += se_conv1_w[(size_t)i * channels] * mean[c];
-        /* Note: kernel=1, so just dot product with the mean (which is length=1 per channel) */
-        se1[i] = val;
-    }
-    /* Wait, the SE conv uses Conv1d on the mean which has length=1.
-     * So it's just a matrix multiply: [se_ch, channels, 1] x [channels, 1] → [se_ch, 1] */
     for (int i = 0; i < se_ch; i++) {
         float val = se_conv1_b[i];
         for (int c = 0; c < channels; c++)

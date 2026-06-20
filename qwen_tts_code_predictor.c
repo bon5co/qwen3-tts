@@ -98,10 +98,14 @@ static long   ql_ffn_zero   = 0;
  * emotion control vector is mean(angry) − mean(neutral) from two such runs
  * (see tests/steer_make.py). Format: 'QSTV' magic + int32 dim + dim×float32. */
 #define STEER_VEC_MAGIC 0x56545351u  /* 'QSTV' little-endian */
-static const char *steer_cap_path   = NULL;
-static double     *steer_cap_acc    = NULL;
-static long        steer_cap_frames = 0;
-static int         steer_cap_dim    = 0;
+static const char *steer_cap_path   = NULL;   /* set once in ql_init, read-only after */
+/* Accumulators are per-thread: steer_capture_accum() does a cross-frame `+=` from the
+ * generation thread; making them __thread avoids a data race if multiple worker threads
+ * ever run with capture on (capture is a single-stream debug tool — atexit flushes the
+ * main/generation thread's copy, which is the one that accumulates in CLI capture). */
+static __thread double *steer_cap_acc    = NULL;
+static __thread long    steer_cap_frames = 0;
+static __thread int     steer_cap_dim    = 0;
 
 static void steer_capture_accum(const float *cp_x, int n) {
     if (!steer_cap_path) return;

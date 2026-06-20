@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -51,7 +52,9 @@ static int64_t parse_int(const char **p) {
     int neg = 0;
     if (**p == '-') { neg = 1; (*p)++; }
     while (**p >= '0' && **p <= '9') {
-        val = val * 10 + (**p - '0');
+        int d = **p - '0';
+        if (val > (INT64_MAX - d) / 10) { val = INT64_MAX; }  /* saturate, avoid signed-overflow UB */
+        else val = val * 10 + d;
         (*p)++;
     }
     return neg ? -val : val;
@@ -307,6 +310,13 @@ void safetensors_print_all(const safetensors_file_t *sf) {
  * Multi-shard operations
  * ======================================================================== */
 
+/* qsort comparator for the fixed-256-byte shard-name slots. Casting strcmp's
+ * (const char*,const char*) signature to qsort's (const void*,const void*) and
+ * calling through it is UB; this wrapper has the correct type. */
+static int shard_name_cmp(const void *a, const void *b) {
+    return strcmp((const char *)a, (const char *)b);
+}
+
 multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     multi_safetensors_t *ms = calloc(1, sizeof(multi_safetensors_t));
     if (!ms) return NULL;
@@ -347,7 +357,7 @@ multi_safetensors_t *multi_safetensors_open(const char *model_dir) {
     }
 
     /* Sort shard names to ensure consistent ordering */
-    qsort(shard_names, n_shards, 256, (int(*)(const void*,const void*))strcmp);
+    qsort(shard_names, n_shards, 256, shard_name_cmp);
 
     for (int i = 0; i < n_shards; i++) {
         snprintf(path, sizeof(path), "%s/%s", model_dir, shard_names[i]);

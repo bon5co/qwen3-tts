@@ -304,6 +304,10 @@ static void write_tensor_impl(FILE *vf, FILE *cv_sf, const char *cv_hdr_json, si
         fwrite(ptr, 1, raw, vf);
         *total_bytes += raw;
     }
+    /* ferror is sticky → one check catches a short write from any fwrite above
+     * (e.g. disk full) instead of silently truncating the voice file. */
+    if (ferror(vf))
+        fprintf(stderr, "Error: short write while saving tensor '%s' (disk full?)\n", tname);
     (*count)++;
 }
 
@@ -1904,8 +1908,11 @@ int main(int argc, char **argv) {
                     char wfull_magic[5] = {0};
                     int is_wdelta = 0;
                     size_t magic_read = fread(wfull_magic, 1, 5, vf);
-                    if (magic_read >= 4 && memcmp(wfull_magic, "WDLT", 4) == 0) {
-                        /* WDELTA format (4-byte magic) — push back the 5th byte */
+                    if (magic_read == 5 && memcmp(wfull_magic, "WDLT", 4) == 0) {
+                        /* WDELTA format (4-byte magic) — push back the 5th byte.
+                         * Require a full 5-byte read: a real WDLT stream always has the
+                         * next field after the magic, so magic_read==4 means truncated —
+                         * don't fseek(-1) past the magic in that edge case. */
                         fseek(vf, -1, SEEK_CUR);
                         is_wdelta = 1;
                     }

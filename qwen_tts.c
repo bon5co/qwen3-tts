@@ -81,6 +81,25 @@ static char *read_file(const char *path, long *out_len) {
 }
 
 /* Config loading */
+/* Walk forward from `p` until the brace `depth` returns to 0, skipping any braces
+ * that occur inside double-quoted strings (config JSON is trusted, but a brace in a
+ * string value would otherwise miscount). Returns a pointer just past the matching
+ * '}' (or at the terminating NUL). Call with `depth` = the count already opened. */
+static const char *json_match_brace(const char *p, int depth) {
+    int in_str = 0;
+    while (*p && depth > 0) {
+        char ch = *p;
+        if (in_str) {
+            if (ch == '\\' && p[1]) p++;        /* skip escaped char inside string */
+            else if (ch == '"') in_str = 0;
+        } else if (ch == '"') in_str = 1;
+        else if (ch == '{') depth++;
+        else if (ch == '}') depth--;
+        p++;
+    }
+    return p;
+}
+
 static int load_config(qwen_tts_ctx_t *ctx) {
     char path[1024]; snprintf(path, sizeof(path), "%s/config.json", ctx->model_dir);
     long len; char *json = read_file(path, &len); if (!json) return -1;
@@ -91,8 +110,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     const char *p = strchr(tc_start, '{'); if (!p) { free(json); return -1; }
     
     /* Find the closing brace of talker_config (including nested code_predictor_config) */
-    int brace = 1; const char *tc_end = p + 1;
-    while (*tc_end && brace > 0) { if (*tc_end == '{') brace++; else if (*tc_end == '}') brace--; tc_end++; }
+    const char *tc_end = json_match_brace(p + 1, 1);
     
     long tc_len = tc_end - p; char *tc_json = (char *)malloc(tc_len + 1);
     if (!tc_json) { free(json); return -1; }            /* leaks-audit #9: OOM NULL-check */
@@ -124,14 +142,8 @@ static int load_config(qwen_tts_ctx_t *ctx) {
                 }
             }
             if (!nested_open) break;
-            /* Find matching close brace */
-            int depth = 1;
-            char *r = nested_open + 1;
-            while (*r && depth > 0) {
-                if (*r == '{') depth++;
-                else if (*r == '}') depth--;
-                r++;
-            }
+            /* Find matching close brace (string-aware) */
+            char *r = (char *)json_match_brace(nested_open + 1, 1);
             /* Blank out the nested object (replace with spaces) */
             memset(nested_open, ' ', r - nested_open);
             scan = r;
@@ -186,8 +198,7 @@ static int load_config(qwen_tts_ctx_t *ctx) {
         if (dc_start) {
             const char *dc_open = strchr(dc_start, '{');
             if (dc_open) {
-                const char *dc_close = dc_open + 1; int brace = 1;
-                while (*dc_close && brace > 0) { if (*dc_close == '{') brace++; else if (*dc_close == '}') brace--; dc_close++; }
+                const char *dc_close = json_match_brace(dc_open + 1, 1);
                 long dc_len = dc_close - dc_open; char *dc_json = (char *)malloc(dc_len + 1);
                 if (!dc_json) { free(json); return -1; }            /* leaks-audit #9: OOM NULL-check */
                 memcpy(dc_json, dc_open, dc_len); dc_json[dc_len] = '\0';
@@ -421,6 +432,12 @@ static void dt_free(decoder_thread_t *dt) {
 
 static void dt_push_frames(decoder_thread_t *dt, const int *frame_codes, int n_frames) {
     pthread_mutex_lock(&dt->mutex);
+    if (n_frames < 0 || dt->write_pos + n_frames > dt->capacity) {
+        /* Bounds guard (currently unreachable: caller pushes 1 frame at a time and
+         * capacity is sized to max_frames). Drop the overflow rather than corrupt heap. */
+        pthread_mutex_unlock(&dt->mutex);
+        return;
+    }
     memcpy(dt->codes + dt->write_pos * 16, frame_codes, n_frames * 16 * sizeof(int));
     dt->write_pos += n_frames;
     pthread_cond_signal(&dt->cond);
@@ -821,6 +838,12 @@ qwen_tts_ctx_t *qwen_tts_clone_for_worker(const qwen_tts_ctx_t *base) {
     w->audio_buf = NULL; w->audio_samples = 0;
     memset(&w->sd_stream, 0, sizeof(w->sd_stream));
 
+    /* Per-worker CP roughness buffers: `*w = *base` byte-copied base's cp_layers
+     * (down_q2_rough pointers + cp_rough_built). Detach them so each worker builds
+     * and owns its own (freed in qwen_tts_free_clone) — never shares/double-frees base's. */
+    w->cp_rough_built = 0;
+    for (int i = 0; i < c->cp_num_layers; i++) w->cp_layers[i].down_q2_rough = NULL;
+
     /* Per-worker tokenizer: loaded lazily on first generate (avoids sharing a
      * single tokenizer across threads). instruct/tf/streaming reset per request. */
     w->cached_tokenizer = NULL;
@@ -851,6 +874,8 @@ void qwen_tts_free_clone(qwen_tts_ctx_t *ctx) {
     emb_cache_free(ctx);
     free(ctx->logits); free(ctx->codec_codes); free(ctx->prev_tokens); free(ctx->audio_buf);
     free(ctx->prev_input_embeds);
+    /* Per-worker lazily-built CP roughness buffers (NULL unless cp_roughness>0 used). */
+    for (int i = 0; i < ctx->config.cp_num_layers; i++) free(ctx->cp_layers[i].down_q2_rough);
     free(ctx->instruct);
     if (ctx->cached_tokenizer) qwen_tokenizer_free((qwen_tokenizer_t *)ctx->cached_tokenizer);
     free(ctx);
