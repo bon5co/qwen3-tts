@@ -93,6 +93,7 @@ help:
 	@echo "  make test-large-quant - Run all 1.7B quantization tests (INT8 + INT4)"
 	@echo "  make test-emotion-ft - Emotion fine-tune (.expr graft) smoke: CSP Italian on 1.7B (preset+clone, seed 42)"
 	@echo "  make test-lora-it    - Emotion×voice×temp listening matrix (L16-26 LoRA; afplay links + full cmds)"
+	@echo "  make emotion-seeds   - Seed-finder palette → docs/emotion-seeds.md (recommended seeds/lang/voice/emo; SLOW)"
 	@echo "  make test-clone      - Voice clone e2e (generate ref → clone → stream)"
 	@echo "  make demo-clone      - Voice clone demo using sample WAV"
 	@echo "  make test-regression - Cross-model regression checks"
@@ -411,6 +412,13 @@ test-emotion-ft: $(TARGET)
 EXPR ?= presets/expr/italian_l1626_r64.expr
 test-lora-it: $(TARGET)
 	@bash tests/lora_matrix.sh Italian $(EXPR)
+
+# Emotion seed-finder → recommended-seeds palette doc (docs/emotion-seeds.md). For each
+# (language × voice × emotion) renders N seeds with --seed-audition --audition-keep, records the
+# auto-pick (glitch+dur) + every take, and writes a usage doc with afplay links + full commands.
+# Opt-in + SLOW (full IT+ES+clone matrix on 1.7B). Override scope via env: LANGS/VOICES_IT/EMOS_IT/N.
+emotion-seeds: $(TARGET)
+	@bash tests/emotion_seed_finder.sh $(if $(OUT_MD),$(OUT_MD),docs/emotion-seeds.md) $(if $(N),$(N),8)
 
 test-batch: $(TARGET)
 	@echo "=== Batched Talker step correctness (opt-in path vs single-stream) ==="
@@ -988,7 +996,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-seeds test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \
