@@ -977,9 +977,13 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
                     else if (strstr(suffix, "down_proj.weight")) target_ptr = (void **)&l->down_bf16;
                     else if (strstr(suffix, "q_norm.weight")) { target_ptr = (void **)&l->q_norm; is_f32 = 1; }
                     else if (strstr(suffix, "k_norm.weight")) { target_ptr = (void **)&l->k_norm; is_f32 = 1; }
-                    else if (strstr(suffix, "input_layernorm.weight"))      { target_ptr = (void **)&l->input_norm; is_f32 = 1; }
-                    else if (strstr(suffix, "post_attention_layernorm.weight")) { target_ptr = (void **)&l->post_attn_norm; is_f32 = 1; }
                 }
+                /* BUG FIX: the layer-level RMSNorms have NO `self_attn.`/`mlp.` infix, so they were
+                 * gated behind `suffix` above and SILENTLY NEVER APPLIED — every .expr's input/post
+                 * layernorm deltas were dropped, under-applying the FT (e.g. CSP topk4 = 35/40). Match
+                 * them on `tname` directly so the full fine-tune is applied. */
+                else if (strstr(tname, "input_layernorm.weight"))          { target_ptr = (void **)&l->input_norm;     is_f32 = 1; }
+                else if (strstr(tname, "post_attention_layernorm.weight")) { target_ptr = (void **)&l->post_attn_norm; is_f32 = 1; }
             }
         }
 
@@ -1021,6 +1025,9 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
                 *target_ptr = result; qwen_track_override(ctx, result);
                 loaded++;
             } else {
+                if (getenv("QWEN_EXPR_DEBUG"))
+                    fprintf(stderr, "  [expr] SKIP delta-fail %s (cur=%p lz4=%p d16=%p res=%p comp=%u)\n",
+                            tname, (void*)cur, (void*)lz4_data, (void*)delta16, (void*)result, comp_size);
                 free(result);
             }
             free(lz4_data); free(delta16);
@@ -1059,6 +1066,9 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
             free(pl);
         } else {
             /* Unknown tensor or unsupported dtype — skip its payload. */
+            if (getenv("QWEN_EXPR_DEBUG"))
+                fprintf(stderr, "  [expr] SKIP unmatched %s (tgt=%p is_f32=%d dtype=%d)\n",
+                        tname, (void*)target_ptr, is_f32, dtype_flag);
             fseek(f, comp_size, SEEK_CUR);
         }
     }
