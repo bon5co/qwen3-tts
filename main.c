@@ -865,6 +865,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
     const int SR = QWEN_TTS_SAMPLE_RATE;
     float *out = NULL; size_t out_n = 0, out_cap = 0;
     int spoken = 0, idx = 0, last_spoken = 0, prev_filler = 0;
+    int para_n = 0;  /* count of paralinguistic [tag] spans seen, for per-occurrence seed variation */
     #define RS_APPEND(src, cnt) do {                                       \
         size_t _c = (cnt);                                                 \
         if (out_n + _c > out_cap) {                                        \
@@ -912,6 +913,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
         float *sv_ptr = ctx->ml_steer;
         int    sv_L = ctx->ml_steer_layers, sv_D = ctx->ml_steer_dim,
                sv_l0 = ctx->ml_steer_l0, sv_l1 = ctx->ml_steer_l1, sv_fr = ctx->ml_steer_frames;
+        uint32_t sv_seed = ctx->seed;
         if (spans[i].ml_steer_path && spans[i].ml_steer_weight != 0.0f) {
             int sL = 0, sD = 0;
             if (load_qlsteer_buf(ctx, spans[i].ml_steer_path, &span_steer, &sL, &sD) == 0) {
@@ -919,18 +921,24 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                 ctx->ml_steer_weight = spans[i].ml_steer_weight;
                 ctx->ml_steer_l0 = spans[i].ml_l0; ctx->ml_steer_l1 = spans[i].ml_l1;
                 ctx->ml_steer_decay = 0.985f; ctx->ml_steer_frames = 0;
-                if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d]\n",
-                                     spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1);
+                /* vary the seed per repeated tag so three [laugh] in a row are NOT bit-identical copies
+                 * (each generate() resets RNG to ctx->seed). The FIRST paralinguistic span keeps the
+                 * base seed = the validated single-tag output; later ones get a deterministic offset. */
+                if (para_n > 0) ctx->seed = sv_seed + (uint32_t)para_n;
+                para_n++;
+                if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d seed %u]\n",
+                                     spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
             }
         }
 
         float *audio = NULL; int n = 0;
         int grc = qwen_tts_generate(ctx, spans[i].text, &audio, &n);
 
-        if (span_steer) {   /* restore the global ml-steer config + free the span vector */
+        if (span_steer) {   /* restore the global ml-steer config + seed + free the span vector */
             ctx->ml_steer = sv_ptr; ctx->ml_steer_layers = sv_L; ctx->ml_steer_dim = sv_D;
             ctx->ml_steer_weight = sv_w; ctx->ml_steer_l0 = sv_l0; ctx->ml_steer_l1 = sv_l1;
             ctx->ml_steer_decay = sv_dec; ctx->ml_steer_frames = sv_fr;
+            ctx->seed = sv_seed;
             free(span_steer);
         }
         if (grc != 0 || !audio || n <= 0) {
