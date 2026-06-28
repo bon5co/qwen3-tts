@@ -42,8 +42,8 @@ echo "$ASSETS" | while read -r name want; do
   fi
   [ $VERIFY_ONLY = 1 ] && continue
   if [ ! -f "$f" ]; then
-    echo "GET   $name  <- $BASE_URL/$name"
-    if curl -fL --retry 3 -o "$f.part" "$BASE_URL/$name"; then
+    echo "GET   $name  <- $BASE_URL/expr/$name"
+    if curl -fL --retry 3 -o "$f.part" "$BASE_URL/expr/$name"; then
       mv "$f.part" "$f"
       got=$(sha "$f"); [ "$got" = "$want" ] && echo "  verified" || echo "  WARNING sha mismatch after download"
     else
