@@ -921,10 +921,11 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                 ctx->ml_steer_weight = spans[i].ml_steer_weight;
                 ctx->ml_steer_l0 = spans[i].ml_l0; ctx->ml_steer_l1 = spans[i].ml_l1;
                 ctx->ml_steer_decay = 0.985f; ctx->ml_steer_frames = 0;
-                /* vary the seed per repeated tag so three [laugh] in a row are NOT bit-identical copies
-                 * (each generate() resets RNG to ctx->seed). The FIRST paralinguistic span keeps the
-                 * base seed = the validated single-tag output; later ones get a deterministic offset. */
-                if (para_n > 0) ctx->seed = sv_seed + (uint32_t)para_n;
+                /* NOTE: every span resets RNG to ctx->seed, so repeated identical [tag]s render bit-identical.
+                 * We deliberately KEEP the base seed for ALL of them: CORRECTNESS FIRST — varying the seed on
+                 * the short isolated anchor span pushes it off-distribution (ear 2026-06-28: seed+1 → sigh,
+                 * seed+2 → language drift). Variety must come from a VALIDATED-safe source (good-seed pool /
+                 * richer anchor), not arbitrary offsets. para_n kept for diagnostics only. */
                 para_n++;
                 if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d seed %u]\n",
                                      spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
