@@ -335,9 +335,10 @@ static int load_steer_vec_accum(const char *path, float scale, float **acc, int 
     return *acc ? 0 : -1;
 }
 
-/* Load a multi-layer Talker steer (.qlsteer: 'QLST' magic + int32 L + int32 D +
- * L*D float32) into ctx->ml_steer. L must be num_layers+1, D = hidden. */
-static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, int l0, int l1) {
+/* Load a multi-layer Talker steer (.qlsteer: 'QLST' magic + int32 L + int32 D + L*D float32)
+ * into a FRESH buffer (does NOT touch ctx state). L must be num_layers+1, D = hidden.
+ * Caller owns *out_buf. Used both for the global --ml-steer and per-span paralinguistic vectors. */
+static int load_qlsteer_buf(qwen_tts_ctx_t *ctx, const char *path, float **out_buf, int *out_L, int *out_D) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "Error: cannot open ml-steer '%s'\n", path); return -1; }
     uint32_t magic = 0; int32_t L = 0, D = 0;
@@ -354,6 +355,14 @@ static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, in
         fprintf(stderr, "Error: failed to read ml-steer '%s'\n", path); free(buf); fclose(f); return -1;
     }
     fclose(f);
+    *out_buf = buf; *out_L = L; *out_D = D;
+    return 0;
+}
+
+/* Load a .qlsteer into ctx->ml_steer (the global --ml-steer). */
+static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, int l0, int l1) {
+    float *buf = NULL; int L = 0, D = 0;
+    if (load_qlsteer_buf(ctx, path, &buf, &L, &D) != 0) return -1;
     free(ctx->ml_steer);
     ctx->ml_steer = buf; ctx->ml_steer_layers = L; ctx->ml_steer_dim = D;
     ctx->ml_steer_weight = weight;
@@ -483,7 +492,10 @@ static int qwen_apply_emotion(qwen_tts_ctx_t *ctx,
 /* steer_weight: <0 = use the mood recipe's weight; >=0 = override (0 = NO steering).
  * rate/volume: >0 = override the recipe value, else inherit it. */
 typedef struct { int is_pause; float pause_s; char mood[48]; char *text;
-                 float steer_weight; float rate; float volume; } cspan_t;
+                 float steer_weight; float rate; float volume; int is_filler;
+                 /* per-span Talker steering vector (paralinguistic [laugh]/[sigh] auto-route).
+                  * ml_steer_path points at a static table literal (NOT freed). 0 weight = none. */
+                 const char *ml_steer_path; float ml_steer_weight; int ml_l0, ml_l1; } cspan_t;
 
 /* English paralinguistic macro = a self-contained soft filler recipe.
  * Ear-validated 2026-06-07: steering on a short, time-stretched vowel goes metallic/
@@ -521,6 +533,20 @@ static const cmacro_t COMPOSE_MACROS[] = {
     { NULL, NULL, 0.0f, 0.0f, 0.0f }
 };
 
+/* Paralinguistic events rendered via a STEERING VECTOR (the validated win, plan §8.9-DONE/§9.13):
+ * the inline [tag] becomes a native-trigger onomatopoeia ANCHOR (which the model performs) and the
+ * vector SHAPES it into the real event. VOCAL family only (laugh/sigh — articulatory events hit the
+ * decoder ceiling). RAW vectors, inject L21-25. Default weight ~8 (ryan over-steers a bit at 8, wants
+ * ~6). Checked BEFORE COMPOSE_MACROS so laugh/sigh use the vector path, not the old DSP filler. */
+typedef struct { const char *tag; const char *anchor; const char *vec; float weight; int l0, l1; } pvec_t;
+static const pvec_t PARA_VECTORS[] = {
+    { "sigh",   "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25 },
+    { "sighs",  "haaah", "presets/steer/paraling/sigh_vs_laugh.qlsteer", 8.0f, 21, 25 },
+    { "laugh",  "ahah",  "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25 },
+    { "laughs", "ahah",  "presets/steer/paraling/laugh_vs_cry.qlsteer",  8.0f, 21, 25 },
+    { NULL, NULL, NULL, 0.0f, 0, 0 }
+};
+
 static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
     if (*n >= *cap) {
         int nc = *cap * 2 + 8;
@@ -555,8 +581,9 @@ static int parse_markup(const char *input, cspan_t **out, int *out_n) {
         while (_a < _b && (seg[_a]==' '||seg[_a]=='\t'||seg[_a]=='\n')) _a++;     \
         while (_b > _a && (seg[_b-1]==' '||seg[_b-1]=='\t'||seg[_b-1]=='\n')) _b--; \
         if (_b > _a) {                                                           \
-            cspan_t _s; _s.is_pause = 0; _s.pause_s = 0;                          \
+            cspan_t _s; _s.is_pause = 0; _s.pause_s = 0; _s.is_filler = 0;        \
             _s.steer_weight = -1.0f; _s.rate = 0; _s.volume = 0;                  \
+            _s.ml_steer_path = NULL; _s.ml_steer_weight = 0; _s.ml_l0 = 0; _s.ml_l1 = 0; \
             snprintf(_s.mood, sizeof(_s.mood), "%s", cur_mood);                   \
             _s.text = (char *)malloc((size_t)(_b - _a) + 1);                      \
             if (!_s.text) { free(seg); free(arr); return -1; }                    \
@@ -592,14 +619,31 @@ static int parse_markup(const char *input, cspan_t **out, int *out_n) {
                         if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
                         handled = 1;
                     } else {
+                        /* paralinguistic STEERING-VECTOR events (laugh/sigh) — checked FIRST so they
+                         * use the vector path (anchor onomatopoeia + per-span ml-steer), not the old
+                         * DSP macro. The vector is applied localized to this span in render_spans. */
+                        for (int m = 0; PARA_VECTORS[m].tag && !handled; m++) {
+                            if (strcasecmp(t, PARA_VECTORS[m].tag) == 0) {
+                                MK_FLUSH();
+                                cspan_t s; memset(&s, 0, sizeof(s)); s.is_filler = 1;
+                                s.steer_weight = 0.0f;  /* no CP steer; the Talker ml-steer does the work */
+                                s.text = strdup(PARA_VECTORS[m].anchor);
+                                s.ml_steer_path = PARA_VECTORS[m].vec;
+                                s.ml_steer_weight = PARA_VECTORS[m].weight;
+                                s.ml_l0 = PARA_VECTORS[m].l0; s.ml_l1 = PARA_VECTORS[m].l1;
+                                if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
+                                handled = 1;
+                            }
+                        }
                         for (int m = 0; COMPOSE_MACROS[m].tag && !handled; m++) {
                             if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) {
                                 MK_FLUSH();
-                                cspan_t s; s.is_pause = 0; s.pause_s = 0;
+                                cspan_t s; s.is_pause = 0; s.pause_s = 0; s.is_filler = 1;
                                 s.steer_weight = COMPOSE_MACROS[m].steer_weight;
                                 s.rate = COMPOSE_MACROS[m].rate;
                                 s.volume = COMPOSE_MACROS[m].volume;
                                 s.mood[0] = 0;  /* macros are no-steer prosody; mood unused */
+                                s.ml_steer_path = NULL; s.ml_steer_weight = 0; s.ml_l0 = 0; s.ml_l1 = 0;
                                 s.text = strdup(COMPOSE_MACROS[m].text);
                                 if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
                                 handled = 1;
@@ -642,6 +686,7 @@ static int text_has_markup(const char *text) {
         if (strncasecmp(t, "pause", 5) == 0 || strncasecmp(t, "break", 5) == 0) return 1;
         if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') return 1;
         if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) return 1;
+        for (int m = 0; PARA_VECTORS[m].tag; m++) if (strcasecmp(t, PARA_VECTORS[m].tag) == 0) return 1;
         for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
         if (qwen_emotion_lookup(t)) return 1;
     }
@@ -805,7 +850,7 @@ static int run_batch(qwen_tts_ctx_t *ctx, const char *text, int target_words, in
     if (!spans) { for (int i = 0; i < nc; i++) free(chunks[i]); free(chunks); return -1; }
     for (int i = 0; i < nc; i++) {
         spans[i].is_pause = 0; spans[i].mood[0] = 0; spans[i].text = chunks[i];
-        spans[i].steer_weight = -1.0f; spans[i].rate = 0.0f; spans[i].volume = 0.0f;
+        spans[i].steer_weight = -1.0f; spans[i].rate = 0.0f; spans[i].volume = 0.0f; spans[i].is_filler = 0;
     }
     rc = render_spans(ctx, spans, nc, language, chunk_pause, output, silent);
     free(spans);
@@ -819,7 +864,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                         const char *output, int silent) {
     const int SR = QWEN_TTS_SAMPLE_RATE;
     float *out = NULL; size_t out_n = 0, out_cap = 0;
-    int spoken = 0, idx = 0, last_spoken = 0;
+    int spoken = 0, idx = 0, last_spoken = 0, prev_filler = 0;
     #define RS_APPEND(src, cnt) do {                                       \
         size_t _c = (cnt);                                                 \
         if (out_n + _c > out_cap) {                                        \
@@ -837,7 +882,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
         if (spans[i].is_pause) {
             if (spans[i].pause_s > 0) RS_APPEND(NULL, (size_t)(spans[i].pause_s * SR));
             if (!silent) fprintf(stderr, "  [pause %.2fs]\n", spans[i].pause_s);
-            last_spoken = 0;
+            last_spoken = 0; prev_filler = 0;
             continue;
         }
         const char *mood = spans[i].mood[0] ? spans[i].mood : NULL;
@@ -848,7 +893,10 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                                &vol, &rate, silent) != 0) { free(out); return -1; }
         if (spans[i].rate   > 0.0f) rate = spans[i].rate;     /* macro filler overrides recipe rate */
         if (spans[i].volume > 0.0f) vol  = spans[i].volume;   /* and volume */
-        if (last_spoken && default_pause > 0) RS_APPEND(NULL, (size_t)(default_pause * SR));
+        /* No silence gap around a paralinguistic filler — it should flow OUT of / INTO the speech
+         * (the "stuck/detached" defect was the 120ms pause + hard seam). We crossfade instead (below). */
+        int xfade_seam = (spans[i].is_filler || prev_filler);
+        if (last_spoken && default_pause > 0 && !xfade_seam) RS_APPEND(NULL, (size_t)(default_pause * SR));
         if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", idx, mood ? mood : "neutral", spans[i].text);
 
         /* Each span is an INDEPENDENT synthesis: force a cold prefill so the previous
@@ -856,8 +904,36 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
          * span's delivery vs synthesizing it alone — ear-caught 2026-06-07). */
         ctx->prev_prefill_len = 0;
 
+        /* Per-span Talker steering (paralinguistic [laugh]/[sigh]): swap in this span's vector for
+         * THIS generation only, then restore the global --ml-steer. Localized — the rest of the text
+         * is untouched and any global emotion steer on the spoken spans is preserved. */
+        float *span_steer = NULL;
+        float  sv_w = ctx->ml_steer_weight, sv_dec = ctx->ml_steer_decay;
+        float *sv_ptr = ctx->ml_steer;
+        int    sv_L = ctx->ml_steer_layers, sv_D = ctx->ml_steer_dim,
+               sv_l0 = ctx->ml_steer_l0, sv_l1 = ctx->ml_steer_l1, sv_fr = ctx->ml_steer_frames;
+        if (spans[i].ml_steer_path && spans[i].ml_steer_weight != 0.0f) {
+            int sL = 0, sD = 0;
+            if (load_qlsteer_buf(ctx, spans[i].ml_steer_path, &span_steer, &sL, &sD) == 0) {
+                ctx->ml_steer = span_steer; ctx->ml_steer_layers = sL; ctx->ml_steer_dim = sD;
+                ctx->ml_steer_weight = spans[i].ml_steer_weight;
+                ctx->ml_steer_l0 = spans[i].ml_l0; ctx->ml_steer_l1 = spans[i].ml_l1;
+                ctx->ml_steer_decay = 0.985f; ctx->ml_steer_frames = 0;
+                if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d]\n",
+                                     spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1);
+            }
+        }
+
         float *audio = NULL; int n = 0;
-        if (qwen_tts_generate(ctx, spans[i].text, &audio, &n) != 0 || !audio || n <= 0) {
+        int grc = qwen_tts_generate(ctx, spans[i].text, &audio, &n);
+
+        if (span_steer) {   /* restore the global ml-steer config + free the span vector */
+            ctx->ml_steer = sv_ptr; ctx->ml_steer_layers = sv_L; ctx->ml_steer_dim = sv_D;
+            ctx->ml_steer_weight = sv_w; ctx->ml_steer_l0 = sv_l0; ctx->ml_steer_l1 = sv_l1;
+            ctx->ml_steer_decay = sv_dec; ctx->ml_steer_frames = sv_fr;
+            free(span_steer);
+        }
+        if (grc != 0 || !audio || n <= 0) {
             fprintf(stderr, "Compose: synthesis failed for span %d\n", idx);
             free(audio); free(out); return -1;
         }
@@ -867,9 +943,22 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
             if (qwen_audio_time_stretch(audio, n, rate, SR, &stretched, &sn) == 0) { seg = stretched; seg_n = sn; }
         }
         if (vol != 1.0f) qwen_audio_apply_gain(seg, seg_n, vol);
-        RS_APPEND(seg, (size_t)seg_n);
+        /* Crossfade a paralinguistic-filler seam so the laugh/sigh blends into the speech instead of
+         * sounding pasted-on. ~45ms equal-gain overlap-add on the existing tail + the new head. */
+        if (xfade_seam && out_n > 0 && seg_n > 0) {
+            size_t xf = (size_t)(0.045f * SR);
+            if (xf > out_n) xf = out_n;
+            if (xf > (size_t)seg_n) xf = (size_t)seg_n;
+            for (size_t k = 0; k < xf; k++) {
+                float a = (float)(xf - k) / (float)xf;          /* fade out previous tail */
+                out[out_n - xf + k] = out[out_n - xf + k] * a + seg[k] * (1.0f - a);
+            }
+            RS_APPEND(seg + xf, (size_t)seg_n - xf);
+        } else {
+            RS_APPEND(seg, (size_t)seg_n);
+        }
         free(stretched); free(audio);
-        spoken++; idx++; last_spoken = 1;
+        spoken++; idx++; last_spoken = 1; prev_filler = spans[i].is_filler;
     }
 
     if (out_n == 0) { fprintf(stderr, "Compose: nothing to synthesize\n"); free(out); return -1; }
@@ -1132,7 +1221,8 @@ int main(int argc, char **argv) {
     const char *ml_steer_path = NULL;  /* --ml-steer: multi-layer Talker emotion steer (.qlsteer) */
     float ml_steer_weight = 8.0f;      /* --ml-weight */
     int ml_l0 = 21, ml_l1 = 25;        /* --ml-range "l0-l1" (identity layers) */
-    float ml_decay = 1.0f;             /* --ml-decay: per-frame weight multiplier (1.0=none) */
+    float ml_decay = 0.985f;           /* --ml-decay: per-frame weight multiplier. DEFAULT 0.985 = derail-fix
+                                          always-on (tames the EOS "so so so" tail on steering). 1.0 = no decay */
     int ml_frames = 0;                 /* --ml-frames: apply only first N gen frames (0=all) */
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
