@@ -10,10 +10,13 @@
 # italian_csp_topk6 also covers Spanish/Japanese/Korean/Russian (the IT pack renders them). The LEGACY
 # packs are older A/B + research artifacts, not used by --emotion → fetched only with --all.
 #
-# Usage:   bash download_assets.sh            # the 3 packs --emotion needs (IT + native DE/FR)  ~620 MB
-#          bash download_assets.sh --all      # + the 6 legacy/experimental packs                ~1.4 GB
+# Usage:   bash download_assets.sh            # the 3 .expr --emotion needs + ASK about the CC0 voices  (~720 MB)
+#          bash download_assets.sh --voices   # also fetch the 4 reference voices, no prompt (CI)
+#          bash download_assets.sh --no-voices# .expr only, never prompt
+#          bash download_assets.sh --all      # + the 6 legacy/experimental .expr packs                (~1.4 GB)
 #          bash download_assets.sh --verify   # only sha256-verify the files already present
 #          BASE_URL=<url> bash download_assets.sh   # mirror elsewhere
+# (Reference voices come from a separate repo via download_voices.sh — invoked automatically when you opt in.)
 # ============================================================================================
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -37,10 +40,21 @@ italian_multi_l1626_dense.expr    9445275fd058c18a0f48d82bb465ff820a19bf99a3d508
 italian_multitag_l1626_dense.expr 6e986b6e7d8f0ae80bcc1d2c4190f511eaa24e6ebebf69a1e19e6f1bbc913528
 EOF
 
-MODE=get; ALL=0
-for a in "$@"; do case "$a" in --verify) MODE=verify;; --all) ALL=1;; esac; done
+MODE=get; ALL=0; VOICES=ask    # VOICES: ask | yes | no
+for a in "$@"; do case "$a" in
+  --verify) MODE=verify;; --all) ALL=1;; --voices) VOICES=yes;; --no-voices) VOICES=no;; esac; done
 ASSETS="$ESSENTIAL"
 { [ "$MODE" = verify ] || [ $ALL = 1 ]; } && ASSETS="$ESSENTIAL"$'\n'"$LEGACY"   # verify/--all span both sets
+
+if [ "$MODE" != verify ]; then
+  echo "================================================================================"
+  echo " qwen3-tts assets — replicable download"
+  echo "   emotion .expr packs  : ~620 MB  (the 3 packs --emotion needs; --all = ~1.4 GB)"
+  echo "   CC0 reference voices : ~100 MB  (4 clones IT/ES/EN/FR, gabrione/qwen3-tts-voices)"
+  echo "   steering vectors     : already in this repo (presets/steer/**) — no download"
+  echo "   → estimated total this run: ~720 MB (essential .expr + voices)"
+  echo "================================================================================"
+fi
 
 sha(){ shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
 echo "$ASSETS" | while read -r name want; do
@@ -61,5 +75,25 @@ echo "$ASSETS" | while read -r name want; do
     fi
   fi
 done
-echo "done. (--emotion needs only the 3 essential packs; use --all for the legacy/experimental set.)"
-echo "      steering vectors in presets/steer/** are committed — no download needed. Recipe: docs/emotion-THE-recipe.md"
+echo "done with .expr. (--emotion needs only the 3 essential packs; use --all for the legacy/experimental set.)"
+
+# ---- CC0 reference voices (the other HF repo) — interactive opt-in (or --voices / --no-voices for CI) ----
+if [ "$MODE" != verify ]; then
+  get_voices=0
+  case "$VOICES" in
+    yes) get_voices=1;;
+    no)  echo "Skipping reference voices (--no-voices).";;
+    ask)
+      if [ -t 0 ]; then
+        printf "Also download the 4 CC0 reference voices (~100 MB, IT/ES/EN/FR)? [Y/n] "
+        read -r ans; case "$ans" in [Nn]*) get_voices=0;; *) get_voices=1;; esac
+      else
+        echo "Non-interactive: skipping voices (re-run with --voices to fetch them)."
+      fi;;
+  esac
+  if [ $get_voices = 1 ]; then
+    echo "--- fetching CC0 reference voices ---"
+    bash "$(dirname "$0")/download_voices.sh"
+  fi
+fi
+echo "steering vectors in presets/steer/** are committed — no download needed. Recipe: docs/emotion-THE-recipe.md"
