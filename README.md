@@ -138,6 +138,15 @@ Clone any voice from a reference audio clip. Requires a Base model.
 
 > Full guide: reference audio tips, model comparison, samples → [docs/voice-cloning.md](docs/voice-cloning.md)
 
+**Ready-to-use reference voices (CC0 / Public Domain).** Four lite ~25 MB graft `.qvoice` clones of LibriVox
+public-domain readers (Italian, Spanish, English, French) so the demos/tests run out of the box and you have
+voices to listen to and reuse:
+```bash
+bash download_voices.sh    # fetch galatea(IT)/quijote(ES)/ohenry(EN)/hugo(FR) into voices/ (sha256-verified)
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_graft.qvoice --icl-only -l Italian --emotion sad --text "…" -o out.wav
+```
+Hosted on Hugging Face → [**gabrione/qwen3-tts-voices**](https://huggingface.co/gabrione/qwen3-tts-voices) (CC0, LibriVox attribution).
+
 ### Custom Voices with Delta `.qvoice`
 
 The killer feature: clone a voice once, save it as a `.qvoice` with `--target-cv`,

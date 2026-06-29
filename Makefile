@@ -392,16 +392,17 @@ test-emotion-ft: $(TARGET)
 	@grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_ryan.log || { echo "FAIL: .expr pack not applied (preset)"; cat $(TEST_DIR)/ft_ryan.log; exit 1; }
 	@test -s $(TEST_DIR)/ft_ryan.wav || { echo "FAIL: preset+FT produced no audio"; exit 1; }
 	@echo "  PASS: emotion FT pack applied on preset ryan -> audio"
-	@# (2) CLONE graft (--icl-only keeps CV weights so the FT pack restores cleanly)
-	@if [ -f voices/galatea_icl.qvoice ]; then \
+	@# (2) CLONE graft (--icl-only keeps CV weights so the FT pack restores cleanly). Uses the CC0 reference
+	@#     voice galatea_graft.qvoice — get it with `bash download_voices.sh` (else this case SKIPs cleanly).
+	@if [ -f voices/galatea_graft.qvoice ]; then \
 		./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -l Italian \
-			--load-voice voices/galatea_icl.qvoice --icl-only \
+			--load-voice voices/galatea_graft.qvoice --icl-only \
 			--expr $(EXPR_FT) --instruct "$(EMO_FT_INSTR)" \
 			--text "$(EMO_FT_TEXT)" -o $(TEST_DIR)/ft_clone.wav 2>$(TEST_DIR)/ft_clone.log; \
 		grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_clone.log || { echo "FAIL: .expr pack not applied (clone graft)"; cat $(TEST_DIR)/ft_clone.log; exit 1; }; \
 		test -s $(TEST_DIR)/ft_clone.wav || { echo "FAIL: clone+FT produced no audio"; exit 1; }; \
 		echo "  PASS: emotion FT pack applied on galatea --icl-only graft -> audio"; \
-	else echo "  SKIP: voices/galatea_icl.qvoice not present (clone-graft case)"; fi
+	else echo "  SKIP: voices/galatea_graft.qvoice not present (run: bash download_voices.sh)"; fi
 	@echo "PASS: emotion fine-tune (.expr) smoke"
 	@echo ""
 

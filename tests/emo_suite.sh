@@ -136,16 +136,32 @@ for tag in $LANGS; do
   done
 done
 
-# ---- GALATEA clone (25MB graft) — contrasting emotions across languages, COMBINE (the clone cross-lang win) ----
+# ---- REFERENCE CLONES (CC0/PD, downloadable via download_voices.sh) — the clone recipe = COMBINE everywhere.
+#      Reproducible for anyone who clones the repo (galatea IT, quijote ES, ohenry EN, hugo FR). The "one easy
+#      way" for clones: IT expr @1.0 (renders) + ryan_<emo> steer w8 + English instruct. ----
+gd="$ROOT/reference_clones"; mkdir -p "$gd"
+echo "==== reference clones (CC0 25MB grafts) — COMBINE in each native language -> $gd ===="
+IT_EXPR=presets/expr/italian_csp_topk6.expr
+# voice-file | native-tag | Language
+for rv in "galatea_graft|it|Italian" "quijote_graft|es|Spanish" "ohenry_graft|en|English" "hugo_graft|fr|French"; do
+  IFS='|' read -r vfile tg lng <<< "$rv"
+  if [ ! -f "voices/$vfile.qvoice" ]; then echo "  SKIP $vfile (run: bash download_voices.sh)"; continue; fi
+  vn="${vfile%_graft}"; GAL="--load-voice voices/$vfile.qvoice --icl-only"
+  for e in anger sad joy; do
+    txt="${TX[${tg}_${e}]}"; ql="$QL/ryan_$(tok $e).qlsteer"
+    run "$gd/${vn}_${tg}_${e}_combine_w8.wav" \
+      $BIN -d $M $GAL -l "$lng" -T 1.1 --seed $SEED --expr "$IT_EXPR" --expr-weight 1.0 \
+      --ml-steer "$ql" --ml-weight 8 --ml-range 21-25 --instruct "${INS[$e]}" --text "$txt"
+  done
+done
+# galatea cross-language bonus (the §8.6 win: an IT clone emoting in far languages)
 if [ -f voices/galatea_graft.qvoice ]; then
-  gd="$ROOT/galatea_clone"; mkdir -p "$gd"
-  echo "==== galatea clone (25MB graft) cross-language -> $gd ===="
   GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
-  for pair in "it|Italian|anger" "it|Italian|joy" "zh|Chinese|sad" "ru|Russian|anger" "ja|Japanese|joy" "en|English|sad"; do
+  for pair in "zh|Chinese|sad" "ru|Russian|anger" "ja|Japanese|joy"; do
     IFS='|' read -r tg lng e <<< "$pair"
-    txt="${TX[${tg}_${e}]}"; ql="$QL/ryan_$(tok $e).qlsteer"; expr="presets/expr/italian_csp_topk6.expr"
-    run "$gd/galatea_${tg}_${e}_combine_w8_expr.wav" \
-      $BIN -d $M $GAL -l "$lng" -T 1.1 --seed $SEED --expr "$expr" --expr-weight 1.0 \
+    txt="${TX[${tg}_${e}]}"; ql="$QL/ryan_$(tok $e).qlsteer"
+    run "$gd/galatea_${tg}_${e}_combine_w8.wav" \
+      $BIN -d $M $GAL -l "$lng" -T 1.1 --seed $SEED --expr "$IT_EXPR" --expr-weight 1.0 \
       --ml-steer "$ql" --ml-weight 8 --ml-range 21-25 --instruct "${INS[$e]}" --text "$txt"
   done
 fi
