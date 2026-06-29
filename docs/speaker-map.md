@@ -53,7 +53,7 @@ Talker was trained mostly on **ZH / JP / EN** voices, so:
 - **`ryan` (EN)** does Italian/French/Spanish well via a cross-lingual **"switch"**; **`vivian` (ZH)** does
   Italian less natively (Chinese-accented Italian).
 - Preset **emotion = the instruct alone** (a ChatML user turn) conditioning **L16–26**, plus temperature — **no
-  weight change**. (See `docs/expressivity.md`.)
+  weight change**. (See `docs/emotion-THE-recipe.md`.)
 
 ## Productization: separate LANGUAGE (heavy, shared) from SPEAKER (tiny x-vector)
 
@@ -84,5 +84,5 @@ language/prosody **+** L16–26 emotion) — DENSE, *not* the low-rank broad-ban
 > the bits → metallic garble. The graft (x-vector, no ref_codes anchor) is the recipe; full-WDELTA is not.
 
 See also: `docs/prosody-map.md` (the per-layer measurements), `regression_lora.md` (dense-vs-LoRA + the recipe),
-`docs/expressivity.md` (the instruct recipe), `docs/icl-graft-portability.md` (x-vector-only default vs ICL),
+`docs/emotion-THE-recipe.md` (the emotion recipe), `docs/icl-graft-portability.md` (x-vector-only default vs ICL),
 `docs/csp-ft-emotion.md`.

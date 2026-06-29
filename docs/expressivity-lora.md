@@ -6,7 +6,7 @@ cloned — speak a target language more naturally and emote, *without* a second 
 > Status: technical/dev reference (captured 2026-06-11). An end-user-friendly version and a
 > dev.to writeup are tracked as a final-phase task. This file is the substance.
 
-Related: [`docs/expressivity.md`](expressivity.md) (the instruct + temperature recipe),
+Related: [`docs/emotion-THE-recipe.md`](emotion-THE-recipe.md) (the recipe),
 [`docs/custom-voices.md`](custom-voices.md), [`docs/icl-graft-portability.md`](icl-graft-portability.md)
 (the `.qvoice-lite` reusable-clone format).
 
@@ -152,4 +152,4 @@ python3 tests/qvoice_to_xvec.py voices/myvoice.qvoice         # one-time: make t
   scaled meaningfully. No retraining needed.
 
 Recipe note: the spoken text is in the target language (`-l`), but the **instruct stays in English/
-Chinese** (the model's instruct-following is EN/ZH-centric) — see `docs/expressivity.md`.
+Chinese** (the model's instruct-following is EN/ZH-centric) — see `docs/emotion-THE-recipe.md`.

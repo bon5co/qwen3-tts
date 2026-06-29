@@ -3,7 +3,7 @@
 A reusable bank of **English instruct prompts** for expressive TTS, organized by family.
 Taxonomy inspired by the Dawizzer ComfyUI emotion node (75 presets); the *prompts* are ours
 because on this engine the working emotion lever is **`--instruct` in English**, not sampling
-knobs (those only add arousal — see `docs/expressivity.md` and PLAN RUN-7).
+knobs (those only add arousal — see `docs/emotion-THE-recipe.md`).
 
 ## The recipe (what actually works)
 

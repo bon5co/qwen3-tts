@@ -51,8 +51,8 @@ expressive markup automatically. (`--compose "..."` does the same explicitly.)
 - An emotion tag stays active until the next emotion tag or `[neutral]`.
 - Text before the first tag is spoken neutrally.
 - **Unrecognized** `[...]` is left as literal text — a stray bracket won't break your script.
-- The full emotion list is in [expressivity.md](expressivity.md); each mood's recipe is in
-  [expressivity-recipes.md](expressivity-recipes.md).
+- The emotion recipe is in
+  [emotion-THE-recipe.md](emotion-THE-recipe.md).
 
 ## How it renders
 
@@ -72,7 +72,7 @@ synthesized with **no emotion steering**, a gentle slowdown and low volume. (Ste
 time-stretched vowel goes metallic/"growl", so fillers are pure soft prosody.) They read
 convincingly as tiredness/relief/amusement in context, but they are synthesized vowels, not
 true non-verbal breaths (the model has no real `<breath>` token — see the dead-ends in
-[expressivity-recipes.md](expressivity-recipes.md)).
+[emotion-THE-recipe.md](emotion-THE-recipe.md)).
 
 ## Tuning
 
