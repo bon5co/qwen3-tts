@@ -204,13 +204,18 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
 |----------|-------|---------|------|--------|
 | Italian | ryan (preset) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_sad.wav) |
 | Italian | ryan (preset) | 😄 joy | *Non ci posso credere, è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_joy.wav) |
+| Italian | ryan (preset) | 🤢 disgust | *Ma che roba è questa? Fa davvero schifo, non riesco neanche a guardarla.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_disgust.wav) |
+| Italian | ryan (preset) | 😲 surprise | *Cosa?! Non me lo aspettavo per niente, è incredibile!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_surprise.wav) |
 | Italian | galatea (cloned voice) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_sad.wav) |
 | German | vivian | 😠 anger | *Also, lass mich dir in Ruhe erklären, wie die Dinge wirklich stehen.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/de_vivian_anger.wav) |
 | French | vivian | 😢 sad | *Bon, laisse-moi t'expliquer calmement comment les choses se passent.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_sad.wav) |
+| French | vivian | 😲 surprise | *Quoi ? Je ne m'y attendais pas du tout, c'est incroyable.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_surprise.wav) |
 | Spanish | vivian | 😄 joy | *Bueno, déjame explicarte con calma cómo están realmente las cosas.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy.wav) |
+| Spanish | vivian | 🤢 disgust | *¿Pero qué es esto? Es asqueroso, ni siquiera puedo mirarlo.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_disgust.wav) |
 | Chinese | vivian | 😄 joy | *我简直不敢相信，这是我一生中最好的消息，我太高兴了！* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/zh_vivian_joy.wav) |
 | Russian | vivian | 😠 anger | *Как ты смеешь так со мной разговаривать? Это неприемлемо!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ru_vivian_anger.wav) |
 | Japanese | ono_anna | 😢 sad | *私が持っていたものを全て失って、もうどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_sad.wav) |
+| Japanese | ono_anna | 😨 fear | *家に誰かいる、足音が聞こえた……怖くてどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_fear.wav) |
 | Korean | sohee | 😠 anger | *네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ko_sohee_anger.wav) |
 
 - **Emotions:** `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
