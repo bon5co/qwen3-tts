@@ -5,7 +5,7 @@
 #   • PER-LANGUAGE subfolders: samples/tests/<DATE>_emo-suite/<lang>/
 #   • EMOTION-MATCHED prompts per (language × emotion) — a sentence whose MEANING fits the emotion
 #     (Qwen-TTS emotes better on meaningful text than on one neutral carrier reused everywhere).
-#   • STEER WEIGHT SWEEP around the documented sweet spot: w6 / w8 / w10 (stay <=w10; w12 over-steers)
+#   • STEER WEIGHT SWEEP around the sweet spot: w8 / w10 / w12 (w12 wins with the right native speaker — 2026-06-29)
 #     PLUS a COMBINE variant (per-language .expr + steer w8 + instruct).
 #   • FILENAME encodes voice + mode + steer weight + expr, so you hear the file and KNOW what produced it:
 #       <lang>_<voice>_<emo>_steer_w<W>.wav            (pure steer, no expr/instruct)
