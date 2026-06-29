@@ -412,6 +412,15 @@ test-emotion-ft: $(TARGET)
 emotion-demo: $(TARGET)
 	@bash tests/emotion_demo.sh
 
+# Ordered emotion TEST SUITE (tests/emo_suite.sh): per-LANGUAGE subfolders, emotion-MATCHED prompts, a steer
+# weight sweep (w6/w8/w10) + a COMBINE variant per (lang×emotion), filenames that encode voice/mode/weight,
+# plus a galatea-clone cross-language folder. For finding/confirming the per-language win. Scope it:
+#   make emo-suite                      # all languages (long)
+#   LANGS="de fr es" make emo-suite     # subset of languages
+#   EMOS="anger sad" make emo-suite     # subset of emotions
+emo-suite: $(TARGET)
+	@bash tests/emo_suite.sh
+
 # Emotion × voice × temp LISTENING matrix for the L16-26 emotion LoRA. Prints, per clip,
 # a comment (voice/emotion/temp/.expr + instruct) + the FULL command + a `cd ... && afplay` link,
 # so you can verify what produced each sound (e.g. SMALL ICL file, NOT the heavy qvoice WDELTA).
@@ -1004,7 +1013,7 @@ demo-clone: $(TARGET)
 test-en: test-small-en
 test-it-ryan: test-small-it
 
-.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emotion-seeds test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
+.PHONY: all help blas clean debug info serve cp-microbench batching-bench test-batch test-errors test-emotion test-emotion-ft emotion-demo emo-suite emotion-seeds test-compose test-caps test-selftest test-golden golden-update quant-ladder test-modes test-qvoice e2e \
         test-serve test-serve-bench test-serve-repro test-serve-openai test-serve-parallel test-serve-concurrent test-serve-batch test-serve-continuous test-serve-stream-batch test-serve-all \
         test-clone test-voice-design \
         demo-clone \
