@@ -35,5 +35,5 @@ voice_block(){ # $1=name  $2..=voice args
 for VN in serena vivian uncle_fu ryan aiden ono_anna sohee eric dylan; do
   voice_block "$VN" -s "$VN"
 done
-voice_block galatea --load-voice voices/galatea_17b.qvoice --icl-only
+voice_block galatea --load-voice voices/galatea_graft.qvoice --icl-only
 echo "ALL DONE -> $OUT ($(ls $OUT/*.wav 2>/dev/null|wc -l|tr -d ' ') files)"

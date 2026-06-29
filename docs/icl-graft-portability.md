@@ -4,32 +4,34 @@ Answers PLAN A2 #1 (ICL vs WDELTA — peso + "funziona ovunque?") and #4 (peso p
 salvare/riusare + compressione → mini `.qvoice-lite`). Measured 2026-06-09 on M1,
 galatea_17b.qvoice (1.7B) + galatea_06b.qvoice (0.6B).
 
-> ## ⭐ DEFAULT clone path = x-vector-only `.bin` (2026-06-18)
-> The default way to clone is now an **8 KB x-vector-only `.bin`**:
+> ## ⭐ DEFAULT clone = the **25 MB graft `.qvoice`** (`--icl-only`) — updated 2026-06-24
+> The recommended clone is the **graft-lite `.qvoice` (~25 MB)** = everything `--icl-only`
+> actually uses (x-vector + META + TPAD + WOVR) **without** the multi-GB WDELTA. It is
+> **bit-identical** to running the heavy file with `--icl-only`, just 120× smaller.
 > ```bash
-> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/X.bin --xvector-only \
->   -l Italian --expr <emotion.expr> --instruct "<EN instruct>" --text "<IT text>" \
->   -T 1.3 -o out.wav
+> # make the graft-lite from any heavy .qvoice (drops the dead WDELTA):
+> python3 tests/qvoice_to_graft.py voices/X_17b.qvoice        # -> voices/X_17b_graft.qvoice (~25 MB)
+> # use it (graft mode keeps CV weights → instruct/expr/steer all work):
+> ./qwen_tts -d qwen3-tts-1.7b --load-voice voices/X_graft.qvoice --icl-only \
+>   -l Italian --expr presets/expr/italian_csp_topk6.expr --ml-steer <emo>.qlsteer \
+>   --ml-weight 8 --instruct "<EN instruct>" --text "<IT text>" -T 1.1 -o out.wav
 > ```
-> Make the `.bin` from an existing qvoice (or straight from a ref recording):
-> ```bash
-> python3 tests/qvoice_to_xvec.py voices/X.qvoice
-> # or, clone straight to a .bin from a ref recording (the engine, not the helper):
-> ./qwen_tts -d qwen3-tts-1.7b-base --ref-audio ref_24k_mono.wav --xvector-only \
->   --save-voice voices/X.bin
-> ```
-> **Why x-vector-only is the default (ear-validated 2026-06-18):** the ICL `ref_codes`
-> carry the reference RECORDING's **room acoustics** (a faint "muffled metallic / reverb")
-> which gets re-injected on every generation, and an `.expr` **amplifies** it. The x-vector
-> carries the speaker IDENTITY **without** the room → clean output, identity preserved, and
-> it tolerates a **higher `.expr` weight** (the ICL amplification path is gone, so you can
-> push the expr harder for the same emotional movement). **Key measured fact:** the lite
-> `galatea_icl.qvoice` and the 2.8 GB `galatea_17b.qvoice` have **byte-identical x-vectors**
-> (cosine 1.0000) — so the clean-vs-metallic difference was the **ICL ref_codes, NOT
-> embedding quality**. Defaults: **T1.3, weight ~1.6–2.0** (`w2.5/T1.3` svaria; joy/disgust
-> stay flat with weight → training ceiling, retrain `top_k=4`). Keep `--icl-only` (§5) as the
-> alternative for **max timbre mimicry** from a studio-clean ref. See also
-> `docs/csp-ft-emotion.md`.
+> **The clone-file LADDER (ship by need — there is NO heavy file anymore):**
+> | file | size | content | when |
+> |---|---|---|---|
+> | `X.bin` `--xvector-only` | 8 KB | x-vector ONLY | ultra-lean; identity holds but **omits sighs/pauses** |
+> | **`X_graft.qvoice` `--icl-only`** | **~25 MB** | x-vector + META + **TPAD + WOVR** | **DEFAULT** — full graft prosody, = heavy `--icl-only` bit-identical |
+> | ~~heavy `X.qvoice`~~ | ~~3 GB~~ | + WDELTA full weight-swap | **REMOVED** — only the metallic full-swap, never used for emotion |
+>
+> **Why the graft beats the bare `.bin` (ear-validated 2026-06-24):** the x-vector is
+> **byte-identical** in the bin and the qvoice — so identity is the same — but the graft also
+> carries **TPAD** (source `tts_pad/bos/eos` embeds) + **WOVR** (source text_projection +
+> codec_embedding override, "eliminates ALL per-frame divergence") which add the **sighs,
+> pauses and prosody micro-detail** the bare x-vector omits. The old ICL `ref_codes` path
+> (`galatea_icl.qvoice`) carried the reference room's **metallic reverb** and is **retired**;
+> the graft has NO ref_codes so it is clean. Tool: `tests/qvoice_to_graft.py`. Emotion levers:
+> `--expr presets/expr/italian_csp_topk6.expr` + `--ml-steer` (CLEAN, w~8) — see
+> `docs/csp-ft-emotion.md` and `plan_emo_v3.md §8`.
 
 ## 1. What a `.qvoice` actually contains (byte breakdown)
 

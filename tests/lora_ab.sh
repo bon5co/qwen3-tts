@@ -16,7 +16,7 @@ declare -A INST=(
 )
 gen() { ./qwen_tts $1 $C --instruct "$2" --text "$TXT" -o "$3" 2>/dev/null; }
 
-for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_17b.qvoice --icl-only"; do
+for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_graft.qvoice --icl-only"; do
   tag="${vsel%%|*}"; varg="${vsel#*|}"
   for emo in sad anger; do
     gen "-d $BASE $varg"            "${INST[$emo]}" "$OUT/${tag}_base_$emo.wav"

@@ -42,7 +42,7 @@ EMOS=(
 # voice: key | kind-tag | one-line desc | qwen-args
 VOICES=(
   "galatea-smallICL|CLONED (small ICL file)|small ICL clone (ref_codes — NOT the 3GB WDELTA); timbre from ICL, emotion from L16-26 LoRA + instruct|--load-voice voices/galatea_icl.qvoice"
-  "galatea-heavyWDELTA|CLONED (heavy 3GB qvoice WDELTA)|full WDELTA weight-swap clone (the heavy path) + L16-26 LoRA + instruct — for comparison vs small ICL|--load-voice voices/galatea_17b.qvoice"
+  "galatea-heavyWDELTA|CLONED (heavy 3GB qvoice WDELTA)|full WDELTA weight-swap clone (the heavy path) + L16-26 LoRA + instruct — for comparison vs small ICL|--load-voice voices/galatea_graft.qvoice"
   "ryan-preset|PRESET (no clone)|preset voice ryan + L16-26 LoRA + instruct (the strong-emotion reference)|-s ryan"
 )
 

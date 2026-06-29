@@ -21,7 +21,7 @@ for emo in neutral sad anger; do
   echo "  viv $emo done"
 done
 echo "### CLONE galatea cross-lingual German (base vs +german_r64)"
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 for emo in sad anger; do
   gen "-d qwen3-tts-1.7b $GAL"            "${INST[$emo]}" "$OUT/gal_base_$emo.wav"
   gen "-d qwen3-tts-1.7b $GAL --expr $R64" "${INST[$emo]}" "$OUT/gal_r64_$emo.wav"

@@ -11,7 +11,7 @@ declare -A INST=(
   [sad]="Speak deeply sad and heartbroken, a slow broken voice on the verge of tears."
   [anger]="Speak with intense, heated, furious anger."
 )
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 for emo in sad anger; do
   for r in r16 r32 r64; do
     ./qwen_tts -d qwen3-tts-1.7b $GAL --expr "${E[$r]}" $C --instruct "${INST[$emo]}" --text "$TXT" -o "$OUT/gal_${emo}_${r}.wav" 2>/dev/null

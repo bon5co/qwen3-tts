@@ -16,7 +16,7 @@ gen() { # margs instruct out
   if [ -z "$2" ]; then ./qwen_tts $1 $C --text "$TXT" -o "$3" 2>/dev/null
   else ./qwen_tts $1 $C --instruct "$2" --text "$TXT" -o "$3" 2>/dev/null; fi
 }
-for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_17b.qvoice --icl-only"; do
+for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_graft.qvoice --icl-only"; do
   tag="${vsel%%|*}"; varg="${vsel#*|}"
   for emo in neutral happy excited; do
     gen "-d qwen3-tts-1.7b $varg"            "${INST[$emo]}" "$OUT/${tag}_base_$emo.wav"

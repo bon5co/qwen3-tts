@@ -108,6 +108,37 @@ def main():
             stream += struct.pack("<I", len(comp)) + comp
             tot_payload += len(comp)
 
+    # v2: if the adapter trained the tag-token embedding (modules_to_save=["text_embedding"]),
+    # export it as a dense bit-delta (dtype 4). Only ~16 reused rows differ -> LZ4 tiny.
+    n_extra = 0
+    emb_key = next((k for k in ah if k.endswith("text_embedding.weight")), None)
+    if emb_key:
+        import lz4.block
+        bh2, bo2 = parse_header(os.path.join(args.base, "model.safetensors"))
+        trained = read_tensor(ap_path, ah, ao, emb_key, np.uint16).ravel()
+        base_emb = read_tensor(os.path.join(args.base, "model.safetensors"), bh2, bo2,
+                               "talker.model.text_embedding.weight", np.uint16).ravel()
+        if trained.shape != base_emb.shape:
+            print(f"  !! embedding shape mismatch {trained.shape} vs {base_emb.shape}, skipping")
+        else:
+            d16 = (trained.astype(np.int32) - base_emb.astype(np.int32)).astype(np.int16)
+            comp = lz4.block.compress(d16.tobytes(), mode="default", store_size=False)
+            nb = b"talker.model.text_embedding.weight"
+            stream += struct.pack("<H", len(nb)) + nb
+            stream += struct.pack("<I", base_emb.nbytes)
+            stream += struct.pack("<B", 4) + struct.pack("<I", len(comp)) + comp
+            n_extra = 1
+            changed = int((d16 != 0).sum())
+            # diagnostic: did the 16 reused para-tag rows (151646-151661) actually move?
+            d2 = d16.reshape(base_emb.shape[0] // 2048 if False else -1, 2048) if base_emb.size % 2048 == 0 else None
+            try:
+                d2 = d16.reshape(-1, 2048)
+                tag_changed = int((d2[151646:151662] != 0).any(axis=1).sum())
+            except Exception:
+                tag_changed = -1
+            print(f"  + text_embedding delta: {changed} changed elems, {len(comp)/1e6:.2f} MB comp "
+                  f"| TAG rows 151646-151661 changed: {tag_changed}/16")
+
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "wb") as f:
         f.write(b"QEXP")
@@ -117,7 +148,7 @@ def main():
         f.write(struct.pack("<I", 0))
         f.write(b"WDLT")
         f.write(struct.pack("<I", args.hidden))
-        f.write(struct.pack("<I", len(names)))
+        f.write(struct.pack("<I", len(names) + n_extra))
         f.write(stream)
 
     disk = os.path.getsize(args.out) / 1e6

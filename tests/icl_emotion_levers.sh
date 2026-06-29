@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 OUT=samples/icl_levers
 mkdir -p "$OUT"
 M=qwen3-tts-1.7b
-GRAFT=voices/galatea_17b.qvoice   # 0 ref_codes -> x-vector graft via --icl-only
+GRAFT=voices/galatea_graft.qvoice   # 0 ref_codes -> x-vector graft via --icl-only
 ICL=voices/galatea_icl.qvoice     # 375 ref_codes -> faithful
 TEXT="Non riesco proprio a crederci. Come hai potuto farmi questo?"
 S=42

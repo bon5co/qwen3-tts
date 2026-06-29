@@ -14,7 +14,7 @@ declare -A INST=(
 )
 gen() { if [ -z "$2" ]; then ./qwen_tts $1 $C --text "$TXT" -o "$3" 2>/dev/null
         else ./qwen_tts $1 $C --instruct "$2" --text "$TXT" -o "$3" 2>/dev/null; fi; }
-for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_17b.qvoice --icl-only"; do
+for vsel in "viv|-s vivian" "gal|--load-voice voices/galatea_graft.qvoice --icl-only"; do
   tag="${vsel%%|*}"; varg="${vsel#*|}"
   for emo in neutral sad anger; do
     gen "-d qwen3-tts-1.7b $varg --expr $R16" "${INST[$emo]}" "$OUT/${tag}_r16_$emo.wav"

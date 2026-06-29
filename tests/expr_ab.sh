@@ -39,7 +39,7 @@ run "-d $FT" "$OUT/viv_ftckpt_neutral.wav" "" -s vivian
 echo -n "  expr-vs-fullckpt: "; python3 tests/compare_audio.py "$OUT/viv_ft_neutral.wav" "$OUT/viv_ftckpt_neutral.wav" 2>&1 | tail -1
 
 echo "### GALATEA (cloned Italian voice, --icl-only graft)"
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 for e in neutral anger sad; do
   run "-d $BASE $GAL"          "$OUT/gal_base_$e.wav" "${INST[$e]}"
   run "-d $BASE $GAL --expr $EXPR" "$OUT/gal_ft_$e.wav"   "${INST[$e]}"

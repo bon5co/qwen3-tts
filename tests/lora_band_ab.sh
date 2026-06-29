@@ -6,7 +6,7 @@ set -uo pipefail
 D=qwen3-tts-1.7b; SEED=42; T=1.1; L=Italian
 BASE=presets/expr/italian_r32.expr           # L16-26 (yesterday)
 BB=presets/expr/italian_bb027_r32.expr       # L00-27 (broad band)
-GAL=voices/galatea_17b.qvoice
+GAL=voices/galatea_graft.qvoice
 O=/tmp/lora_band_ab; mkdir -p "$O"
 EMO="Non posso credere che tu l'abbia fatto davvero, sono fuori di me!"   # emotional line
 NEU="Domani mattina prendo il treno delle otto per andare in citta."      # neutral: rendering+phonetics

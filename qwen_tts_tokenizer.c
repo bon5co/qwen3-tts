@@ -832,6 +832,63 @@ int32_t *qwen_tokenizer_encode_with_special(qwen_tokenizer_t *tok, const char *t
     return qwen_tokenizer_encode(tok, text, out_len);
 }
 
+/* PARALINGUISTIC TAG carve-out. Canonical map: training/expressivity-lora/para_tag_map.json.
+ * Each [tag] is rewritten to a SINGLE reserved Qwen special-token id (LLM vision/box/tool/fim
+ * slots the TTS path never uses; the para LoRA re-binds them). Without this, the BPE splits
+ * "[sigh]" into "[","sigh","]" and the model reads it literally / falls back to laughter.
+ * Non-tag spans are BPE-encoded normally; tag ids are emitted atomically in place. */
+int32_t *qwen_tokenizer_encode_para(qwen_tokenizer_t *tok, const char *text, int *out_len) {
+    static const struct { const char *tag; int32_t id; } PARA_TAGS[] = {
+        {"[laugh]",151646},{"[sigh]",151647},{"[cough]",151648},{"[breath]",151649},
+        {"[sniff]",151650},{"[sneeze]",151651},{"[yawn]",151652},{"[uhm]",151653},
+        {"[cry]",151654},{"[surprise]",151655},{"[confirm]",151656},{"[question]",151657},
+        {"[grumble]",151658},{"[shh]",151659},{"[gasp]",151660},{"[groan]",151661},
+    };
+    const int NTAGS = (int)(sizeof(PARA_TAGS)/sizeof(PARA_TAGS[0]));
+    if (!tok || !text) { if (out_len) *out_len = 0; return NULL; }
+
+    int cap = 256, n = 0;
+    int32_t *ids = (int32_t *)malloc(cap * sizeof(int32_t));
+    if (!ids) { if (out_len) *out_len = 0; return NULL; }
+    #define PARA_PUSH(v) do { if (n >= cap) { cap *= 2; ids = (int32_t *)realloc(ids, cap * sizeof(int32_t)); } ids[n++] = (v); } while (0)
+
+    const char *p = text;
+    const char *seg = text;   /* start of the current non-tag span */
+    while (*p) {
+        int matched = -1, mlen = 0;
+        if (*p == '[') {
+            for (int i = 0; i < NTAGS; i++) {
+                int tl = (int)strlen(PARA_TAGS[i].tag);
+                if (strncmp(p, PARA_TAGS[i].tag, (size_t)tl) == 0) { matched = i; mlen = tl; break; }
+            }
+        }
+        if (matched >= 0) {
+            if (p > seg) {  /* flush the BPE of the text before this tag */
+                size_t sl = (size_t)(p - seg);
+                char *sub = (char *)malloc(sl + 1);
+                memcpy(sub, seg, sl); sub[sl] = '\0';
+                int subn = 0;
+                int32_t *sub_ids = qwen_tokenizer_encode(tok, sub, &subn);
+                for (int i = 0; i < subn; i++) PARA_PUSH(sub_ids[i]);
+                free(sub_ids); free(sub);
+            }
+            PARA_PUSH(PARA_TAGS[matched].id);
+            p += mlen; seg = p;
+        } else {
+            p++;
+        }
+    }
+    if (p > seg) {  /* flush trailing text */
+        int subn = 0;
+        int32_t *sub_ids = qwen_tokenizer_encode(tok, seg, &subn);
+        for (int i = 0; i < subn; i++) PARA_PUSH(sub_ids[i]);
+        free(sub_ids);
+    }
+    #undef PARA_PUSH
+    if (out_len) *out_len = n;
+    return ids;
+}
+
 char *qwen_tokenizer_decode(qwen_tokenizer_t *tok, const int32_t *tokens,
                             int num_tokens, int *out_len) {
     if (!tok || !tokens || num_tokens <= 0 || !tok->id_to_token) {

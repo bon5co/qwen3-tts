@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 OUT=samples/clone_boost; mkdir -p "$OUT"
 TXT="Allora, lascia che ti spieghi come stanno le cose."
 R32=presets/expr/italian_lora_r32.expr
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 C="-l Italian -T 1.1 --seed 42 -j1 --silent"
 declare -A INST=(
   [sad]="Speak deeply sad and heartbroken, a slow broken voice on the verge of tears."

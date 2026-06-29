@@ -110,10 +110,15 @@ def main():
                     sp = splice_point(y)
                     out_y = xfade_concat(xfade_concat(y[:sp], ev), y[sp:]) if sp < len(y) else xfade_concat(y, ev)
                     out_text = insert_marker_text(text, m, sp / max(1, len(y)))
-                    emo = "neutral"; used[m] += 1
+                    emo = m.strip("[]"); used[m] += 1     # emotion field = the MARKER (laugh/sigh/cough) for the CSP probe
             out = os.path.join(wav_dir, name + ".wav")
             sf.write(out, out_y, SR, subtype="PCM_16")
-            row = {"audio": out, "text": out_text, "ref_audio": out, "instruct": "", "emotion": emo}
+            # language = full name (from carrier lang code) so the CSP trainer's lang-tagged dataset works
+            LANG_FULL = {"IT":"Italian","DE":"German","ES":"Spanish","FR":"French","RU":"Russian",
+                         "KO":"Korean","JA":"Japanese","EN":"English","ZH":"Chinese","PT":"Portuguese"}
+            lang = LANG_FULL.get((c.get("lang") or "").upper(), "English")
+            row = {"audio": out, "text": out_text, "ref_audio": out, "instruct": "",
+                   "emotion": emo, "language": lang}
             f.write(json.dumps(row, ensure_ascii=False) + "\n"); rows.append(row)
 
     print(f"wrote {len(rows)} rows -> {out_jsonl}")

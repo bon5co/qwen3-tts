@@ -968,7 +968,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     int32_t *ref_text_tokens = NULL;
     int ref_text_token_len = 0;
     if (tok) {
-        text_tokens = qwen_tokenizer_encode(tok, text, &text_token_len);
+        text_tokens = qwen_tokenizer_encode_para(tok, text, &text_token_len);
         /* ICL mode: also tokenize reference text */
         if (ctx->voice_clone && !ctx->xvector_only && ctx->ref_text) {
             ref_text_tokens = qwen_tokenizer_encode(tok, ctx->ref_text, &ref_text_token_len);
@@ -1435,6 +1435,12 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * a free-running comparison meaningless; this isolates it. NULL → normal synth. */
     int   *tf_codes = NULL;     /* nframes × 16 reference codes */
     int    tf_nframes = 0;
+    /* QWEN_TF_CB_KEEP=N (codec-VC experiment): in TF replay, KEEP the model's own first N codebooks
+     * (predicted with the TARGET voice loaded) and override only codebooks N..15 from the reference
+     * clip. N=0 (default) = override all 16 (pure replay). N=1 keeps the coarse cb0 (timbre-ish) from
+     * the target voice while taking the fine cb1-15 articulation from a real cough -> cross-voice splice. */
+    int    tf_cb_keep = 0;
+    { const char *k = getenv("QWEN_TF_CB_KEEP"); if (k && *k) { tf_cb_keep = atoi(k); if (tf_cb_keep < 0) tf_cb_keep = 0; if (tf_cb_keep > 16) tf_cb_keep = 16; } }
     FILE  *code0_fp = NULL;     /* QWEN_DUMP_CODE0: Talker's greedy code0 prediction per frame */
     {
         const char *c0p = getenv("QWEN_DUMP_CODE0");
@@ -1559,9 +1565,15 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         /* Teacher-forcing replay: ride the reference rails (code0 + CP feedback). */
         if (tf_codes) {
             if (frame >= tf_nframes) break;
-            code0 = tf_codes[(int64_t)frame * 16 + 0];
+            /* codec-VC: keep the model's own code0 (target-voice timbre) when tf_cb_keep>=1 */
+            if (tf_cb_keep < 1) code0 = tf_codes[(int64_t)frame * 16 + 0];
             ctx->tf_ref_codes = tf_codes + (int64_t)frame * 16 + 1;
         }
+
+        /* In codec-VC mode the model's own code0 may sample EOS early; fall back to the reference
+         * code0 so the replay runs the full clip length instead of stopping. */
+        if (code0 == QWEN_TTS_CODEC_EOS && tf_codes && tf_cb_keep >= 1)
+            code0 = tf_codes[(int64_t)frame * 16 + 0];
 
         if (code0 == QWEN_TTS_CODEC_EOS) {
             if (!ctx->silent) fprintf(stderr, "  EOS at frame %d\n", frame);
@@ -1580,7 +1592,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
          * overwrite with the reference so the Talker's next input stays on the bf16
          * rails (identical hidden states for every precision). */
         if (tf_codes)
-            memcpy(codes, tf_codes + (int64_t)frame * 16, 16 * sizeof(int));
+            memcpy(codes + tf_cb_keep, tf_codes + (int64_t)frame * 16 + tf_cb_keep,
+                   (size_t)(16 - tf_cb_keep) * sizeof(int));
 
         memcpy(ctx->codec_codes + (int64_t)ctx->codec_frames * 16, codes, 16 * sizeof(int));
         ctx->codec_frames++;

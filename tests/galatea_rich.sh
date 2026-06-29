@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 OUT=samples/galatea_rich; mkdir -p "$OUT"
 TXT="Allora, lascia che ti spieghi come stanno le cose."
 R64=presets/expr/italian_lora_r64.expr; R128=presets/expr/italian_lora_r128.expr
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 C="-l Italian -T 1.1 --seed 42 -j1 --silent"
 declare -A INST=(
   [bitter]="Speak with bitter, resentful sarcasm, cold and wounded."

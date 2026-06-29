@@ -14,7 +14,7 @@ for e in neutral sad anger; do
   echo "  viv $e done"
 done
 echo "### CLONE galatea cross-lingual French (base vs +french_r64)"
-GAL="--load-voice voices/galatea_17b.qvoice --icl-only"
+GAL="--load-voice voices/galatea_graft.qvoice --icl-only"
 for e in sad anger; do
   gen "-d qwen3-tts-1.7b $GAL"             "${INST[$e]}" "$OUT/gal_base_$e.wav"
   gen "-d qwen3-tts-1.7b $GAL --expr $R64" "${INST[$e]}" "$OUT/gal_r64_$e.wav"
