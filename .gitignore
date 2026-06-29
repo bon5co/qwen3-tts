@@ -2,6 +2,7 @@
 *.wav
 !samples/*.wav
 !samples/voice_clone_refs/**
+!samples/emotion_examples/**
 !tests/golden/*.wav
 *.py
 !tests/*.py

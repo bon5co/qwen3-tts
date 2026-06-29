@@ -197,13 +197,23 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
     --text "Allora, lascia che ti spieghi come stanno le cose." -o sad.wav
 ```
 
+**🔊 Hear it** — committed examples in [`samples/emotion_examples/`](samples/emotion_examples) (play after clone:
+`afplay samples/emotion_examples/<file>.wav`, or click to download):
+
+| voice · language | examples |
+|---|---|
+| ryan · Italian (preset) | [sad](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_sad.wav) · [joy](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_joy.wav) · [fear](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_fear.wav) |
+| galatea · Italian (cloned voice) | [sad](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_sad.wav) |
+| vivian · German | [anger](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/de_vivian_anger.wav) |
+| ono_anna · Japanese | [sad](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_sad.wav) |
+| sohee · Korean | [anger](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ko_sohee_anger.wav) |
+
 - **Emotions:** `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
+- **The recipe:** a **preset voice** → pure **STEER** (the steering vector @ w12, clean in every language); a
+  **cloned voice** → **COMBINE** (the language `.expr` + steer). Use the **native preset per language** (JA
+  `ono_anna`, KO `sohee`, ZH `vivian`, EN/Romance `ryan`); the engine prints a hint. Full recipe →
+  [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Works in every Qwen3-TTS language** (EN, IT, DE, ZH, RU, KO, JA, ES, FR, PT) — just set `-l <Language>`.
-  The steering vector carries the emotion (a language-agnostic activation direction); the `.expr` renders and
-  stabilizes the language. **DE / FR / IT have a native `.expr`**; the other languages use the Italian pack as
-  a universal cross-language renderer (ear-validated on IT/ES/RU/ZH/JA/KO).
-- **Cloned voices** emote with the same one flag (the engine picks the clone's own steer dir when it has one,
-  else a universal palette). Clones default to a clean **x-vector** load; see [Voice Cloning](#voice-cloning).
 - **Paralinguistics → inline `[tags]`, also automatic.** Write `[laugh]` or `[sigh]` in `--text` and the engine
   performs the event (it picks the onomatopoeia anchor + the right vector for you) — no flags:
   ```bash
