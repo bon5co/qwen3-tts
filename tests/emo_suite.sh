@@ -12,7 +12,8 @@
 #       <lang>_<voice>_<emo>_combine_w8_expr.wav       (expr + steer w8 + instruct)
 #   • GALATEA clone folder: contrasting emotions across a few languages (COMBINE, the clone cross-lang win).
 #
-# GOLD native preset per language: ryan = IT/EN/PT ; vivian = DE/FR/ES/ZH ; ono_anna = JA ; sohee = KO.
+# GOLD native preset per language: ryan = IT/EN/PT/RU ; vivian = DE/FR/ES/ZH ; ono_anna = JA ; sohee = KO.
+#   (RU = ryan: vivian sits too high-pitched on Russian — ear-verdict 2026-06-30.)
 # 1.7B CustomVoice, seed 42, ml-range 21-25, ml-decay 0.985 (engine default).
 #
 # Scope to a subset: LANGS="de fr es" bash tests/emo_suite.sh   (default = all). EMOS="anger sad" to subset emotions.
@@ -48,7 +49,7 @@ declare -A LCFG=(
  [zh]="Chinese|-s vivian|vivian|presets/expr/italian_csp_topk6.expr"
  [ja]="Japanese|-s ono_anna|ono_anna|presets/expr/italian_csp_topk6.expr"
  [ko]="Korean|-s sohee|sohee|presets/expr/italian_csp_topk6.expr"
- [ru]="Russian|-s vivian|vivian|presets/expr/italian_csp_topk6.expr"
+ [ru]="Russian|-s ryan|ryan|presets/expr/italian_csp_topk6.expr"
  [pt]="Portuguese|-s ryan|ryan|presets/expr/italian_csp_topk6.expr")
 
 # EMOTION-MATCHED prompts: "tag_emo" -> sentence whose meaning fits the emotion.

@@ -46,7 +46,7 @@ echo "== multilingual highlights (emotion works in every Qwen language, on the N
 gen de_vivian_anger.wav   -s vivian   -- anger German   "Also, lass mich dir in Ruhe erklaeren, wie die Dinge wirklich stehen."
 gen fr_vivian_sad.wav     -s vivian   -- sad   French   "Bon, laisse-moi t'expliquer calmement comment les choses se passent vraiment."
 gen es_vivian_joy.wav     -s vivian   -- joy   Spanish  "Bueno, dejame explicarte con calma como estan realmente las cosas."
-gen ru_vivian_anger.wav   -s vivian   -- anger Russian  "Как ты смеешь так со мной разговаривать? Это неприемлемо, я этого не потерплю!"
+gen ru_ryan_anger.wav     -s ryan     -- anger Russian  "Как ты смеешь так со мной разговаривать? Это неприемлемо, я этого не потерплю!"
 gen zh_vivian_joy.wav     -s vivian   -- joy   Chinese  "我简直不敢相信，这是我一生中最好的消息，我太高兴了！"
 gen ja_ono_anna_sad.wav   -s ono_anna -- sad   Japanese "私が持っていたものを全て失って、もうどうすればいいのか分からない。"
 gen ko_sohee_anger.wav    -s sohee    -- anger Korean   "네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!"

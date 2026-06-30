@@ -55,5 +55,8 @@ Notes:
   (`reference_dgx_ft_checkpoints`) — NOT shipped (k6 won for DE/FR).
 - steer vectors (`presets/steer/emotion/ryan_*.qlsteer`): committed in git.
 
+## Russian
+Native preset = **ryan** (not vivian — vivian sits too high-pitched on Russian, ear-verdict 2026-06-30).
+
 ## Try it
 `make emotion-demo` (Italian ×6 + multilingual + galatea clone) → `samples/tests/emotion_demo/`.
