@@ -23,8 +23,8 @@ scp "$HERE/dgx_csp_06b_italian.sh" "$HERE/prepare_emozionalmente.py" "$HERE/conc
 echo "[sync-06b] export tool -> $ROOT/tests/"
 scp "$REPO/tests/expr_extract.py" "$DGX:$ROOT/tests/"
 
-echo "[sync-06b] docker-run trainers (shared, model-agnostic) -> $ROOT/Qwen3-TTS/finetuning/"
-scp "$HERE/csp_probe.py" "$HERE/dgx_sft_expr_csp.py" "$HERE/dgx_dataset_expr_lang.py" \
+echo "[sync-06b] docker-run trainers (0.6B-specific copies, text_projection fix) -> $ROOT/Qwen3-TTS/finetuning/"
+scp "$HERE/csp_probe_06b.py" "$HERE/dgx_sft_expr_csp_06b.py" "$HERE/dgx_dataset_expr_lang.py" \
     "$HERE/prepare_data.py" "$DGX:$ROOT/Qwen3-TTS/finetuning/"
 
 echo "[sync-06b] done. On the DGX:"

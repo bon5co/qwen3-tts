@@ -128,7 +128,7 @@ if is_done probe; then say "skip probe"; else
   stage probe
   run_train "
     cd /root/qwen-ft/Qwen3-TTS/finetuning &&
-    python3 -u csp_probe.py --train_jsonl $CODES \
+    python3 -u csp_probe_06b.py --train_jsonl $CODES \
       --init_model_path $MODEL --out_json $PROBE_JSON --epochs 3 --top_k $TOPK
   " 2>&1 | tee -a "$LOG"
   need_file probe "$PROBE_JSON"; mark probe
@@ -143,7 +143,7 @@ if is_done train; then say "skip train"; else
   stage train
   run_train "
     cd /root/qwen-ft/Qwen3-TTS/finetuning &&
-    python3 -u dgx_sft_expr_csp.py --train_jsonl $CODES \
+    python3 -u dgx_sft_expr_csp_06b.py --train_jsonl $CODES \
       --init_model_path $MODEL --output_model_path $OUT_CKPT \
       --csp-layers '$CSP_LAYERS' --scope full --num_epochs $EPOCHS_FT &&
     chmod -R a+rX $OUT_CKPT
