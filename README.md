@@ -213,7 +213,7 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
 | Spanish | vivian | 😄 joy | *Bueno, déjame explicarte con calma cómo están realmente las cosas.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy.wav) |
 | Spanish | vivian | 🤢 disgust | *¿Pero qué es esto? Es asqueroso, ni siquiera puedo mirarlo.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_disgust.wav) |
 | Chinese | vivian | 😄 joy | *我简直不敢相信，这是我一生中最好的消息，我太高兴了！* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/zh_vivian_joy.wav) |
-| Russian | vivian | 😠 anger | *Как ты смеешь так со мной разговаривать? Это неприемлемо!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ru_vivian_anger.wav) |
+| Russian | ryan | 😠 anger | *Как ты смеешь так со мной разговаривать? Это неприемлемо!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ru_ryan_anger.wav) |
 | Japanese | ono_anna | 😢 sad | *私が持っていたものを全て失って、もうどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_sad.wav) |
 | Japanese | ono_anna | 😨 fear | *家に誰かいる、足音が聞こえた……怖くてどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_fear.wav) |
 | Korean | sohee | 😠 anger | *네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ko_sohee_anger.wav) |
@@ -230,6 +230,24 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
   ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian -T 1.1 \
       --text "Che giornata... [sigh] non ce la faccio più. [laugh]" -o para.wav
   ```
+
+#### Emotion + paralinguistics together (experimental 🧪)
+
+You can put a paralinguistic `[tag]` **inside an emotional sentence** and get both at once — e.g. `--emotion joy`
++ `[laugh]`. When a `[tag]` is present the engine switches the emotion to its **COMBINE** stack (the `.expr`
+language-correction keeps the event from drifting the accent) and rides the laugh/sigh steering vector at the
+per-voice weight (ryan w6, others w8). The pure-emotion path (no tag) is unchanged. This is **still a bit
+unstable** across some languages/voices (work in progress) — the clearest results are `[laugh]`/`[sigh]` on
+`ryan`/`vivian`. Reproduce with `make emotion-para-demo`.
+
+| Language | Voice | Emotion + tag | Text | Listen |
+|----------|-------|---------------|------|--------|
+| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_joy_laugh.wav) |
+| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_sad_sigh.wav) |
+| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_en_joy_laugh.wav) |
+| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
+| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy_laugh.wav) |
+| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_joy_laugh.wav) |
 
 **Get the assets** (needed once, for the `.expr` fine-tunes — the steering vectors already ship in this repo):
 

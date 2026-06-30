@@ -58,5 +58,24 @@ Notes:
 ## Russian
 Native preset = **ryan** (not vivian — vivian sits too high-pitched on Russian, ear-verdict 2026-06-30).
 
+## Emotion + paralinguistics (`[laugh]`/`[sigh]`/… inside an emotional line) — experimental
+`--emotion` composes with an inline paralinguistic `[tag]` in `--text`. **Only when a para event tag is present**
+the emotion switches to the validated **para+emo setup** (it does NOT change the pure-emotion path above):
+- **force COMBINE** even on a preset STEER cell — the per-language `.expr` is the language-correction that stops
+  the EN-captured para anchor (`ahahah`/`haaah`) from drifting the accent (without it: language drift + metallic).
+- **emotion steer** at the cell weight (w12) + a default English instruct.
+- **para steering vector** (`presets/steer/paraling/{laugh_vs_cry,sigh_vs_laugh}.qlsteer`, L21-25) at its
+  **per-voice** weight: **ryan w6** (most sensitive — w8 goes metallic/derails), **galatea/vivian w8**.
+
+Engine: `compose_from_text` + `text_has_para_event()` + `para_active` in `main.c` (the per-span loop preserves
+the global emotion steer/expr on spoken spans; each `[tag]` span swaps in its para vector). `[laugh]`/`[sigh]` use
+the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onomatopoeia macros.
+
+> ⚠️ **STILL UNSTABLE (TODO, plan_emo_v3) — much better than before, but not solid across all langs/voices.**
+> Clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Known rough edge: on a CLONE the laugh span (a separate
+> cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
+> per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).
+
 ## Try it
-`make emotion-demo` (Italian ×6 + multilingual + galatea clone) → `samples/tests/emotion_demo/`.
+- `make emotion-demo` (Italian ×6 + multilingual + galatea clone) → `samples/tests/emotion_demo/`.
+- `make emotion-para-demo` (emotion + inline `[tag]` across langs/speakers) → `samples/tests/emotion_para_demo/`.

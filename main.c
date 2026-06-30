@@ -807,6 +807,28 @@ static int text_has_markup(const char *text) {
     return 0;
 }
 
+/* Does `text` contain at least one PARALINGUISTIC event tag (steering-vector [laugh]/[sigh] OR a
+ * COMPOSE_MACRO filler [huff]/[ugh]/…)? When a para event rides together with a routed `--emotion`,
+ * the engine switches the EMOTION application to the ear-validated para+emo setup (COMBINE: the
+ * language-correction .expr keeps the EN-captured para anchor from drifting the accent), and the
+ * para steering vector uses its per-voice weight. The pure-emotion (no para) path is UNCHANGED —
+ * presets stay STEER-only as shipped. (Excludes [pause]/[neutral]/emotion-mood tags.) */
+static int text_has_para_event(const char *text) {
+    for (const char *p = strchr(text, '['); p; p = strchr(p + 1, '[')) {
+        const char *c = strchr(p, ']');
+        if (!c) continue;
+        size_t tl = (size_t)(c - p - 1);
+        char tag[64];
+        if (tl >= sizeof(tag)) continue;
+        memcpy(tag, p + 1, tl); tag[tl] = 0;
+        char *t = tag; while (*t == ' ') t++;
+        char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
+        for (int m = 0; PARA_VECTORS[m].tag; m++)   if (strcasecmp(t, PARA_VECTORS[m].tag) == 0)   return 1;
+        for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
+    }
+    return 0;
+}
+
 static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                         const char *language, float default_pause,
                         const char *output, int silent);   /* fwd (defined below) */
@@ -1032,7 +1054,12 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
             int sL = 0, sD = 0;
             if (load_qlsteer_buf(ctx, spans[i].ml_steer_path, &span_steer, &sL, &sD) == 0) {
                 ctx->ml_steer = span_steer; ctx->ml_steer_layers = sL; ctx->ml_steer_dim = sD;
-                ctx->ml_steer_weight = spans[i].ml_steer_weight;
+                /* Per-voice paralinguistic weight (win recipe, ear 2026-06-25/28): galatea·vivian = 8,
+                 * ryan = 6 (ryan is the most sensitive — w8 goes metallic/derails, w6 stabilizes). The
+                 * table default is 8; cap to 6 on the ryan preset only. */
+                float pw = spans[i].ml_steer_weight;
+                if (ctx->speaker_id == QWEN_TTS_SPEAKER_RYAN && pw > 6.0f) pw = 6.0f;
+                ctx->ml_steer_weight = pw;
                 ctx->ml_steer_l0 = spans[i].ml_l0; ctx->ml_steer_l1 = spans[i].ml_l1;
                 ctx->ml_steer_decay = 0.985f; ctx->ml_steer_frames = 0;
                 /* VARIETY (safe): every generate() resets RNG to ctx->seed, so repeated identical [tag]s
@@ -1049,7 +1076,7 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                     }
                 }
                 if (!silent) fprintf(stderr, "  [paraling steer: %s w%.0f L%d-%d seed %u]\n",
-                                     spans[i].ml_steer_path, spans[i].ml_steer_weight, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
+                                     spans[i].ml_steer_path, pw, spans[i].ml_l0, spans[i].ml_l1, ctx->seed);
             }
         }
 
@@ -1779,13 +1806,18 @@ int main(int argc, char **argv) {
      * a vivid English instruct ONLY on EXPR/COMBINE cells (validated STEER cells use NO instruct — the steer
      * vector carries the emotion). instruct + temperature are CONSUMED before the late router, so set them
      * here. The user's -I / -T always override. 1.7B routed emotions only. */
+    /* Para-active = the --text carries a paralinguistic event tag ([laugh]/[sigh]/[huff]/…). ONLY then does
+     * a routed emotion switch to the validated para+emo setup (COMBINE: the .expr language-correction stops
+     * the EN-captured para anchor from drifting the accent + the emotion instruct). The pure-emotion path
+     * (no para) is untouched — presets stay STEER-only as shipped. */
+    int para_active = text && !no_compose && text_has_para_event(text);
     if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec)) {
         const char *etok = emotion_tok(emotion_spec);
         char evk[64];
         const char *evoice = emotion_voice_key(load_voice != NULL, load_voice, speaker_name, evk, sizeof(evk));
         emo_cell_t ecell; float etemp;
         resolve_emotion_recipe(language, evoice, load_voice != NULL, etok, &ecell, &etemp);
-        if (!instruct && ecell.use_expr) {   /* instruct only when the recipe uses expr (EXPR/COMBINE) */
+        if (!instruct && (ecell.use_expr || para_active)) {   /* instruct on EXPR/COMBINE cells, AND on para+emo */
             instruct = default_emotion_instruct(emotion_spec);
             if (instruct && !silent)
                 fprintf(stderr, "Emotion '%s': default English instruct \"%s\" (override with -I)\n", emotion_spec, instruct);
@@ -1833,8 +1865,14 @@ int main(int argc, char **argv) {
      * (--compose calls the same helper per span; see below.) */
     /* Auto-route a tagged --text (e.g. "Ciao [sad] ... [sigh]") through the
      * inline-markup composer, so users get expressive markup without a new flag. */
+    int compose_from_text = 0;
     if (!compose_spec && !no_compose && text && text_has_markup(text)) {
         compose_spec = text;
+        compose_from_text = 1;   /* inline [tags] in --text: the WHOLE text is one --emotion, so keep the
+                                  * routed emotion's global expr/steer (applied below) — the compose loop
+                                  * preserves ctx->ml_steer across spoken spans while each [tag] span swaps
+                                  * in its own paralinguistic vector. (An explicit --compose spec is per-span
+                                  * and does NOT get the blanket emotion router.) */
         if (!silent) fprintf(stderr, "Inline markup detected in --text -> compose mode\n");
     }
     if (no_compose && !silent && text && text_has_markup(text))
@@ -2908,8 +2946,10 @@ int main(int argc, char **argv) {
      * ear-validated per-(voice×emotion) recipe CELL (plan §8.3) — NOT a blanket combine. Each cell's
      * mode (EXPR-only / STEER-only / COMBINE) is chosen by use_expr/use_steer; adding expr to a STEER
      * cell softens the emotion (galatea anger → "sad"). Runs here (voice+lang+ctx known). Manual
-     * --expr/--ml-steer override; instruct+temp were defaulted earlier. */
-    if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048) {
+     * --expr/--ml-steer override; instruct+temp were defaulted earlier. Also runs when compose mode was
+     * auto-entered from inline [tags] in --text (compose_from_text) so `--emotion` + e.g. [laugh]/[sigh]
+     * still emotes the spoken spans — the per-span compose loop preserves this global steer/expr. */
+    if (emotion_spec && (!compose_spec || compose_from_text) && ctx->config.hidden_size >= 2048) {
         const char *tok = emotion_tok(emotion_spec);
         if (tok) {
             char vkbuf[64];
@@ -2919,8 +2959,14 @@ int main(int argc, char **argv) {
              * docs/emotion-THE-recipe.md is the aligned single source of truth. */
             emo_cell_t cell; float rtemp;
             resolve_emotion_recipe(language, voice_key, ctx->voice_clone, tok, &cell, &rtemp);
-            int want_expr = cell.use_expr;
+            /* PARA+EMO: when a paralinguistic [tag] is active, force COMBINE even on a preset STEER cell —
+             * the .expr is the language-correction that keeps the EN-captured para anchor ([laugh]/[sigh]/…)
+             * from drifting the accent (validated para+emo recipe). The emotion steer stays at the cell's
+             * weight; the para vector rides per-span at its per-voice weight. NO-para path is unchanged. */
+            int want_expr = cell.use_expr || para_active;
             float ew = cell.use_expr ? cell.expr_w : 1.0f;
+            if (para_active && !cell.use_expr && !silent)
+                fprintf(stderr, "Emotion '%s': para active -> COMBINE (expr language-correction) for this clip\n", emotion_spec);
 
             /* (1) per-language .expr (FT). Skip if the user passed --expr (their override applies below). */
             if (want_expr && !expr_path) {
