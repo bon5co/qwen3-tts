@@ -155,7 +155,9 @@ fi
 if is_done export; then say "skip export"; else
   stage export
   python3 -c 'import numpy' 2>/dev/null || pip install --break-system-packages -q numpy 2>&1 | tail -2
-  python3 "$ROOT/tests/expr_extract.py" "$MODEL" "$OUT_CKPT/checkpoint-final" "$EXPR_OUT" \
+  # export runs on the HOST -> use the HOST model path ($ROOT/...), NOT the container path ($MODEL=/root/...).
+  MODEL_HOST="${MODEL/\/root\/qwen-ft/$ROOT}"
+  python3 "$ROOT/tests/expr_extract.py" "$MODEL_HOST" "$OUT_CKPT/checkpoint-final" "$EXPR_OUT" \
       --lang Italian --hidden 1024 2>&1 | tee -a "$LOG"
   need_file export "$EXPR_OUT"; mark export
 fi
