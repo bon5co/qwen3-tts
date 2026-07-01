@@ -191,6 +191,28 @@ The 4 discovery wins hold across voices, each with its own winning seed (pin per
 | **pleasure / aroused** | `嗯` | vivian · s42 · joy | "godimento ahhhwww" — ends metallic → explore other seeds on vivian |
 | **`[aww]` tender-wonder** | `呜呜` | galatea · any seed · sad | soft cooing "uooo" — adoring/tender ("che bel cucciolo tenero"). NOT a cry. |
 
+### T3-explore — 2-class seed rule CONFIRMED + the `嗯` seed→meaning goldmine + cross-lang (2026-07-01)
+**A) 🤯 `嗯` (mmm) is a MULTI-EVENT trigger — the SEED selects the meaning** (vivian IT, joy). One CN char, many
+events — this is the T4 variants engine in miniature:
+| trigger · voice · seed | event | candidate tag |
+|---|---|---|
+| `嗯` vivian s100 | mmm of taste/pleasure (food), short | `[mmm]` (pleasure-taste) |
+| `嗯` vivian s256 | aroused "gode, eh eh, mmm delizioso" | `[moan]` (pleasure-aroused) |
+| `嗯` vivian s777 | scornful/dismissive "mmm!" | `[hmpf]` (disdain) |
+| `嗯` vivian s1234 | dry "mm-mm, sì sì" confirmation | `[mhm]` (confirmation = Step confirmation-en) |
+| `嗯` vivian s2024 | tired/sated sighed mmm | `[mmm]` (tired-pleasure) — a variant |
+| `嗯` vivian s333 | ❌ laughs then long yawn, doesn't speak | KO |
+
+**B) 2-CLASS SEED RULE — CONFIRMED on a 2nd clone (quijote ES):** clones share a seed, presets share another.
+- **`[gasp]` `啊`: CLONE=s7 (galatea ✅ + quijote ✅), PRESET=s42 (ryan ✅ + vivian ✅)** — the clean 2-class split.
+- `[groan]` `哼` = **s42 universal** (quijote → a "TSK" win too). `[mmm]` `嗯` "delizioso" = **s7 universal** (quijote win).
+- `[yawn]` `哈啊`: CLONE=s42 / PRESET=s7 (quijote works at both, s7 a touch cleaner — slight tail noise either way).
+- quijote s42 gasp = a nice **longer gasp variant** (sospirato). → **⇒ MAP RULE = per-event {clone-seed, preset-seed},
+  not per-voice** (vivian only deviates on `[sigh]` onom = `ahh`). Test a 3rd clone later to lock it.
+
+**C) Cross-language:** gasp `啊` + groan `哼` hold on **ryan-ENGLISH** ✅ (CN triggers are language-agnostic). mmm-EN
+a touch metallic at the end; yawn-EN = a short "mini-yawn" (a yawn variant). → CN onomatopoeia works across langs.
+
 ### CRY — dedicated hunt plan (user 2026-07-01: "a real cry almost came with strongly-pushed sad + steer in some sentences")
 Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and low-arousal). Ideas to try:
 - **Onomatopoeia candidates:** `呜呜` (wuwu — gave yawn here), `呜咽` (sob), `啜泣`, `哇` (loud wail — also surprise),
