@@ -148,6 +148,24 @@ ryan/clone/other. Nits: mild metallic tail on ryan laugh (later). `haha`@T1.0=al
 
 ---
 
+## T3 — new-event discovery (2026-07-01, galatea clone IT, CN triggers from Step-Audio-EditX + related emotion)
+Reinforces the SEED rule hard: groan works ONLY at s42 (s7 = nothing), yawn works ONLY at s42 (s7 weak),
+while gasp/mmm work at s7 — **each (event × trigger × voice) has its own winning seed, always pin it.**
+| new tag | trigger | emotion | seed | verdict | ear note |
+|---|---|---|---|---|---|
+| **`[gasp]`** | `啊` (CN) | surprise | **7** | ✅ **WIN** | "ah!" breve, stupore incredulo (s42 = più `eh!` secco, weaker) |
+| **`[groan]` / `[growl]`** | `哼` (CN) | anger | **42** | ✅ **WIN** | rabbia + `arggg/grrr` — molto bello (⚠️ s7 = renders NOTHING) |
+| **`[mmm]` / `[pleasure]`** | `嗯` (CN) | joy | **7** | ✅ **WIN** | "mmm" breve, "davvero delizioso" (s42 = drifts language, KO) |
+| **`[yawn]`** | `哈啊` (CN) | sad/tired | **42** | ✅ **TOP WIN** | sbadiglio stanco `ahh` (s7 = weaker/less effective) |
+| chuckle | `呵呵` (CN) | joy | 7/42 | ❌ KO (→ sigh) | fa `awww`/uff sospirato, non una risatina — needs another trigger |
+| cry | `呜呜` (CN) | sad | 7/42 | ❌ KO (→ yawn) | esce uno sbadiglio, non pianto (s42 also a bit of tail noise). laugh≈cry≈yawn confusable |
+| gasp | `哇` (CN) | surprise | 42 | 🟡 undefined | "waaah" — unclear how to map |
+
+**⇒ NEW events to add to the map (pending cross-voice validation on ryan/vivian):** `[gasp]`→`啊` s7 ·
+`[groan]`→`哼` s42 · `[mmm]`→`嗯` s7 · `[yawn]`→`哈啊` s42. Still open: chuckle (呵呵→sigh), cry (呜呜→yawn).
+
+---
+
 ## Status legend
 ✅ WIN (promote to the `[tag]` map) · 🟡 interesting/partial (keep, needs a pick) · ❌ KO (do not re-run) · ↪ produced a different event.
 
