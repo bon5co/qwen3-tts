@@ -43,22 +43,34 @@ Carriers used below:
 
 → **Sigh mapping candidates (galatea IT):** short = `唉` s42 · medium = `唉` s7 (or `哈哈` s7) · long = `唉` s2024 / `ahh` s2024.
 
-### 😄 LAUGH  (`--emotion joy`)  — ❌ NOT solved inline in Italian yet
+### 😄 LAUGH — ✅ solved inline in **English**, ❌ still not in Italian (plain onomatopoeia)
+**English (ryan, `--emotion joy`, no event-instruct):**
 | onomatopoeia | seed | verdict | ear note |
 |---|---|---|---|
-| `hahaha` | 7 / 42 / 2024 | ❌ KO | svaria male (non ride) |
-| `哈哈` (CN) | 42 / 2024 | ❌ KO | svaria / troppo lungo / rumore, non ride |
-| `哈哈` (CN) | 7 | ↪ became a **sigh** | (logged above as a sigh WIN) |
+| `hahaha` | 42 | ✅ **WIN (EN)** | ride; solo un filo metallico a fine (over di poco) — la risata inline in inglese esce |
+| `hahaha` + laugh-instruct | 42 | ❌ KO | l'instruct-laugh esplicito lo fa **svariare metallico** → NON aggiungere event-instruct al laugh |
 
-**⚠️ KEY OPEN PROBLEM:** in **Italian the onomatopoeia SIGHS instead of laughing** ("EN laughs, IT sighs",
-plan_emo_v3 §8.10/L760). Historically galatea-IT DID laugh — but **only via the `laugh−cry` steering vector**
-(plan L783 "galatea lvc_w8 = TOP, ride"), which is the split-span/"splice" we rejected. So the **inline** laugh
-in IT is still unsolved. NEXT experiments (do NOT repeat the KO plain-onomatopoeia sweep above):
-1. inline `哈哈`/`ehehe`/`ihih` + an **explicit laugh instruct** ("Burst out laughing with bright joyful
-   giggles.") to tip IT into laughing in one generation (the user's "sfrutta meglio l'instruct" lever);
-2. confirm **ryan-EN** laughs inline on `hahaha` (English path — expected to work, gives a reference);
-3. only if inline can't laugh in IT: revisit whether the vector can be applied **within** the single
-   generation (positional, not a separate span) — research, not the split-span.
+**Italian (galatea clone, `--emotion joy`) — plain onomatopoeia (KO) AND laugh-instruct (KO):**
+| onomatopoeia | seed | verdict | ear note |
+|---|---|---|---|
+| `hahaha` | 7/42/2024 | ❌ KO | svaria male, non ride |
+| `哈哈` (CN) | 7 | ❌ KO (laugh) | `ah ah!` 2×, non ride |
+| `ehehe` | 42/7 | ❌ KO | metallico |
+| `ehehe` | 2024 | 🟡 partial | regge ma finisce metallico, sospiro medio `ehhhh` |
+
+**⚠️ KEY (2026-07-01):** in **Italian the onomatopoeia SIGHS/derails, never laughs** ("EN laughs, IT sighs",
+plan §8.10/L760). The explicit **laugh-instruct HURTS** (metallic) — for laugh use onomatopoeia + `--emotion`
+ONLY, no event-instruct. Historically galatea-IT laughed **only via the `laugh−cry` steering vector**
+(split-span = the rejected "splice"). So: **`[laugh]` ships INLINE for English (`hahaha`+joy); inline laugh
+in Italian/clone stays UNSOLVED.** NEXT (don't repeat the KO sweeps above): fix the mild metallic tail on the
+EN win (try `-T 1.0`, shorter `haha`, or trim the tail); for IT, explore other triggers only if a new idea appears.
+
+### 🎭 SERENDIPITOUS NEW-TAG candidates (galatea IT, from the laugh sweep — keep for future tags)
+These did NOT laugh but produced a **clean, distinct OTHER event in-voice** — promote to their own `[tag]` later:
+| sound | trigger | seed | note |
+|---|---|---|---|
+| **scoff / sneer** (sbeffeggio) | `哈哈` (CN) + laugh-instruct | 42 | `AHH!` sospirato = risata breve sprezzante/di scherno — a real scornful scoff |
+| **pant / aroused** (ansimo) | `哈哈` (CN) + laugh-instruct | 2024 | `ah ah ah` poi ansima — a panting/aroused vocalization |
 
 ---
 
