@@ -43,34 +43,49 @@ Carriers used below:
 
 → **Sigh mapping candidates (galatea IT):** short = `唉` s42 · medium = `唉` s7 (or `哈哈` s7) · long = `唉` s2024 / `ahh` s2024.
 
-### 😄 LAUGH — ✅ solved inline in **English**, ❌ still not in Italian (plain onomatopoeia)
-**English (ryan, `--emotion joy`, no event-instruct):**
-| onomatopoeia | seed | verdict | ear note |
-|---|---|---|---|
-| `hahaha` | 42 | ✅ **WIN (EN)** | ride; solo un filo metallico a fine (over di poco) — la risata inline in inglese esce |
-| `hahaha` + laugh-instruct | 42 | ❌ KO | l'instruct-laugh esplicito lo fa **svariare metallico** → NON aggiungere event-instruct al laugh |
+### 😄 LAUGH — ✅ SOLVED inline both English AND Italian/clone (2026-07-01)
+**Two levers that crack it: (1) SHORT onomatopoeia (`haha`, not `hahaha` — the long form over-laughs into a
+pant/"godimento"); (2) the RIGHT LANGUAGE of the onomatopoeia — Chinese `哈哈哈` makes the CLONE laugh in
+Italian where Latin letters only sigh (user's CN hypothesis, confirmed). No event-instruct (it goes metallic).**
 
-**Italian (galatea clone, `--emotion joy`) — plain onomatopoeia (KO) AND laugh-instruct (KO):**
+**English (ryan, `--emotion joy`):**
+| onomatopoeia | T | seed | verdict | ear note |
+|---|---|---|---|---|
+| `haha` | **1.0** | **42** | ✅✅ **TOP WIN** | risata clean e breve `ehehe`, pulita, **finisce la frase** — the shippable EN laugh |
+| `haha` | 0.9 | 42 | ✅ **WIN** | ride medio-lungo, ci sta bene |
+| `hahaha 哈哈` (EN+ZH mix) | 1.1 | 42 | ✅ **WIN (TOP)** | risata media bella, finisce la frase |
+| `hahaha` | 0.9/1.0/1.1 | 42/7 | ❌ KO | svaria in `ah ah ah` pant/"godimento", metallico, spesso non finisce la frase |
+| `哈哈` | 1.0 | 42 | ❌ KO | ride troppo + ansima, si allunga, non finisce |
+| `hahaha` + laugh-instruct | 1.1 | 42 | ❌ KO | l'event-instruct lo fa svariare metallico → NON aggiungere instruct al laugh |
+
+**Italian — galatea clone (`--emotion joy`, T1.1):**
 | onomatopoeia | seed | verdict | ear note |
 |---|---|---|---|
-| `hahaha` | 7/42/2024 | ❌ KO | svaria male, non ride |
-| `哈哈` (CN) | 7 | ❌ KO (laugh) | `ah ah!` 2×, non ride |
+| `哈哈哈` (CN) | **7** | ✅✅ **WIN — clone laughs in IT!** | ride, breve, **con la voce clonata** — CN cracks the "IT sighs" wall |
+| `哈哈哈` (CN) | 42 | ❌ KO | non ride, iperventila/affannato poi finisce la frase |
+| `hahaha` (Latin) | 7/42/2024 | ❌ KO | svaria / non ride (Latin sighs in IT) |
+| `哈哈` (CN, 2 chars) | 7 | ❌ KO | `ah ah!` 2×, non ride (needs the 3rd char `哈哈哈`) |
 | `ehehe` | 42/7 | ❌ KO | metallico |
-| `ehehe` | 2024 | 🟡 partial | regge ma finisce metallico, sospiro medio `ehhhh` |
 
-**⚠️ KEY (2026-07-01):** in **Italian the onomatopoeia SIGHS/derails, never laughs** ("EN laughs, IT sighs",
-plan §8.10/L760). The explicit **laugh-instruct HURTS** (metallic) — for laugh use onomatopoeia + `--emotion`
-ONLY, no event-instruct. Historically galatea-IT laughed **only via the `laugh−cry` steering vector**
-(split-span = the rejected "splice"). So: **`[laugh]` ships INLINE for English (`hahaha`+joy); inline laugh
-in Italian/clone stays UNSOLVED.** NEXT (don't repeat the KO sweeps above): fix the mild metallic tail on the
-EN win (try `-T 1.0`, shorter `haha`, or trim the tail); for IT, explore other triggers only if a new idea appears.
+**⇒ LAUGH mapping:** EN/preset → `haha` @ **T1.0** s42 · clone/IT → **`哈哈哈` (CN)** s7 · EN+ZH mix `hahaha 哈哈`
+also TOP. Seed is decisive (`哈哈哈` s7 laughs, s42 hyperventilates) — always pin the validated seed. SHORT form
++ no event-instruct.
 
-### 🎭 SERENDIPITOUS NEW-TAG candidates (galatea IT, from the laugh sweep — keep for future tags)
+### 🀄 Chinese cross-voice para on the clone (galatea IT) — the rest
+| event | trigger | seed | verdict | ear note |
+|---|---|---|---|---|
+| cough | `咳咳` (CN) | 42 | ❌ KO (as cough) | non tossisce; sospira pulito e finisce la frase (a clean sigh, not a cough) |
+| mmm/pleasure | `嗯` (CN) | 42 | ❌ KO | non fa nulla para, forse non finisce la frase |
+
+→ CN unlocks the **vocal** family (laugh now too, sigh already) but **articulatory** cough still hits the
+decoder ceiling even in Chinese. Consistent with the whole project: vocal events achievable, articulatory not.
+
+### 🎭 SERENDIPITOUS NEW-TAG candidates (galatea IT — keep for future tags)
 These did NOT laugh but produced a **clean, distinct OTHER event in-voice** — promote to their own `[tag]` later:
 | sound | trigger | seed | note |
 |---|---|---|---|
-| **scoff / sneer** (sbeffeggio) | `哈哈` (CN) + laugh-instruct | 42 | `AHH!` sospirato = risata breve sprezzante/di scherno — a real scornful scoff |
-| **pant / aroused** (ansimo) | `哈哈` (CN) + laugh-instruct | 2024 | `ah ah ah` poi ansima — a panting/aroused vocalization |
+| **scoff / sneer** (sbeffeggio) | `哈哈` (CN, 2-char) + laugh-instruct | 42 | `AHH!` sospirato = risata breve sprezzante/di scherno |
+| **pant / aroused** (ansimo) | `哈哈` (CN, 2-char) + laugh-instruct | 2024 | `ah ah ah` poi ansima — panting/aroused vocalization |
 
 ---
 
