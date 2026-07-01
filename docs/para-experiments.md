@@ -171,6 +171,26 @@ while gasp/mmm work at s7 — **each (event × trigger × voice) has its own win
 Genuinely still-open: a real **cry** (crosses over to yawn/sigh). **chuckle is NOT a separate hunt** — it's a
 short **laugh variant** (`[laugh:short]`, T4: shorter `哈`/`哈哈` + seed).
 
+### T3-val — cross-voice validation on ryan + vivian (2026-07-01) → 4 new events CONFIRMED (per-voice seed)
+The 4 discovery wins hold across voices, each with its own winning seed (pin per voice):
+| tag | trigger | galatea | ryan | vivian |
+|---|---|---|---|---|
+| **`[gasp]`** | `啊` | s7 | **s42** ✅ "ahhh è incredibile" | **s42** ✅ |
+| **`[groan]`** | `哼` | s42 | **s42** ✅ clean groan | **s42** ✅ (a sharp angry TSK) |
+| **`[mmm]`** | `嗯` | s7 | **s7** ✅ | **s7** ✅ |
+| **`[yawn]`** | `哈啊` | s42 | **s7** ✅ | **s7/s42** ✅ |
+
+⇒ **mmm = s7 universal · groan = s42 universal · gasp/yawn = per-voice seed.** All 4 → promote to HAVE + map into
+`para_pick` (per-voice seed like `[sigh]`). s7/s42 not-listed cells = metallic/errors (KO).
+
+### New serendipitous candidates (this round — SAVE per the PRINCIPLE)
+| candidate | trigger | voice · seed · emo | note |
+|---|---|---|---|
+| **angry laugh** (risata rabbiosa) | `哼` | ryan · s7 · anger | long scornful/stizzosa laugh — distinct from `[scoff]` (哈哈 s42) |
+| **tsk / disapproval** | `哼` | vivian · s42 · anger | sharp angry tongue-click "TSK!" (groan-family variant) |
+| **pleasure / aroused** | `嗯` | vivian · s42 · joy | "godimento ahhhwww" — ends metallic → explore other seeds on vivian |
+| **`[aww]` tender-wonder** | `呜呜` | galatea · any seed · sad | soft cooing "uooo" — adoring/tender ("che bel cucciolo tenero"). NOT a cry. |
+
 ### CRY — dedicated hunt plan (user 2026-07-01: "a real cry almost came with strongly-pushed sad + steer in some sentences")
 Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and low-arousal). Ideas to try:
 - **Onomatopoeia candidates:** `呜呜` (wuwu — gave yawn here), `呜咽` (sob), `啜泣`, `哇` (loud wail — also surprise),
@@ -180,6 +200,14 @@ Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and l
 - **WIDE seed pool** (the key — cry is seed-fragile): sweep {7, 42, 100, 256, 777, 2024, 1234, 88, 333} not just 7/42.
 - **Sentence-dependent:** try several emotional carriers (grief-loaded text) — cry surfaced only in some sentences.
 - Harvest anything clean even if re-labeled (per the PRINCIPLE above).
+
+**Hunt #1 result (2026-07-01, galatea, sad + crying instruct):** ❌ no real cry yet. Findings:
+- `呜呜` × 9 seeds {7…333} came out **identical (3.9s each)** → the strong crying `--instruct` PINS the trajectory,
+  so **seed does not vary it here** — for cry the lever is the ONOMATOPOEIA + the SENTENCE, not the seed. And `呜呜`
+  performs as a soft **"uooo"** tender coo → logged as the `[aww]` candidate above, NOT a cry.
+- `呜咽` and `sob` are **READ as words** ("wuyè" / "sob") — the model doesn't perform them. `哇` = "waaah", unclear.
+- NEXT cry idea: vary the CARRIER/onomatopoeia (broken `...ah...ah...`, `singhiozzo`, sniffle `snif snif`) rather
+  than seed; or accept that cry ≈ the hardest vocal event and park it. Real-cry may need FT (like the pros).
 
 ---
 

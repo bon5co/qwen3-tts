@@ -51,11 +51,13 @@ Legend: **HAVE** = shipped/validated (see para-experiments.md) · **CAND** = ser
 | `[sigh]` | breathy exhale | sigh/resp. | 1–2s · resignation, tiredness, relief | EL, Bark, Step | ✅ **HAVE** `唉`(ryan/clone) / `ahh`(vivian) | short / medium / long; "defeated" |
 | `[scoff]` / `[sneer]` | scornful short laugh | laughter | ~0.8s · contempt, derision | — (novel) | 🆕 **CAND** `哈哈` s42 (galatea) | 1 |
 | `[pant]` / `[moan]` | panting / aroused exhale | moan | 1–2s · exertion, pleasure | — | 🆕 **CAND** `哈哈` s2024 (galatea) | 1–2 (careful: NSFW-adjacent) |
-| `[yawn]` | tired open yawn | resp. | ~1.5s · sleepy, bored | — | TRY `haaa`/`哈啊` (native winner earlier) | 1 |
-| `[mmm]` / `[pleasure]` | satisfied hum | moan | ~0.8s · savoring, assent | — | TRY `嗯` (CN, old macro) | 1 |
-| `[gasp]` | sharp inhale | resp. | ~0.5s · surprise, shock | EL, Bark, Step (surprise-*) | TRY (Step: surprise-ah/oh/wa) | short / big |
-| `[groan]` | low complaint | groan | ~1s · pain, annoyance | (taxonomy) | TRY | 1 |
-| `[cry]` / `[sob]` | weeping | cry | 1–3s · grief | EL, Bark | TRY ⚠️ (laugh≈cry confusable — needs care) | 1 |
+| `[yawn]` | tired open yawn | resp. | ~1.5s · sleepy, bored | Step (breathing-ish) | ✅ **HAVE** `哈啊` (galatea s42, ryan/vivian s7) | 1 (+alt `呜呜`) |
+| `[mmm]` / `[pleasure]` | satisfied hum | moan | ~0.8s · savoring, assent | Step (confirmation-en) | ✅ **HAVE** `嗯` s7 (universal) | 1 |
+| `[gasp]` | sharp inhale / "ah!" | resp. | ~0.5s · surprise, shock | EL, Bark, Step (surprise-*) | ✅ **HAVE** `啊` (galatea s7, ryan/vivian s42) | short / big |
+| `[groan]` / `[growl]` | angry grrr / complaint | groan | ~1s · anger, pain | Step (dissatisfaction-hnn) | ✅ **HAVE** `哼` s42 (universal; vivian→a TSK) | 1 |
+| `[aww]` | tender coo "uooo" | moan | ~1s · adoration, "how cute" | — (novel) | 🆕 **CAND** `呜呜` (galatea, sad) | 1 |
+| angry-laugh · tsk | scornful laugh / tongue-click | laughter | ~1s · contempt | — | 🆕 **CAND** `哼` (ryan s7 = laugh; vivian s42 = tsk) | — |
+| `[cry]` / `[sob]` | weeping | cry | 1–3s · grief | EL, Bark | ❌ hunt#1 KO (呜呜→coo, 呜咽/sob→read) — likely needs FT | — |
 | `[huff]` / `[ugh]` | irritated puff | — | ~0.6s · annoyance | EL (implied) | 🟡 old DSP macro (`Uff…`/`Ugh…`) — re-do inline | 1 |
 
 ## 3. TARGET menu — ARTICULATORY / RESPIRATORY (hard — decoder ceiling)
