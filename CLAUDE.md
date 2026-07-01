@@ -12,6 +12,13 @@
 > 2026-06-29, committed + pushed. Paralinguistics = inline `[laugh]`/`[sigh]` tags. **Do NOT re-derive from the old
 > abandoned methods** (graft/x-vector/τ-vectors/`.vec`/dense-FT/per-language EXPR-COMBINE — all archived in
 > `docs/archive/`). Read THE recipe, don't re-spelunk weeks of experiments.
+>
+> 🔬 **PARALINGUISTIC `[tag]` METHOD + TEST LOG — read `docs/para-experiments.md` BEFORE any para experiment.**
+> ONE method only: **INLINE native-trigger** (onomatopoeia inside the sentence, ONE generation → event in the
+> voice's own timbre, mixed in). ❌ **NEVER the split-span / steering-span "splice"** (separate cold-prefill span
+> = sounds like a different voice — rejected by ear 2026-07-01). The doc is the durable WIN/KO table by
+> onomatopoeia × seed × language × emotion × speaker — do NOT re-run a KO combo; promote WINs into the `[tag]`
+> map. (Known open: in Italian the onomatopoeia SIGHS not laughs — inline laugh in IT still unsolved.)
 
 This file is the practical guide for agents working on this repository.
 It is intentionally implementation-oriented: what to change, where, how to test,
