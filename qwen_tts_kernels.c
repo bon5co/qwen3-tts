@@ -814,7 +814,7 @@ void qwen_matvec_bf16(float *y, const uint16_t *W, const float *x, int rows, int
  * The bf16 weight decode is scalar (a single shift, amortized over the B FMAs).
  *
  * TODO (newer ISAs, annotate-now / exploit-later): the bf16 decode + FMA could use
- *   - ARM bf16 BFDOT/BFMMLA (Apple M2+, Neoverse V1/V2, NVIDIA Grace, DGX Spark) and
+ *   - ARM bf16 BFDOT/BFMMLA (Apple M2+, Neoverse V1/V2, NVIDIA Grace, NVIDIA GPU) and
  *     i8mm SMMLA for the int8 batched twin — NEON here does a scalar bf16->f32 shift.
  *   - ARM SVE/SVE2 (Grace/Spark): vector-length-agnostic B loop.
  *   - x86 AVX-512-BF16 (VDPBF16PS) to fuse decode+FMA; AVX-512-VNNI for int8 batched.

@@ -11,7 +11,7 @@ We measure each emotion as the SHIFT vs that condition's NEUTRAL clip (so per-vo
 cancels — valid for RELATIVE A/B even though absolute SER on Italian/clones is only a proxy).
 
 Runs on CPU or GPU. Needs: torch + transformers + soundfile + (librosa OR torchaudio) for resampling.
-On the DGX: add `transformers soundfile librosa` to the qwen-ft image (torch already there), or
+On the GPU box: add `transformers soundfile librosa` to the qwen-ft image (torch already there), or
   pip install --break-system-packages transformers soundfile librosa
 
 Usage:

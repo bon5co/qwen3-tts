@@ -34,9 +34,7 @@ ab_*.sh
 *.zip
 
 # Local-only infra/dev scripts (private LAN, never commit)
-scripts/dgx_*
-training/expressivity-lora/dgx_*
-training/expressivity-lora/sync_*to_dgx.sh
+scripts/
 
 # expressivity artifacts (host on GH release/HF, do not commit big binaries)
 qwen3-tts-1.7b-expr/
@@ -46,6 +44,10 @@ qwen3-tts-1.7b-expr/
 # closes the loss-risk behind the 2026-06-15 regression (validated .expr lost with no backup).
 presets/expr/*.expr
 !training/expressivity-lora/*.py
+# Local-only GPU-box trainer/sync scripts (private LAN) — must come AFTER the *.py
+# re-include above so they stay ignored (they are pulled to the box, not for the public repo).
+training/expressivity-lora/gpu_*
+training/expressivity-lora/sync_*to_gpu.sh
 # local training data (prep outputs: wav24k + manifests + codes) — never commit
 training/expressivity-lora/data*/
 

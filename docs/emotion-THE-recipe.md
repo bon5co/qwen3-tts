@@ -9,8 +9,8 @@
 > 2. the code: `EMOTION_CELLS[]` + `resolve_emotion_recipe()` in `main.c`, exposed as the `--emotion` flag.
 >
 > If you change one, change the other. Provenance of the literal params: `tests/recipe_final.sh` (Italian) +
-> the per-language scripts (`tests/{german,french,spanish}_ab.sh`, `tests/crosslang_emo.sh`) + the DGX checkpoints
-> (`reference_dgx_ft_checkpoints`). Last ear-validation: 2026-06-24 (IT) / 2026-06-29 (per-language).
+> the per-language scripts (`tests/{german,french,spanish}_ab.sh`, `tests/crosslang_emo.sh`) + the GPU box checkpoints
+> (`reference_gpu_ft_checkpoints`). Last ear-validation: 2026-06-24 (IT) / 2026-06-29 (per-language).
 
 ## How a user invokes it
 **One flag.** `--emotion <sad|joy|anger|fear|disgust|surprise>` (1.7B CustomVoice only). The engine auto-applies
@@ -51,8 +51,8 @@ Notes:
 
 ## Assets
 - expr packs (`presets/expr/`): `italian_csp_topk6`, `german_csp_k6`, `french_csp_k6` (shipped on HF, fetch with
-  `bash download_assets.sh`). Native `{german,french,spanish}_r32` re-exportable from the DGX checkpoints
-  (`reference_dgx_ft_checkpoints`) — NOT shipped (k6 won for DE/FR).
+  `bash download_assets.sh`). Native `{german,french,spanish}_r32` re-exportable from the GPU box checkpoints
+  (`reference_gpu_ft_checkpoints`) — NOT shipped (k6 won for DE/FR).
 - steer vectors (`presets/steer/emotion/ryan_*.qlsteer`): committed in git.
 
 ## Russian

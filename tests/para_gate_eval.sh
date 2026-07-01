@@ -2,8 +2,8 @@
 # ============================================================================
 # PARA-FT STEP 1 — GATE EVAL (plan_emo_v3.md §9.5 "THIS IS THE GATE")
 #
-# Runs Mac-side, NO GPU. The instant Step 1 training finishes on the DGX:
-#   1. pull the chosen LoRA adapter (16MB) from the DGX
+# Runs Mac-side, NO GPU. The instant Step 1 training finishes on the GPU box:
+#   1. pull the chosen LoRA adapter (16MB) from the GPU box
 #   2. export_expr.py -> factored .expr (no base needed, pure numpy)
 #   3. synth [laugh]/[sigh] phrases (EN + IT) WITH vs WITHOUT the .expr (A/B)
 #
@@ -18,7 +18,7 @@
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
-DGX="${DGX:-dgx}"
+GPU="${GPU:-gpubox}"
 REMOTE_OUT="/home/gabriele/qwen-ft/out_para_step1_lr2e6_s031"
 EP="${1:-final}"
 W="${2:-1.0}"
@@ -29,9 +29,9 @@ LOCAL_ADAPTER="/tmp/para_step1_${ADIR}"
 EXPR="/tmp/para_step1_${EP}.expr"
 mkdir -p "$OUTD"
 
-echo "### [1/3] pull adapter $ADIR from $DGX"
+echo "### [1/3] pull adapter $ADIR from $GPU"
 rm -rf "$LOCAL_ADAPTER"; mkdir -p "$LOCAL_ADAPTER"
-scp "$DGX:$REMOTE_OUT/$ADIR/adapter_model.safetensors" "$DGX:$REMOTE_OUT/$ADIR/adapter_config.json" "$LOCAL_ADAPTER/" || { echo "!! adapter $ADIR not found on DGX"; exit 1; }
+scp "$GPU:$REMOTE_OUT/$ADIR/adapter_model.safetensors" "$GPU:$REMOTE_OUT/$ADIR/adapter_config.json" "$LOCAL_ADAPTER/" || { echo "!! adapter $ADIR not found on GPU box"; exit 1; }
 
 echo "### [2/3] export_expr.py -> $EXPR (factored)"
 python3 training/expressivity-lora/export_expr.py "$LOCAL_ADAPTER" "$EXPR" --lang English --hidden 2048 || exit 1

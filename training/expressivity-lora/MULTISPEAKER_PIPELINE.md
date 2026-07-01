@@ -25,11 +25,11 @@ the EMOVO-only (6 Italian actors) set that produced a voice-specific result.
 
 ## Files (this dir)
 
-ORIGINALS (pulled from the DGX as a tracked trace — do NOT edit, they are the proven recipe):
-- `dgx_sft_expr.py` — dense full-rank FT, trains L16-26 (`--layers`) + text_projection, voice-agnostic.
-- `dgx_dataset_expr.py` — its dataset builder (instruct-conditioned, **no** language tag).
-- `dgx_sft_expr_lora.py` — the LoRA variant (low-rank, same band).
-- `dgx_emovo_prep.py` — EMOVO → train_raw schema (the schema everything else mirrors).
+ORIGINALS (pulled from the GPU box as a tracked trace — do NOT edit, they are the proven recipe):
+- `gpu_sft_expr.py` — dense full-rank FT, trains L16-26 (`--layers`) + text_projection, voice-agnostic.
+- `gpu_dataset_expr.py` — its dataset builder (instruct-conditioned, **no** language tag).
+- `gpu_sft_expr_lora.py` — the LoRA variant (low-rank, same band).
+- `gpu_emovo_prep.py` — EMOVO → train_raw schema (the schema everything else mirrors).
 - `prepare_data.py` — codec-encode step (Qwen tokenizer, GPU). Original upstream.
 - `prepare_esd.py` — ESD (HF `duanyu027/ESD`) → schema. English speakers 0001-0010.
 
@@ -37,10 +37,10 @@ NEW (this epic):
 - `prepare_cremad.py` — CREMA-D (HF parquet mirror) → schema. 91 actors, 12 fixed sentences.
 - `concat_manifests.py` — merge + validate manifests; `--langs` stamps a per-file `language`,
   `--repeat` oversamples a minority language.
-- `dgx_dataset_expr_lang.py` — **language-tagged** dataset builder (injects the language codec token,
-  matching inference). Run `python3 dgx_dataset_expr_lang.py --self-test` to verify the prefix.
-- `dgx_sft_expr_lang.py` — fork of `dgx_sft_expr.py` that uses the tagged builder (1-line diff: import).
-- `dgx_multi_emotion.sh` — end-to-end orchestrator (download → prep → encode → concat → FT), idempotent
+- `gpu_dataset_expr_lang.py` — **language-tagged** dataset builder (injects the language codec token,
+  matching inference). Run `python3 gpu_dataset_expr_lang.py --self-test` to verify the prefix.
+- `gpu_sft_expr_lang.py` — fork of `gpu_sft_expr.py` that uses the tagged builder (1-line diff: import).
+- `gpu_multi_emotion.sh` — end-to-end orchestrator (download → prep → encode → concat → FT), idempotent
   via `<stage>.DONE` markers, fail-loud `need_file` gates, timestamped `multi_emotion.log`.
 - `docker/Dockerfile` + `docker/build_img.sh` — the `qwen-ft:latest` image (ubuntu 24.04 + torch +
   torchaudio + qwen-tts). **Use this image for encode AND train** (the nvcr pytorch image has a broken
@@ -48,11 +48,11 @@ NEW (this epic):
 - `../../tests/emo_score.py` — automatic SER scorer (audeering wav2vec2 arousal/valence) to rank
   expressivity variants without listening to every clip. CPU-ok.
 
-## Reproduce (on the DGX, from `~/qwen-ft`)
+## Reproduce (on the GPU box, from `~/qwen-ft`)
 
 ```bash
 cd ~/qwen-ft/docker && bash build_img.sh          # one-time: qwen-ft:latest
-bash dgx_multi_emotion.sh                          # download ESD+CREMA-D, prep, encode, concat, FT (untagged)
+bash gpu_multi_emotion.sh                          # download ESD+CREMA-D, prep, encode, concat, FT (untagged)
 # -> out_multi_l1626/checkpoint-final/model.safetensors
 
 # LANGUAGE-TAGGED variant (the fix):
@@ -61,13 +61,13 @@ python3 concat_manifests.py --out multi_emotion_tagged/train_with_codes.jsonl \
     emovo/train_with_codes.jsonl esd/train_with_codes.jsonl cremad/train_with_codes.jsonl
 docker run --rm --gpus all --ipc=host -v $HOME/qwen-ft:/root/qwen-ft -v $HOME/qwen-ft:$HOME/qwen-ft \
     qwen-ft:latest bash -c "cd /root/qwen-ft/Qwen3-TTS/finetuning && \
-    python3 -u dgx_sft_expr_lang.py --train_jsonl /root/qwen-ft/multi_emotion_tagged/train_with_codes.jsonl \
+    python3 -u gpu_sft_expr_lang.py --train_jsonl /root/qwen-ft/multi_emotion_tagged/train_with_codes.jsonl \
     --output_model_path /root/qwen-ft/out_multi_l1626_tagged --layers 16-26 --num_epochs 5"
 ```
 
 Then (locally) extract the `.expr` and A/B:
 ```bash
-mkdir qwen3-tts-1.7b-expr-multi && scp dgx:.../checkpoint-final/model.safetensors qwen3-tts-1.7b-expr-multi/
+mkdir qwen3-tts-1.7b-expr-multi && scp gpubox:.../checkpoint-final/model.safetensors qwen3-tts-1.7b-expr-multi/
 python3 tests/expr_extract.py qwen3-tts-1.7b qwen3-tts-1.7b-expr-multi presets/expr/<name>.expr --lang Italian
 # A/B preset ryan IT vs EN, and (separately) the clone — see tests/emo_score.py
 ```
@@ -85,7 +85,7 @@ LOCAL only (NOT committed — large / gitignored):
 - `qwen3-tts-1.7b-expr-multi*/` — the pulled FT checkpoints (3.8 GB each).
 - `samples/diag/` — the ryan A/B clips (see listening guide); `samples/multispk_ab*/` — clone A/B.
 
-DGX (`~/qwen-ft/`):
+GPU box (`~/qwen-ft/`):
 - datasets: `esd/`, `cremad/`, `emovo/` (each has `train_with_codes.jsonl`); merged: `multi_emotion/`,
   `multi_emotion_tagged/`.
 - checkpoints: `out_multi_l1626/` (untagged 5ep), `out_multi_l1626_tagged/` (tagged 5ep).

@@ -14,7 +14,7 @@ for A/B-ing emotion .expr packs (all vs >=3/5 vs smart vs τ_wide) on ryan/vivia
 This is a NEW dedicated script (does not touch the TTS training scripts). Pairs with tests/emo_judge.py
 (which loads the saved model and scores generated wavs).
 
-Run (DGX, qwen-ft:latest; needs transformers + datasets + soundfile + torchaudio/librosa):
+Run (GPU box, qwen-ft:latest; needs transformers + datasets + soundfile + torchaudio/librosa):
   python3 train_ser_judge.py --data-dir /root/qwen-ft/emozionalmente_zenodo \
       --out /root/qwen-ft/ser_judge_it --epochs 8
 Self-test (no model/data): python3 train_ser_judge.py --self-test

@@ -52,13 +52,13 @@ Multi-speaker × multi-emotion (× multilingual) corpora are what make emotion g
 1. **CHEAPEST, do first — multi-speaker emotion data.** Re-train the emotion FT on MANY speakers × emotions
    (ESD's 10 EN speakers × 5 emotions + EMOVO for IT), not EMOVO-only (6 IT actors). The FT then learns the
    emotion transform across diverse identities → generalizes to novel x-vectors far better. Fits our existing
-   `dgx_sft_expr.py` pipeline; just change the data. This directly attacks our measured "emotion direction is
+   `gpu_sft_expr.py` pipeline; just change the data. This directly attacks our measured "emotion direction is
    voice-specific" problem.
 2. **Conflicting-pair augmentation** (FlexiVoice-lite) in data prep: pair a reference clip in emotion A with
    an instruction for emotion B, so the model learns instruct overrides the reference identity/prosody.
 3. **The proper (bigger) fix — adversarial disentanglement.** Add a speaker classifier + GRL on an emotion
    representation during FT so emotion becomes speaker-invariant (IndexTTS2/SelfTTS). Needs training-code
-   changes on the DGX (new loss head), not just data — flag as the SOTA Phase-3+ track.
+   changes on the GPU box (new loss head), not just data — flag as the SOTA Phase-3+ track.
 4. **Cross-lingual temp drift is architectural** (x-vector-in-LM leakage, CosyVoice 2). Without an arch
    change we manage it by capping temp ≤ 2.0 (already our finding).
 5. **Manage the emotion↔timbre tension** (CosyVoice 2 ablation): stronger emotion conditioning costs some

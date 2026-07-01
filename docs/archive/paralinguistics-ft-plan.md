@@ -1,4 +1,4 @@
-# Serious paralinguistic FT — blueprint (when DGX is back on)
+# Serious paralinguistic FT — blueprint (when GPU box is back on)
 
 Why the earlier 1–2 day para CSP-FT failed, and the concrete recipe to fix it. The discovery
 (`docs/paralinguistics-native.md`) proved these events are **latent in the weights** → an FT only has to
@@ -58,7 +58,7 @@ The trigger method (`docs/paralinguistics-native.md`) is the **floor**. The FT m
   conditioning is the bet). A/B FT-`[sneeze]` vs trigger-only.
 - Gate: language-hold (no accent drift) on a neutral set + golden mel unchanged for non-tagged text.
 
-## Train-script changes (prep now, DGX off)
+## Train-script changes (prep now, GPU box off)
 1. **New mixed manifest builder** — download/clean each dataset → unified `{audio,text(with inline marker),
    marker,language,speaker}` jsonl → `concat_manifests.py`.
 2. **Encode** — `prepare_data.py` via **`qwen-ft:latest`** docker (NOT a fresh `pip install qwen-tts` — that
@@ -68,6 +68,6 @@ The trigger method (`docs/paralinguistics-native.md`) is the **floor**. The FT m
 4. **Train** — LoRA on the probed band, 5–8 ep; checkpoint + `expr_extract.py` / LoRA export.
 5. **Eval harness** — `[tag]`-only (no trigger) on ryan/galatea/vivian, A/B vs `samples/para_native/`.
 
-I can write all of these (manifest builder, dataset cleaners, the prep/probe/train wrappers) with DGX OFF,
+I can write all of these (manifest builder, dataset cleaners, the prep/probe/train wrappers) with GPU box OFF,
 so it's a one-command run when you reheat. The heat-free prep is steps 1–5 scaffolding + dataset download
 scripts; only encode/probe/train need the GPU.

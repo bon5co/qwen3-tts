@@ -15,12 +15,12 @@
 # INPUT: an ENCODED manifest jsonl (rows with `audio_codes`, `emotion`, `language`, optional `instruct`)
 #        — the SAME file the CSP-FT trainer consumes. The probe only READS the model (no weight updates),
 #        so it is cheap. OUTPUT: a small JSON with per-layer weights + the selected layer set, consumed by
-#        dgx_sft_expr_csp.py via --csp-layers.
+#        gpu_sft_expr_csp.py via --csp-layers.
 #
 # Self-test (NO model, NO data — verifies the probe head learns to pick a planted layer):
 #   python3 csp_probe.py --self-test
 #
-# Real run (on the DGX, model + encoded data present):
+# Real run (on the GPU box, model + encoded data present):
 #   python3 csp_probe.py --train_jsonl /root/qwen-ft/data/multi_emotion_tagged.jsonl \
 #       --init_model_path /root/qwen-ft/models/1.7B-CustomVoice \
 #       --out_json /root/qwen-ft/csp_layers_italian.json --epochs 3 --top_k 2
@@ -78,7 +78,7 @@ def select_layers(weights, top_k, n_layers):
 # ----------------------------------------------------------------------------- real probing (needs model)
 def run_probe(args):
     from accelerate import Accelerator
-    from dgx_dataset_expr_lang import TTSDataset
+    from gpu_dataset_expr_lang import TTSDataset
     from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
     from torch.optim import AdamW
     from torch.utils.data import DataLoader

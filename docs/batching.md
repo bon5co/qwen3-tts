@@ -27,7 +27,7 @@
 >    already does (vectorizes over the B dimension: AVX-512 16-wide → AVX2 8 → NEON 4 → scalar).
 > 3. **Newer-ISA leads (annotate now, exploit later)** — see the TODO in `bf16_matmat_slice`:
 >    ARM bf16 BFDOT/BFMMLA + i8mm SMMLA (Apple **M2/M3/M4/M5**, Neoverse V1/V2, **NVIDIA Grace /
->    DGX Spark**), ARM **SVE/SVE2** (Grace/Spark, vector-length-agnostic), x86 **AVX-512-BF16**
+>    NVIDIA GPU**), ARM **SVE/SVE2** (Grace/Spark, vector-length-agnostic), x86 **AVX-512-BF16**
 >    (VDPBF16PS) and **AVX-512-VNNI** for the int8 batched twin. And add `qwen_matmat_int8/_int4`
 >    twins — batching pays MOST at low precision (it amortizes the unpack).
 >

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """ESD (Emotional Speech Dataset, Zhou et al.) -> train_raw.jsonl in the SAME schema as EMOVO
-(dgx_emovo_prep.py), so multi-speaker ESD aligns ALONGSIDE EMOVO for a voice-agnostic, multi-speaker
+(gpu_emovo_prep.py), so multi-speaker ESD aligns ALONGSIDE EMOVO for a voice-agnostic, multi-speaker
 emotion fine-tune (the deep-research lever: emotion learned across MANY identities -> generalizes to
 cloned/novel x-vectors). See docs/emotion-research.md, PLAN Phase 2.
 
@@ -17,11 +17,11 @@ This script:
     where they overlap (neutral = empty instruct = the anchor),
   - emits one row per utterance with a unique `actor` (e.g. esd0001) for speaker diversity.
 
-Usage (on the DGX, after downloading ESD):
+Usage (on the GPU box, after downloading ESD):
   python3 prepare_esd.py --esd-root ~/qwen-ft/esd/raw --out ~/qwen-ft/esd/train_raw.jsonl \
       --speakers 0001-0010            # English only (cross-lingual transfer); add 0011-0020 for ZH too
   # then run the SAME codec-encode step as EMOVO (prepare_data.py) to get train_with_codes.jsonl,
-  # then concatenate with emovo/train_with_codes.jsonl and fine-tune via dgx_sft_expr.py.
+  # then concatenate with emovo/train_with_codes.jsonl and fine-tune via gpu_sft_expr.py.
 
 NOTE: verify the exact ESD folder/txt layout on the box (releases vary slightly); the emotion folder
 names and the per-speaker .txt are the parts to confirm. License: ESD is released for research — verify

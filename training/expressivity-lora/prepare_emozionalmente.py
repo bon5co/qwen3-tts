@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emozionalmente -> train_raw.jsonl in the SAME schema as EMOVO (dgx_emovo_prep.py) / CREMA-D
+"""Emozionalmente -> train_raw.jsonl in the SAME schema as EMOVO (gpu_emovo_prep.py) / CREMA-D
 (prepare_cremad.py), so it aligns ALONGSIDE them for a voice-agnostic, MANY-speaker emotion FT.
 
 WHY Emozionalmente: it is THE 10x lever for Italian emotion. EMOVO is ~0.5 h / 6 actors; Emozionalmente
@@ -29,16 +29,16 @@ TWO SOURCES:
   No license — cite-only: F. Catania et al., "Emozionalmente...", IEEE TASLP 33:1142-1155, 2025,
   doi:10.1109/TASLPRO.2025.3540662.
 
-This script (NEW, dedicated -- does NOT touch dgx_emovo_prep.py / prepare_cremad.py / prepare_esd.py):
+This script (NEW, dedicated -- does NOT touch gpu_emovo_prep.py / prepare_cremad.py / prepare_esd.py):
   - reads the Emozionalmente split (or a local dir),
   - OPTIONAL quality filtering/cleaning (off by default): drop clipped, light denoise, loudness-normalize,
   - resamples 16 kHz -> 24 kHz mono (codec requirement; mirrors EMOVO/CREMA),
   - maps the 7 emotions -> (label, English instruct) using the SAME instruct strings as EMOVO/CREMA,
   - emits one row per utterance with a unique `actor` (emozionalmente<speaker_id>) for speaker diversity,
-  - stamps `language: Italian` (single-language FT path, ready for dgx_dataset_expr_lang.py),
+  - stamps `language: Italian` (single-language FT path, ready for gpu_dataset_expr_lang.py),
   - prints PROGRESS every --log-every rows and a final per-emotion / per-speaker breakdown.
 
-Usage (DGX, qwen-ft:latest docker -- needs huggingface_hub + pyarrow + soundfile + ffmpeg):
+Usage (GPU box, qwen-ft:latest docker -- needs huggingface_hub + pyarrow + soundfile + ffmpeg):
   python3 prepare_emozionalmente.py --report                          # just inspect SNR/peak, write nothing
   python3 prepare_emozionalmente.py --out ~/qwen-ft/emozionalmente/train_raw.jsonl            # KEEP ALL
   python3 prepare_emozionalmente.py --out ... --loudnorm              # clean levels, lose no data
@@ -53,7 +53,7 @@ HF_SPLIT = "emozionalmente"      # the Italian split (verified: only IT split in
 HF_PARQUET = "data/emozionalmente-00000-of-00001.parquet"
 
 # emotion string -> (our label, English instruct). neutral = empty instruct (the no-instruct anchor).
-# SAME instruct strings as dgx_emovo_prep.py / prepare_cremad.py so all sources speak one instruct vocab.
+# SAME instruct strings as gpu_emovo_prep.py / prepare_cremad.py so all sources speak one instruct vocab.
 EMO = {
     "anger":     ("anger",    "Speak with hot, furious anger, sharp and forceful."),
     "disgust":   ("disgust",  "Speak with physical disgust, repulsed and recoiling."),

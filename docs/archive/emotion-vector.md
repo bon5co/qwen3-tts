@@ -67,7 +67,7 @@ strength = full correction = clean. Push >1.0 only to over-dramatize (may distor
 
 ```bash
 # 1) two dense FTs on the SAME multi-speaker set (frozen except L16-26 + text_projection):
-#    θ_emotion : all rows, emotional instructs   (training/expressivity-lora/dgx_sft_expr_lang.py)
+#    θ_emotion : all rows, emotional instructs   (training/expressivity-lora/gpu_sft_expr_lang.py)
 #    θ_neutral : neutral rows only, empty instruct
 # 2) pull both checkpoints + the base locally, then FLOAT task-arithmetic -> .expr:
 python3 tests/tau_arith.py \
@@ -105,4 +105,4 @@ warnings are a red herring — the mod-2¹⁶ wrap is lossless; ignore the count
 ## Links
 - Deep history + reproduce: [`../training/expressivity-lora/MULTISPEAKER_PIPELINE.md`]
 - Roadmap / decisions: `PLAN.md` (local-only) — "SESSION 2026-06-16" block.
-- Builder: [`../tests/tau_arith.py`]; FT: [`../training/expressivity-lora/dgx_sft_expr_lang.py`].
+- Builder: [`../tests/tau_arith.py`]; FT: [`../training/expressivity-lora/gpu_sft_expr_lang.py`].

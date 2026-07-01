@@ -72,12 +72,12 @@ L0-27 LoRA changes q/k/v/o/gate on **every** layer including L0-12 (timbre/proso
 anchor and regresses the model toward the LoRA's averaged (neutral-ish) training distribution → flat,
 timbre-drifted, pace-distorted. Same defect on every language because every `bb027` pack is L0-27.
 
-## 5. DGX state (192.168.1.94 = `dgx`, `/home/gabriele/qwen-ft/`)
+## 5. GPU-box state
 
 - Datasets present, ready (with codec codes): `emovo/train_with_codes.jsonl` (IT/EMOVO), plus emodb (DE),
   cafe/esmatch (FR/ES), mesd, etc.
-- Real trainer: `Qwen3-TTS/finetuning/dgx_sft_expr_lora.py` — has `--layers` (default **16-26**), `--lora_r`.
-- The broad-band run came from `dgx_emovo_broadband.sh`, which **overrides `--layers 0-27`** (its header even
+- Real trainer: `Qwen3-TTS/finetuning/gpu_sft_expr_lora.py` — has `--layers` (default **16-26**), `--lora_r`.
+- The broad-band run came from `gpu_emovo_broadband.sh`, which **overrides `--layers 0-27`** (its header even
   mis-claims L0-27 "beats emotion-only L16-26" — contradicted by §2). The trainer itself is fine; only the
   invocation was broad-band.
 - Export: `expr-lora/export_expr.py ADAPTER_DIR OUT.expr --lang Italian --hidden 2048` → QEXP factored (dtype 5).
@@ -105,12 +105,12 @@ new `.expr` must parse as L16-26 only (ICL owns timbre layers, LoRA owns emotion
 ## 7. THE WOW RECIPE FOUND — DENSE full-FT, not LoRA; graft, not full-WDELTA (2026-06-15 pt2)
 
 Ear-testing the L16-26 LoRA showed it moves clones only weakly. Retracing the original "WOW" work: the
-first expressivity result was a **FULL fine-tune** (`dgx_sft_expr.py`, EMOVO Italian, 5 epochs) — NOT a LoRA.
+first expressivity result was a **FULL fine-tune** (`gpu_sft_expr.py`, EMOVO Italian, 5 epochs) — NOT a LoRA.
 That FT was **already restricted to L16-26** (`is_trainable()` = L16-26 gate_proj+attn + text_projection); the
 4 GB is just the full checkpoint. So the WOW vs now is **DENSE full-rank vs LoRA low-rank on the SAME L16-26
 layers** — a CAPACITY difference, not a band difference.
 
-- The FT checkpoint is still local: `qwen3-tts-1.7b-expr/` (4.2 GB) and on DGX `out_expr/checkpoint-final`.
+- The FT checkpoint is still local: `qwen3-tts-1.7b-expr/` (4.2 GB) and on GPU box `out_expr/checkpoint-final`.
 - Regenerated the **dense route-a `.expr`** with `tests/expr_extract.py qwen3-tts-1.7b qwen3-tts-1.7b-expr` →
   `presets/expr/italian_l1626_dense.expr` (186 MB, 72 tensors = 55 bf16 L16-26 deltas + 17 f32 norms, dtype 4).
   Lossless: it stores the bf16 BIT delta `(expr_bits − cv_bits)`; apply does `cur_bits + delta`.
@@ -149,5 +149,5 @@ per-language base + light speaker adapter = exactly the graft+dense we found). C
    but can't fully nativize a non-native preset (vivian=Chinese) or an arbitrary clone.
 
 **NEXT (roadmap):** (a) git-track `italian_l1626_dense.expr` (done); (b) re-do FR/DE/ES as DENSE full-FTs on
-the DGX (`dgx_sft_expr.py`, not the LoRA) + extract dense `.expr`; (c) grow the Italian dataset (varied prosody
+the GPU box (`gpu_sft_expr.py`, not the LoRA) + extract dense `.expr`; (c) grow the Italian dataset (varied prosody
 + paralinguistics) and train a denser/wider FT; (d) `make test-lora-it` should use the graft+dense recipe.

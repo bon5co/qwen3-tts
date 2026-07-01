@@ -93,12 +93,12 @@ needs. Note: the dense `.expr` bit-delta applies cleanly only on CV-intact weigh
 2. **Probe** (`csp_probe.py`): a softmax-weighted layer probe + emotion classifier on the frozen Talker finds
    **emotion concentrates LATE: L22-27, peak L22-23** (weights L22 .110 > L23 .084 > L25 > L26 > L24 > L27).
    This refines the old hand-picked L16-26 (the real core is later/tighter). Selected blocks = **[22, 23]**.
-3. **CSP-FT** (`dgx_sft_expr_csp.py`): fine-tune ONLY blocks 22+23 (whole block, `--scope full`), FREEZE
+3. **CSP-FT** (`gpu_sft_expr_csp.py`): fine-tune ONLY blocks 22+23 (whole block, `--scope full`), FREEZE
    everything else incl. pronunciation → speech stays clean (no "gomani"). 10 epochs. Output = a full CV
    checkpoint; `tests/expr_extract.py` extracts the bit-delta vs base → `presets/expr/italian_csp.expr` (72MB,
    only the 2 blocks). Train-loss stays ~7 (flat) — EXPECTED with 92% frozen; verdict is ear, not loss.
-4. **Orchestrator** (`dgx_csp_italian.sh`): runs all of the above on the DGX, ISOLATED in `runs/csp_italian/`
-   (own data/markers/outputs — never collides with other runs). `SMART=1 TRAIN_JUDGE=1 nohup bash dgx_csp_italian.sh`.
+4. **Orchestrator** (`gpu_csp_italian.sh`): runs all of the above on the GPU box, ISOLATED in `runs/csp_italian/`
+   (own data/markers/outputs — never collides with other runs). `SMART=1 TRAIN_JUDGE=1 nohup bash gpu_csp_italian.sh`.
 
 ## Why only 2–4 layers? (representation vs control)
 
@@ -146,7 +146,7 @@ the **ranked order**; you pick **how many** by how much push the voice needs. Th
 ## Reproduce the .expr from the checkpoint
 
 ```bash
-scp -r dgx:qwen-ft/runs/csp_italian/out_csp_italian/checkpoint-final /tmp/csp_ckpt
+scp -r gpubox:qwen-ft/runs/csp_italian/out_csp_italian/checkpoint-final /tmp/csp_ckpt
 python3 tests/expr_extract.py qwen3-tts-1.7b /tmp/csp_ckpt presets/expr/italian_csp.expr --lang Italian
 ```
 

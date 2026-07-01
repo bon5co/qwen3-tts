@@ -78,7 +78,7 @@ Apple does **not** expose SVE for general use; its matmul lever is **bf16 (BFDOT
 | **AWS Graviton2** (Neoverse N1) | Armv8.2 | ✅ | ❌ | ❌ | ❌ | ❌ | dotprod only, like M1-class |
 | **AWS Graviton3** (Neoverse V1) | Armv8.4+ | ✅ | ✅ | ✅ | ✅ (256b) | ❌ | bf16+i8mm+SVE — strong ARM server |
 | **AWS Graviton4** (Neoverse V2) | Armv9.0 | ✅ | ✅ | ✅ | ✅ SVE2 | ❌ | newest AWS ARM |
-| **NVIDIA Grace** (Neoverse V2) | Armv9.0 | ✅ | ✅ | ✅ | ✅ SVE2 | ❌ | DGX/GH200; very high bandwidth |
+| **NVIDIA Grace** (Neoverse V2) | Armv9.0 | ✅ | ✅ | ✅ | ✅ SVE2 | ❌ | GH200; very high bandwidth |
 | **Ampere Altra** (Neoverse N1) | Armv8.2 | ✅ | ❌ | ❌ | ❌ | ❌ | dotprod only (Oracle/Hetzner/Scaleway) |
 
 ¹ Apple implements SME's streaming-SVE internally but does not expose classic SVE to user code; treat

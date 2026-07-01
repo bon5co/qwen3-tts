@@ -3,7 +3,7 @@
 validation + a full breakdown so the merge can't go wrong silently.
 
 This is a NEW, dedicated step (it does NOT touch the original prep/encode/train scripts). The dense
-expressivity FT (dgx_sft_expr.py) reads ONE --train_jsonl; this produces it from EMOVO (IT) + ESD (EN) +
+expressivity FT (gpu_sft_expr.py) reads ONE --train_jsonl; this produces it from EMOVO (IT) + ESD (EN) +
 CREMA-D (EN), i.e. the Phase-2 many-speaker emotion set (PLAN Phase 2, docs/emotion-research.md step 1).
 
 It:

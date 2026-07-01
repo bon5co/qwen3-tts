@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # PARA-FT — ALL-8-TAGS eval (for Step 2+, plan_emo_v3.md §9.8). Mac-side, no GPU.
-# Pulls a LoRA adapter from the DGX, exports a factored .expr, and synthesizes
+# Pulls a LoRA adapter from the GPU box, exports a factored .expr, and synthesizes
 # one EN sentence per tag (+ a no-tag control) so each [tag] can be A/B-judged
 # for mapping to ITS OWN event. sigh!=laugh is the key check Step 2 must fix.
 #
@@ -13,7 +13,7 @@
 # ============================================================================
 set -uo pipefail
 cd "$(dirname "$0")/.."
-DGX="${DGX:-dgx}"
+GPU="${GPU:-gpubox}"
 OUTDIR_NAME="${1:-out_para_step2_8tag}"
 EP="${2:-final}"
 W="${3:-1.5}"
@@ -25,9 +25,9 @@ LOCAL_ADAPTER="/tmp/${OUTDIR_NAME}_${ADIR}"
 EXPR="/tmp/${OUTDIR_NAME}_${EP}.expr"
 mkdir -p "$OUTD"
 
-echo "### pull $ADIR from $DGX:$OUTDIR_NAME"
+echo "### pull $ADIR from $GPU:$OUTDIR_NAME"
 rm -rf "$LOCAL_ADAPTER"; mkdir -p "$LOCAL_ADAPTER"
-scp "$DGX:$REMOTE_OUT/$ADIR/adapter_model.safetensors" "$DGX:$REMOTE_OUT/$ADIR/adapter_config.json" "$LOCAL_ADAPTER/" || { echo "!! adapter not found"; exit 1; }
+scp "$GPU:$REMOTE_OUT/$ADIR/adapter_model.safetensors" "$GPU:$REMOTE_OUT/$ADIR/adapter_config.json" "$LOCAL_ADAPTER/" || { echo "!! adapter not found"; exit 1; }
 echo "### export -> $EXPR"
 python3 training/expressivity-lora/export_expr.py "$LOCAL_ADAPTER" "$EXPR" --lang English --hidden 2048 || exit 1
 
