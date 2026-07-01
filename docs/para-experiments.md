@@ -117,9 +117,22 @@ Seed 7 is decisive (s42 forces/derails). `haha`@T1.0 stays a ryan-EN-only clean 
 | vivian · IT | `唉` (CN) | 42 · **0.9** | ✅ **WIN** | pulito (la temp più bassa calma il CN) |
 | vivian · IT | `唉` (CN) | 42 · 1.1 | ❌ KO | ansima stanchezza/godimento, metallico (vivian over-does 唉 at T1.1) |
 
-**⇒ SIGH mapping: ryan/clone → `唉` @ s42 T1.1 · vivian → `ahh` @ s7 (medium) / s42 (short) T1.1.**
-Sigh is more voice-dependent than laugh. `ahh` looks like a candidate UNIVERSAL sigh (wins on vivian AND
-galatea `ahh` s2024) — TODO: confirm `ahh` sighs on ryan-IT too → if yes, unify `[sigh]` → `ahh`.
+| ryan · IT | `ahh` | 7 / 42 · 1.1 | ✅ **WIN** | sospira pulito: s7 medio, s42 breve — `ahh` sighs on ryan too |
+
+**⇒ SIGH mapping (FINAL): `[sigh]` → `ahh` (Latin) — UNIVERSAL** (ryan IT, vivian IT, galatea). seed 7 = medium,
+seed 42 = short. (`唉` also perfect on ryan/clone but over-does on vivian → `ahh` is the safe universal pick.)
+
+---
+
+## ✅ FINAL inline `[tag]` mapping (validated across ryan/vivian/galatea, 2026-07-01)
+| tag | onomatopoeia (inline) | seed | scope |
+|---|---|---|---|
+| **`[laugh]`** | `哈哈哈` (CN, 3-char) | **7** | universal — ryan EN/IT, vivian IT, galatea clone |
+| **`[sigh]`**  | `ahh` (Latin)          | **7** (medium) / 42 (short) | universal — same voices |
+Method: INLINE substitution into the sentence, ONE generation, `--emotion` + T1.1, no event-instruct, no
+steering-span. Seed 7 serves BOTH tags → default the generation seed to 7 when a para tag is present and no
+explicit `--seed`. Nits: mild metallic tail on ryan laugh (later). `唉`=alt sigh (ryan/clone), `haha`@T1.0=alt
+laugh (ryan-EN only).
 
 ---
 
