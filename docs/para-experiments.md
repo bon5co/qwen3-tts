@@ -117,22 +117,34 @@ Seed 7 is decisive (s42 forces/derails). `haha`@T1.0 stays a ryan-EN-only clean 
 | vivian · IT | `唉` (CN) | 42 · **0.9** | ✅ **WIN** | pulito (la temp più bassa calma il CN) |
 | vivian · IT | `唉` (CN) | 42 · 1.1 | ❌ KO | ansima stanchezza/godimento, metallico (vivian over-does 唉 at T1.1) |
 
-| ryan · IT | `ahh` | 7 / 42 · 1.1 | ✅ **WIN** | sospira pulito: s7 medio, s42 breve — `ahh` sighs on ryan too |
+| ryan · IT | `ahh` | 7 / 42 · 1.1 | ✅ **WIN (alt)** | sospira pulito: s7 medio, s42 breve |
 
-**⇒ SIGH mapping (FINAL): `[sigh]` → `ahh` (Latin) — UNIVERSAL** (ryan IT, vivian IT, galatea). seed 7 = medium,
-seed 42 = short. (`唉` also perfect on ryan/clone but over-does on vivian → `ahh` is the safe universal pick.)
+**⇒ SIGH mapping (FINAL) — VOICE-DEPENDENT (not universal!):** ryan/clone → **`唉` @ seed 42**; vivian → **`ahh`
+@ seed 7** (vivian over-does `唉` at T1.1). ⚠️ NOTE: `ahh` @ seed 7 is a WIN on ryan/vivian but was **KO on
+galatea** (`3× eh eh eh`) — do NOT use `ahh` s7 as a universal sigh. `ahh` s2024 is the galatea `ahh` win.
 
 ---
 
-## ✅ FINAL inline `[tag]` mapping (validated across ryan/vivian/galatea, 2026-07-01)
-| tag | onomatopoeia (inline) | seed | scope |
+## ✅ FINAL inline `[tag]` mapping — SHIPPED in main.c (commit 2a6d661, 2026-07-01)
+The **user writes the friendly tag `[laugh]`/`[sigh]`**; the engine rewrites it under the hood to the
+onomatopoeia below, **COMMA-DELIMITED** (`", onom, "` — the pause that makes it a discrete event), pins the
+validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`para_inline_substitute` in main.c.)
+
+| tag (user writes) | onomatopoeia (engine inserts) | seed | scope |
 |---|---|---|---|
-| **`[laugh]`** | `哈哈哈` (CN, 3-char) | **7** | universal — ryan EN/IT, vivian IT, galatea clone |
-| **`[sigh]`**  | `ahh` (Latin)          | **7** (medium) / 42 (short) | universal — same voices |
-Method: INLINE substitution into the sentence, ONE generation, `--emotion` + T1.1, no event-instruct, no
-steering-span. Seed 7 serves BOTH tags → default the generation seed to 7 when a para tag is present and no
-explicit `--seed`. Nits: mild metallic tail on ryan laugh (later). `唉`=alt sigh (ryan/clone), `haha`@T1.0=alt
-laugh (ryan-EN only).
+| **`[laugh]`** | `哈哈哈` (CN, 3-char) | **7** | universal — ryan EN/IT, vivian, galatea clone |
+| **`[sigh]`** — ryan/clone | `唉` (CN) | **42** | ryan/clone |
+| **`[sigh]`** — vivian | `ahh` (Latin) | **7** | vivian only (over-does `唉`) |
+
+Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
+steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
+ryan/clone/other. Nits: mild metallic tail on ryan laugh (later). `haha`@T1.0=alt laugh (ryan-EN only),
+`ahh` s2024=alt sigh (galatea). Plain text (no tag) is untouched.
+
+> ⚠️⚠️ **PROCESS RULE (2026-07-01, learned the hard way):** ALWAYS test a `[tag]` feature the way a REAL USER
+> would — write the actual `[laugh]`/`[sigh]` tag in `--text` and let the engine substitute — **never** hand-paste
+> the raw onomatopoeia. The first wiring pasted `哈哈哈` WITHOUT the delimiting commas and picked the wrong
+> per-voice seed → all 3 clips were garbage. The `[tag]` path (commas + per-voice seed) is the only valid test.
 
 ---
 
