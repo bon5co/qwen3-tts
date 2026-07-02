@@ -59,6 +59,23 @@ void  qwen_metal_scale(void *ctx, float *out, const float *a, float s, int n);
 void  qwen_metal_rope(void *ctx, float *x, const float *cosv, const float *sinv,
                       int n_heads, int head_dim);
 
+/* Snake activation (decoder): data[c*L+t] += exp(-log_beta[c])*sin(exp(log_alpha[c])*x)^2 */
+void  qwen_metal_snake(void *ctx, float *data, const float *log_alpha,
+                       const float *log_beta, int channels, int length);
+/* Direct causal GQA attention (matches qwen_causal_attention). */
+void  qwen_metal_attention(void *ctx, float *O, const float *Q, const float *K, const float *V,
+                           int seq_q, int seq_k, int n_heads, int n_kv, int head_dim,
+                           float scale, int q_offset);
+/* matmat with f32 weights (prefill GEMM), simdgroup_matrix MMA. */
+void  qwen_metal_matmat_f32(void *ctx, float *Y, const float *W, const float *X,
+                            int rows, int cols, int B);
+/* Causal conv1d / conv-transpose1d, channel-first [ch,length] (decoder ConvNet). */
+void  qwen_metal_conv1d(void *ctx, float *out, const float *in, const float *weight,
+                        const float *bias, int in_ch, int out_ch, int length, int ksz, int dilation);
+void  qwen_metal_conv_transpose1d(void *ctx, float *out, const float *in, const float *weight,
+                                  const float *bias, int in_ch, int out_ch, int in_len, int out_len,
+                                  int ksz, int stride);
+
 /* FUSED RESIDENT FFN (the heavy block): rms_norm → gate_up matvec → SwiGLU →
  * down matvec → residual, encoded as ONE command buffer with all intermediates
  * kept in device buffers (no per-op CPU sync). gate_up [2*inter,H] interleaved,
