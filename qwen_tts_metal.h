@@ -59,6 +59,12 @@ void  qwen_metal_scale(void *ctx, float *out, const float *a, float s, int n);
 void  qwen_metal_rope(void *ctx, float *x, const float *cosv, const float *sinv,
                       int n_heads, int head_dim);
 
+/* Amortized matvec cost with K dispatches in ONE command buffer (ms/op) —
+ * the fused regime a real decode step runs in (isolates kernel throughput from
+ * the per-op CPU<->GPU sync). */
+double qwen_metal_matvec_bench_fused(void *ctx, const uint16_t *W, const float *x,
+                                     int rows, int cols, int reps);
+
 /* Full per-op correctness + resident-timing suite vs the CPU kernels.
  * out (FILE*) may be NULL → stdout. Returns number of failing ops (0 = PASS). */
 int   qwen_metal_selftest(void *out);

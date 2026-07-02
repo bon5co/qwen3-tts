@@ -29,12 +29,24 @@ static const char *QWEN_METAL_SRC =
 "inline float bf16_to_f32(ushort b) { return as_type<float>(uint(b) << 16); }\n"
 "struct q4blk { float scale; uchar qs[16]; };\n"
 "\n"
+/* simdgroup matvec: one output row per simdgroup; 32 lanes stride the cols with
+ * coalesced weight reads, then simd_sum reduces (the ggml-metal mmv pattern). */
 "kernel void matvec_bf16(device const ushort *W [[buffer(0)]],\n"
 "    device const float *x [[buffer(1)]], device float *y [[buffer(2)]],\n"
-"    constant uint &cols [[buffer(3)]], uint row [[thread_position_in_grid]]) {\n"
-"    float acc = 0.0f; device const ushort *w = W + (ulong)row * cols;\n"
-"    for (uint c = 0; c < cols; ++c) acc += bf16_to_f32(w[c]) * x[c];\n"
-"    y[row] = acc;\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]],\n"
+"    uint3 tgpig [[threadgroup_position_in_grid]],\n"
+"    uint tiisg [[thread_index_in_simdgroup]],\n"
+"    uint sgitg [[simdgroup_index_in_threadgroup]],\n"
+"    uint nsg [[simdgroups_per_threadgroup]]) {\n"
+"    uint row = tgpig.x * nsg + sgitg; if (row >= rows) return;\n"
+"    device const ushort4 *w4 = (device const ushort4 *)(W + (ulong)row * cols);\n"
+"    device const float4 *x4 = (device const float4 *)x;\n"
+"    uint n4 = cols >> 2; float acc = 0.0f;\n"
+"    for (uint c = tiisg; c < n4; c += 32) { ushort4 b = w4[c];\n"
+"        float4 wf = float4(as_type<float>(uint(b.x)<<16), as_type<float>(uint(b.y)<<16),\n"
+"                           as_type<float>(uint(b.z)<<16), as_type<float>(uint(b.w)<<16));\n"
+"        acc += dot(wf, x4[c]); }\n"
+"    acc = simd_sum(acc); if (tiisg == 0) y[row] = acc;\n"
 "}\n"
 "\n"
 "kernel void matmat_bf16(device const ushort *W [[buffer(0)]],\n"
@@ -238,9 +250,12 @@ void qwen_metal_matvec_bf16(void *ctx, float *y, const uint16_t *W,
         [e setComputePipelineState:pso];
         [e setBuffer:bW offset:0 atIndex:0]; [e setBuffer:bx offset:0 atIndex:1];
         [e setBuffer:by offset:0 atIndex:2];
-        uint32_t cc = (uint32_t)cols; [e setBytes:&cc length:4 atIndex:3];
-        [e dispatchThreads:MTLSizeMake((NSUInteger)rows,1,1)
-        threadsPerThreadgroup:MTLSizeMake(cap256(pso),1,1)];
+        uint32_t cc = (uint32_t)cols, rr = (uint32_t)rows;
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
+        const NSUInteger NSG = 8;   /* simdgroups per threadgroup → 256 threads */
+        NSUInteger ntg = ((NSUInteger)rows + NSG - 1) / NSG;
+        [e dispatchThreadgroups:MTLSizeMake(ntg,1,1)
+        threadsPerThreadgroup:MTLSizeMake(NSG * 32,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         memcpy(y, by.contents, (size_t)rows * sizeof(float));
     }
@@ -471,6 +486,37 @@ static double nowms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
     return t.tv_sec * 1000.0 + t.tv_nsec / 1e6; }
 static uint16_t to_bf16(float f) { union { float f; uint32_t u; } v; v.f = f; return (uint16_t)(v.u >> 16); }
 
+/* Amortized matvec cost when K dispatches share ONE command buffer + one
+ * commit/wait (resident weight + IO) — isolates kernel throughput from the
+ * per-op CPU<->GPU round-trip that dominates the naive one-op-per-commit path.
+ * Returns ms/op. This is the regime a real fused decode step runs in. */
+double qwen_metal_matvec_bench_fused(void *ctx, const uint16_t *W, const float *x,
+                                     int rows, int cols, int reps) {
+    @autoreleasepool {
+        qwen_metal_ctx *c = ctx;
+        id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)c->queue;
+        id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)c->pso_matvec_bf16;
+        id<MTLBuffer> bW = weight_buf(c, W, (size_t)rows * cols * sizeof(uint16_t));
+        id<MTLBuffer> bx = io_buf(c, 0, (size_t)cols * sizeof(float));
+        id<MTLBuffer> by = io_buf(c, 1, (size_t)rows * sizeof(float));
+        memcpy(bx.contents, x, (size_t)cols * sizeof(float));
+        uint32_t cc = (uint32_t)cols, rr = (uint32_t)rows;
+        const NSUInteger NSG = 8; NSUInteger ntg = ((NSUInteger)rows + NSG - 1) / NSG;
+        double t0 = nowms();
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:pso];
+        [e setBuffer:bW offset:0 atIndex:0]; [e setBuffer:bx offset:0 atIndex:1];
+        [e setBuffer:by offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4];
+        for (int r = 0; r < reps; ++r)
+            [e dispatchThreadgroups:MTLSizeMake(ntg,1,1)
+            threadsPerThreadgroup:MTLSizeMake(NSG * 32,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        return (nowms() - t0) / reps;
+    }
+}
+
 static int check(FILE *f, const char *name, const float *a, const float *b, int n, double tol) {
     double mabs = 0, mref = 0;
     for (int i = 0; i < n; ++i) { double d = fabs((double)a[i]-b[i]); if (d>mabs) mabs=d;
@@ -572,8 +618,14 @@ int qwen_metal_selftest(void *out) {
     double tc_mm = (nowms()-t0)/it;
     t0 = nowms(); for (int k = 0; k < it; ++k) qwen_metal_matmat_bf16(ctx, gpu, Wb, X, rows, cols, B);
     double tg_mm = (nowms()-t0)/it;
-    fprintf(f, "  timing matvec_bf16: cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n", tc_mv, tg_mv, tg_mv>0?tc_mv/tg_mv:0);
-    fprintf(f, "  timing matmat_bf16: cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n", tc_mm, tg_mm, tg_mm>0?tc_mm/tg_mm:0);
+    fprintf(f, "  timing matvec_bf16 (per-op commit): cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n", tc_mv, tg_mv, tg_mv>0?tc_mv/tg_mv:0);
+    fprintf(f, "  timing matmat_bf16 (per-op commit): cpu=%.3f ms  metal=%.3f ms  (%.2fx)\n", tc_mm, tg_mm, tg_mm>0?tc_mm/tg_mm:0);
+    /* fused: 200 matvecs in ONE command buffer (the real decode regime) */
+    double tg_fused = qwen_metal_matvec_bench_fused(ctx, Wb, x, rows, cols, 200);
+    t0 = nowms(); for (int k = 0; k < 200; ++k) qwen_matvec_bf16(cpu, Wb, x, rows, cols);
+    double tc_op = (nowms()-t0)/200;
+    fprintf(f, "  matvec FUSED (200 ops/1 cmdbuf): cpu=%.4f ms/op  metal=%.4f ms/op  (%.2fx)\n",
+            tc_op, tg_fused, tg_fused>0?tc_op/tg_fused:0);
     fprintf(f, "metal-selftest: %s (%d op%s failing)\n", fails ? "FAIL" : "PASS", fails, fails==1?"":"s");
 
     free(Wb); free(Wi); free(Ws); free(Wq); free(x); free(X); free(w); free(gu);
