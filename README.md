@@ -60,7 +60,7 @@ make blas
 - **Emotion in one flag** — `--emotion <sad\|joy\|anger\|fear\|disgust\|surprise>` (1.7B) auto-applies the ear-validated recipe (per-language fine-tune `.expr` + steering vector + a default English instruct + temperature), on presets **and** cloned voices, in every Qwen language. A vivid English `--instruct` and `-T` override. Pitch-preserving `--rate`/`--volume` and a `--roughness` grit knob are still available. See [docs/emotion-THE-recipe.md](docs/emotion-THE-recipe.md).
 - **Inline markup for audiobooks** — write one text with ElevenLabs/Bark-style tags and get a multi-emotion take in one pass: `--text "I won! [excited] ...amazing! [pause:500ms] [sad] But it's over. [sigh]"`. Mid-text emotion switches, `[pause:400ms]`/`[break:1s]` pauses, and `[sigh]`/`[huff]` paralinguistic fillers — auto-detected in `--text` (no flag) or explicit via `--compose`. Spans are model-generated and concatenated seamlessly. See [docs/markup.md](docs/markup.md).
 - **VoiceDesign** — Create new voices from text descriptions.
-- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`.
+- **HTTP server** — `/v1/tts`, `/v1/tts/stream`, OpenAI-compatible `/v1/audio/speech`; JSON body takes `emotion`/`instruct`/`volume`/`rate` (same recipe as the CLI).
 - **Streaming** — Real-time audio via `--stream` (WAV) or `--stdout` (raw PCM).
 - **INT8 quantization** — `--int8` quantizes Talker + Code Predictor (native SDOT on ARM, AVX-512/VNNI on x86): **0.6B goes sub-realtime on Apple Silicon (RTF < 1.0, CLI/stream/server)**, **1.7B 2.66→1.79 (−33%)**, near-bf16 quality, works with preset speakers and custom `.qvoice` voices. (INT4 is the lever on memory-starved x86; on cache-rich chips like M1, INT8 wins.)
 - **Configurable sampling** — Temperature, top-k, top-p, and repetition penalty.
@@ -321,9 +321,13 @@ A manual `--expr` / `--ml-steer` always **overrides** the `--emotion` auto-route
 curl -s http://localhost:8080/v1/tts \
   -d '{"text":"Hello, how are you?"}' -o output.wav
 
-# Stream with real-time playback
+# With emotion (same recipe as the CLI --emotion; joy/sad/angry/calm/…)
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"What a wonderful day!","speaker":"ryan","language":"English","emotion":"joy"}' -o joy.wav
+
+# Stream with real-time playback (emotion works on the streaming path too)
 curl -sN http://localhost:8080/v1/tts/stream \
-  -d '{"text":"Hello, how are you?"}' | \
+  -d '{"text":"Hello, how are you?","emotion":"sad"}' | \
   play -t raw -r 24000 -e signed -b 16 -c 1 -
 
 # OpenAI-compatible endpoint

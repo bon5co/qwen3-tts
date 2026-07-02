@@ -53,6 +53,13 @@ curl -s http://localhost:8080/v1/tts \
 curl -s http://localhost:8080/v1/tts \
   -d '{"text":"I cannot believe it!","instruct":"Speak angrily"}' \
   -o angry.wav
+
+# With emotion — same ear-validated recipe as the CLI --emotion
+# (joy/happy/excited/proud/news/dramatic/calm/sad/gloomy/annoyed/stern/angry).
+# Sets the Code-Predictor steering vector for (emotion, language) + volume/tempo.
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"What a wonderful day!","speaker":"ryan","language":"English","emotion":"joy"}' \
+  -o joy.wav
 ```
 
 ### `POST /v1/tts/stream` — Streaming PCM
@@ -111,6 +118,9 @@ curl -s http://localhost:8080/v1/health
   "speaker": "ryan",
   "language": "English",
   "instruct": "Speak cheerfully",
+  "emotion": "joy",
+  "volume": 1.0,
+  "rate": 1.0,
   "seed": 42,
   "temperature": 0.5,
   "top_k": 50,
@@ -122,8 +132,17 @@ curl -s http://localhost:8080/v1/health
 All fields except `text` are optional. Defaults: speaker=ryan, language=English,
 temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 
+**Expressivity fields:**
+
+| Field | Meaning |
+|---|---|
+| `instruct` | Free-form style prompt (**1.7B only**), e.g. `"Speak angrily"`. |
+| `emotion` | Named mood — same recipe as the CLI `--emotion`: `joy`, `happy`, `excited`, `proud`, `news`, `dramatic`, `calm`, `sad`, `gloomy`, `annoyed`, `stern`, `angry`. Sets the Code-Predictor steering vector for the `(emotion, language)` pair (applied during generation, so it works on **both** `/v1/tts` and `/v1/tts/stream`) and applies the recipe's volume/tempo. Best on 1.7B. |
+| `volume` | Linear output gain (`1.0` = unchanged). Overrides the emotion recipe's volume; applied on both full and streaming paths. |
+| `rate` | Pitch-preserving tempo (`>1` faster). Overrides the emotion recipe's rate. Applied on `/v1/tts`; **not** on `/v1/tts/stream` (needs the full buffer). |
+
 Each request resets its **sampling parameters** to defaults (speaker, language, temperature,
-top-k/p, rep-penalty, seed), so those do not leak between requests.
+top-k/p, rep-penalty, seed) **and clears any prior emotion steering**, so nothing leaks between requests.
 
 > **Reproducibility (fixed 2026-06-03):** identical consecutive requests now produce **bit-identical**
 > output, and a cold server request matches the CLI. The earlier cross-request divergence was a stale
