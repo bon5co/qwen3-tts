@@ -1156,17 +1156,23 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
         fprintf(stderr, "Error: %s is not a valid .expr file (bad magic)\n", path);
         fclose(f); return -1;
     }
-    fread(&version, sizeof(uint32_t), 1, f);
-    fread(lang, 1, 16, f);
-    fread(&reserved, sizeof(uint32_t), 1, f);
+    /* audit #8: check the header freads (a truncated file must not proceed with garbage).
+     * The tensor DATA itself is integrity-guarded by download_assets.sh's sha256 vs
+     * presets/expr/MANIFEST.md, so per-tensor size validation is covered upstream. */
+    if (fread(&version, sizeof(uint32_t), 1, f) != 1 ||
+        fread(lang, 1, 16, f) != 16 ||
+        fread(&reserved, sizeof(uint32_t), 1, f) != 1) {
+        fprintf(stderr, "Error: %s truncated header\n", path);
+        fclose(f); return -1;
+    }
     char wmagic[4];
     if (fread(wmagic, 1, 4, f) != 4 || memcmp(wmagic, "WDLT", 4) != 0) {
         fprintf(stderr, "Error: %s missing WDLT stream\n", path);
         fclose(f); return -1;
     }
     uint32_t target_h = 0, n_tensors = 0;
-    fread(&target_h, sizeof(uint32_t), 1, f);
-    fread(&n_tensors, sizeof(uint32_t), 1, f);
+    if (fread(&target_h, sizeof(uint32_t), 1, f) != 1 ||
+        fread(&n_tensors, sizeof(uint32_t), 1, f) != 1) { fclose(f); return -1; }  /* audit #8 */
     if ((int)target_h != ctx->config.hidden_size) {
         fprintf(stderr, "Error: .expr is for hidden=%u but model has hidden=%d (model/.expr mismatch)\n",
                 target_h, ctx->config.hidden_size);
@@ -1182,13 +1188,16 @@ static int apply_expr_file(qwen_tts_ctx_t *ctx, const char *path, float expr_wei
         if (fread(&name_len, sizeof(uint16_t), 1, f) != 1) break;
         char tname[256] = {0};
         if (name_len >= 256) break;
-        fread(tname, 1, name_len, f);
-        uint32_t data_bytes;
-        fread(&data_bytes, sizeof(uint32_t), 1, f);
+        uint32_t data_bytes = 0, comp_size = 0;
         uint8_t dtype_flag = 0;
-        uint32_t comp_size = 0;
-        fread(&dtype_flag, 1, 1, f);
-        fread(&comp_size, sizeof(uint32_t), 1, f);
+        /* audit #8: check the per-record metadata freads; a truncated record must not feed
+         * garbage sizes into the mallocs below. Cap sizes to a sane bound (256 MB) so a
+         * corrupt length can't trigger an absurd allocation. */
+        if (fread(tname, 1, name_len, f) != name_len ||
+            fread(&data_bytes, sizeof(uint32_t), 1, f) != 1 ||
+            fread(&dtype_flag, 1, 1, f) != 1 ||
+            fread(&comp_size, sizeof(uint32_t), 1, f) != 1) break;
+        if (data_bytes > (256u << 20) || comp_size > (256u << 20)) break;
 
         /* Resolve tname -> the weight pointer to override. bf16 weight matrices use the
          * int16-delta path (dtype 4); RMSNorm weights are f32 in the engine and use raw

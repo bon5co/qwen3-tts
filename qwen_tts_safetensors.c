@@ -227,6 +227,19 @@ safetensors_file_t *safetensors_open(const char *path) {
 
     if (parse_header(sf) != 0) { safetensors_close(sf); return NULL; }
 
+    /* audit #8: validate every tensor's [data_offset, data_offset+data_size) lies within
+     * the mapped data section. A truncated/corrupt file could otherwise make
+     * safetensors_data() hand back a pointer that reads OOB past the mmap. The subtraction
+     * form avoids size_t overflow (data_offset <= data_section is checked first). */
+    size_t data_section = file_size - 8 - (size_t)header_size;
+    for (int i = 0; i < sf->num_tensors; i++) {
+        safetensor_t *t = &sf->tensors[i];
+        if (t->data_offset > data_section || t->data_size > data_section - t->data_offset) {
+            fprintf(stderr, "safetensors: tensor '%s' data range out of bounds (corrupt file)\n", t->name);
+            safetensors_close(sf); return NULL;
+        }
+    }
+
     return sf;
 }
 

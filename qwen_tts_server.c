@@ -740,15 +740,17 @@ static void job_free(batch_job_t *j) {
  * names + defaults using ctx config only. *needs_single set when the batch engine
  * can't serve it (instruct or voice_design → must run single-stream). Returns
  * malloc'd text or NULL on bad/oversized input. */
-static char *parse_batch_req(qwen_tts_ctx_t *ctx, const char *body,
+static char *parse_batch_req(qwen_tts_ctx_t *ctx, int def_speaker_id, int def_language_id,
+                             const char *body,
                              qwen_batch_req_t *req, int *needs_single) {
     *needs_single = 0;
     char *text = json_extract_string(body, "text");
     if (!text) text = json_extract_string(body, "input");
     if (!text || text[0] == '\0' || strlen(text) > MAX_TTS_TEXT) { free(text); return NULL; }
 
-    /* defaults (mirror reset_request_state) */
-    if (ctx->voice_clone) { req->speaker_id = ctx->speaker_id; req->language_id = ctx->language_id; }
+    /* defaults (mirror reset_request_state). audit #5: use the start-of-server snapshot,
+     * NOT live ctx->speaker_id/language_id which the scheduler mutates per admission. */
+    if (ctx->voice_clone) { req->speaker_id = def_speaker_id; req->language_id = def_language_id; }
     else { req->speaker_id = 3061 /*ryan*/; req->language_id = 2050 /*English*/; }
     req->temperature = 0.5f; req->top_k = 50; req->top_p = 1.0f; req->rep_penalty = 1.05f;
     req->greedy_warmup = ctx->greedy_warmup;
@@ -792,7 +794,12 @@ static void respond_wav(int fd, const float *audio, int n_samples) {
 
 /* Reader thread: pop a client fd, read+route. Synthesis is deferred to jobs;
  * only non-synth endpoints answer inline. */
-typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; job_queue_t *jq_single; } reader_arg_t;
+/* def_speaker_id/def_language_id: audit #5 — snapshot of the ctx voice-clone defaults
+ * taken ONCE at server start (single-threaded). Readers must NOT read ctx->speaker_id/
+ * language_id live: the scheduler transiently overwrites+restores those per admission,
+ * so a concurrent read would race and pick a wrong default. */
+typedef struct { qwen_tts_ctx_t *ctx; conn_queue_t *cq; job_queue_t *jq; job_queue_t *jq_single;
+                 int def_speaker_id; int def_language_id; } reader_arg_t;
 
 static void *reader_main(void *arg) {
     reader_arg_t *ra = (reader_arg_t *)arg;
@@ -824,7 +831,7 @@ static void *reader_main(void *arg) {
             batch_job_t *j = (batch_job_t *)calloc(1, sizeof(batch_job_t));
             j->fd = fd;
             int needs_single = 0;
-            char *text = parse_batch_req(ra->ctx, body, &j->req, &needs_single);
+            char *text = parse_batch_req(ra->ctx, ra->def_speaker_id, ra->def_language_id, body, &j->req, &needs_single);
             if (!text) { send_error(fd, 400, "missing, empty, or oversized 'text' (max 8192 chars)"); close(fd); free(j); free(buf); continue; }
             if (needs_single) {
                 /* instruct / voice_design can't batch → dedicated worker (clone ctx) */
@@ -928,14 +935,21 @@ static void *scheduler_main(void *arg) {
 }
 
 /* Single-job worker: streaming / instruct / voice_design on a CLONE ctx so it
- * never stalls the batch. NULL clone → run on the shared ctx (still correct;
- * the batch driver is the only other ctx user and these are rare). */
-typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; } single_arg_t;
+ * never stalls the batch. audit #6: if the clone allocation failed (reject=1) we do
+ * NOT fall back to the shared scheduler ctx — that ctx is synthesizing continuously,
+ * so two threads on it would corrupt KV/dec_x. Instead we drain the queue with 503
+ * (clean error) rather than serve corrupted audio. */
+typedef struct { qwen_tts_ctx_t *ctx; job_queue_t *jq; int reject; } single_arg_t;
 static void *single_worker_main(void *arg) {
     single_arg_t *sw = (single_arg_t *)arg;
     for (;;) {
         batch_job_t *j = jq_pop(sw->jq);
         if (!j) break;   /* shutdown + drained */
+        if (sw->reject) {
+            send_error(j->fd, 503, "single-job worker unavailable (clone alloc failed)");
+            close(j->fd); job_free(j);
+            continue;
+        }
         sw->ctx->stream = 0; sw->ctx->audio_cb = NULL;
         if (j->is_stream) handle_tts_stream(sw->ctx, j->fd, j->body);
         else handle_tts(sw->ctx, j->fd, j->body);
@@ -960,8 +974,12 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
 
     pthread_t *readers = (pthread_t *)calloc(n_readers, sizeof(pthread_t));
     reader_arg_t *rargs = (reader_arg_t *)calloc(n_readers, sizeof(reader_arg_t));
+    /* audit #5: snapshot the voice-clone defaults now, before the scheduler (which
+     * mutates ctx->speaker_id/language_id per admission) starts. */
+    int def_spk = ctx->speaker_id, def_lang = ctx->language_id;
     for (int i = 0; i < n_readers; i++) {
         rargs[i].ctx = ctx; rargs[i].cq = &cq; rargs[i].jq = &jq; rargs[i].jq_single = &jq_single;
+        rargs[i].def_speaker_id = def_spk; rargs[i].def_language_id = def_lang;
         pthread_create(&readers[i], NULL, reader_main, &rargs[i]);
     }
     /* continuous-batching scheduler (owns base ctx) */
@@ -972,7 +990,9 @@ int qwen_tts_serve_batched(qwen_tts_ctx_t *ctx, int port, int max_batch) {
      * (clone shares weights+voice; NULL → fall back to shared ctx). */
     qwen_tts_ctx_t *single_ctx = qwen_tts_clone_for_worker(ctx);
     pthread_t single_thr;
-    single_arg_t swarg = { .ctx = single_ctx ? single_ctx : ctx, .jq = &jq_single };
+    /* audit #6: on clone failure, run the worker in reject mode (503) rather than share
+     * the scheduler's ctx (which would corrupt in-flight batch synthesis). */
+    single_arg_t swarg = { .ctx = single_ctx ? single_ctx : ctx, .jq = &jq_single, .reject = (single_ctx == NULL) };
     pthread_create(&single_thr, NULL, single_worker_main, &swarg);
 
     fprintf(stderr, "Server listening on http://0.0.0.0:%d (continuous request-batching: max_batch=%d, %d readers%s)\n",

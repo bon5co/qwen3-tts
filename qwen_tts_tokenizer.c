@@ -222,6 +222,12 @@ static char *parse_json_string(const char *json, int *pos) {
                 case 'f':  out[o++] = '\f'; break;
                 case 'u': {
                     (*pos)++;
+                    /* audit #8: a truncated "\uXX"+NUL must not read past the terminator.
+                     * Require all 4 hex digits to be present; otherwise bail to end. */
+                    if (!json[*pos] || !json[*pos+1] || !json[*pos+2] || !json[*pos+3]) {
+                        while (json[*pos]) (*pos)++;   /* jump to NUL; outer loop stops */
+                        break;
+                    }
                     uint32_t cp = 0;
                     for (int i = 0; i < 4; i++) {
                         char c = json[*pos + i];
@@ -231,8 +237,10 @@ static char *parse_json_string(const char *json, int *pos) {
                         else if (c >= 'A' && c <= 'F') cp |= 10 + c - 'A';
                     }
                     *pos += 3; /* will be incremented by 1 below */
-                    /* Handle surrogate pairs */
-                    if (cp >= 0xD800 && cp <= 0xDBFF && json[*pos + 1] == '\\' && json[*pos + 2] == 'u') {
+                    /* Handle surrogate pairs (audit #8: also require the low \uXXXX's 4 hex
+                     * digits to be present before reading them). */
+                    if (cp >= 0xD800 && cp <= 0xDBFF && json[*pos + 1] == '\\' && json[*pos + 2] == 'u' &&
+                        json[*pos+3] && json[*pos+4] && json[*pos+5] && json[*pos+6]) {
                         *pos += 3; /* skip \u */
                         uint32_t lo = 0;
                         for (int i = 0; i < 4; i++) {
