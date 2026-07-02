@@ -14,21 +14,28 @@ CPU kernels (bf16-exact within fp-order).
 
 ## Master table
 
-| # | Op (code point) | Bound | CPU — SIMD path | Metal — kernel + M1 result | CUDA — status | Commit |
+Status: ✅ = implemented + correctness-gated · 🔷 = implemented, DGX-compile-pending (nvcc; logic mirrors the
+M1-validated Metal twin) · ⏳ = optimization TODO.
+
+| # | Op (code point) | Bound | CPU — SIMD path | Metal — kernel + M1 result | CUDA | Commit |
 |---|---|---|---|---|---|---|
-| 1 | **matvec bf16** (Talker/CP decode) | mem | NEON (scalar fallback); no AVX2 | `matvec_bf16` simdgroup + `ushort4`/`float4` + `simd_sum`; per-op 0.25×, **fused 1.0–1.5×** | cuBLAS Sgemm resident (B=1) — DGX-run | 5c9826d |
-| 2 | **matvec int8** (int8 CP/Talker) | mem | NEON **SDOT** (ARM); AVX-512 VNNI (x86, validated) | `matvec_int8` in-shader dequant; PASS rel 4e-3 | planned: `__dp4a`/dp4 + q8_1 act-quant (ggml `vecdotq`) | d0e2ff6 |
-| 3 | **matvec q4_0** (int4 CP) | mem | NEON nibble-unpack; SDOT-q4 = TODO | `matvec_q4_0` in-shader `(nib-8)*s`; PASS rel 4e-7 | planned: dp4a q4→q8_1 | d0e2ff6 |
-| 4 | **matmat bf16** (prefill / server batch) | **cmp** | hand NEON register-blocked; prefill via **BLAS/AMX** | `matmat_bf16` **`simdgroup_matrix` 8×8 MMA**; **B=32 → 6.96×** ⭐ | cuBLAS `Sgemm`/`GemmEx` (bf16 sm_80+) | 921c542 |
-| 5 | **rms_norm** (+fused residual) | mem | NEON + **AVX2** | `rms_norm` 2-level simd/threadgroup reduction; PASS exact | planned `norm.cu` block-reduce | d0e2ff6 |
-| 6 | **rope** (interleaved / neox) | cmp | scalar / NEON | `rope`; PASS rel 9e-8 | planned `rope.cu` (fuse into QKV epilogue) | d0e2ff6 |
-| 7 | **swiglu / silu** | mem | `vvexpf` (Accelerate) / scalar | `swiglu`,`silu`; PASS rel <2e-7 | planned elementwise | d0e2ff6 |
-| 8 | **add / mul / scale** | mem | scalar (auto-vec) | `eadd`/`emul`/`escale`; PASS exact | planned elementwise | d0e2ff6 |
-| 9 | **FFN block** (rms→gate_up→swiglu→down→res) | mem(B1)/cmp(batch) | per-op CPU kernels | **`qwen_metal_ffn_swiglu` = ONE command buffer, resident activations**; B=1 **1.07×** | planned fused | db0ec05 |
-| 10 | **attention** (causal GQA) | mem | NEON (f32 + bf16-KV) | **TODO** — port `flash_attn_ext_vec` (online softmax, KV resident) | TODO `fattn-vec` | — |
-| 11 | **speech decoder ConvNet** (480× upsample, snake) | **cmp** | NEON/scalar; snake `sinf` scalar | **TODO** — `conv_transpose_1d` tap-solve + im2col/GEMM + snake (the honest M1 win) | TODO | — |
-| 12 | **prefill GEMM** (TTFA floor) | **cmp** | **BLAS** (Accelerate AMX), fp32 weights | **TODO** — `mul_mm` MMA on bf16 (kill the bf16→f32 convert) | cuBLAS `GemmEx` | — |
+| 1 | **matvec bf16** (Talker/CP decode) | mem | NEON (scalar fallback); no AVX2 | ✅ `matvec_bf16` simdgroup + `ushort4`/`float4` + `simd_sum`; per-op 0.25×, **fused 1.0–1.5×** | ✅ cuBLAS Sgemm resident (B=1) | 5c9826d |
+| 2 | **matvec int8** | mem | NEON **SDOT**; AVX-512 VNNI (x86) | ✅ `matvec_int8` in-shader dequant; rel 4e-3 | ⏳ `__dp4a`+q8_1 (ggml `vecdotq`) | d0e2ff6 |
+| 3 | **matvec q4_0** | mem | NEON nibble-unpack | ✅ `matvec_q4_0` `(nib-8)*s`; rel 4e-7 | ⏳ dp4a q4→q8_1 | d0e2ff6 |
+| 4 | **matmat bf16** (prefill / server batch) | **cmp** | hand NEON; prefill via **BLAS/AMX** | ✅ **`simdgroup_matrix` 8×8 MMA**; **B=32 → 6.96×** ⭐ | ✅ cuBLAS Sgemm resident (→GemmEx bf16 sm_80+) | 921c542 |
+| 5 | **rms_norm** | mem | NEON + **AVX2** | ✅ 2-level simd/threadgroup reduction; exact | 🔷 `k_rms_norm` block-reduce | 0267eb1 |
+| 6 | **rope** (interleaved/neox) | cmp | scalar / NEON | ✅ `rope`; rel 9e-8 | 🔷 `k_rope` | 0267eb1 |
+| 7 | **swiglu / silu** | mem | `vvexpf`/scalar | ✅ `swiglu`,`silu`; rel <2e-7 | 🔷 `k_swiglu`/`k_silu` | 0267eb1 |
+| 8 | **add / mul / scale** | mem | scalar (auto-vec) | ✅ `eadd`/`emul`/`escale`; exact | 🔷 `k_add`/`k_mul`/`k_scale` | 0267eb1 |
+| 9 | **FFN block** (rms→gate_up→swiglu→down→res) | mem(B1)/cmp(batch) | per-op CPU kernels | ✅ **`qwen_metal_ffn_swiglu` = ONE command buffer, resident activations**; B=1 **1.07×** | ⏳ fused (CUDA-graph) | db0ec05 |
+| 10 | **attention** (causal GQA) | mem | NEON (f32 + bf16-KV) | ✅ `attention` direct online-softmax; rel 2.7e-7 (flash-vec = opt) | 🔷 `k_attention` | b3df324 |
+| 11 | **decoder ConvNet** (480× upsample) | **cmp** | NEON/scalar; snake `sinf` | ✅ `conv1d`+`conv_transpose1d` (tap-solve)+`snake`; **exact** | 🔷 `k_conv1d`/`k_conv_transpose1d`/`k_snake` | b3df324 |
+| 12 | **prefill GEMM** (TTFA floor) | **cmp** | **BLAS** (AMX), fp32 weights | ✅ `matmat_f32` `simdgroup_matrix` MMA; **exact** | ✅ cuBLAS Sgemm | b3df324 |
 | 13 | **quantize** bf16→int8/q4 (load-time) | — | NEON | n/a (host) | n/a (host) | — |
+
+**Metal column: COMPLETE** (17 ops, all `--gpu-selftest` PASS). **CUDA column: cuBLAS GEMM done + all compute
+kernels written** (🔷 DGX-compile-pending — no nvcc on the M1 dev box; each mirrors a validated Metal twin).
+Remaining = optimization (int8/q4 dp4a, CUDA-graph fusion), not missing ops.
 
 ## Backend architecture (all three)
 - **Seam** `qwen_tts_backend.{h,c}` — vtable (resolver metal→cuda→cpu) + global offload hooks
