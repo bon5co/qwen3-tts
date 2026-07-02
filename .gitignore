@@ -55,6 +55,7 @@ training/expressivity-lora/data*/
 # (Cleanup of already-tracked extras like PLAN.md = a later TODO, not today.)
 docs/PROJECT-COMPASS.md
 plan_emo_v*.md
+plan_v*.md
 analisi_*.md
 audit_*.md
 docs/paralinguistics-*.md
