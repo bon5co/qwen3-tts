@@ -427,7 +427,13 @@ static void dt_free(decoder_thread_t *dt) {
     pthread_mutex_destroy(&dt->mutex);
     pthread_cond_destroy(&dt->cond);
     free(dt->codes);
-    /* audio_buf ownership transfers to caller — don't free here */
+    /* Leaks-audit fix (2026-07, #1 HIGH): free audio_buf here. The normal-mode
+     * caller that takes ownership NULLs dt->audio_buf *before* calling us, so this
+     * is free(NULL) (no-op) on that path; on the streaming, talker-step-error, and
+     * codec_frames==0 paths the caller does NOT take ownership, so this frees the
+     * ~63 MB (max_frames*1920) allocation that used to leak on every such request. */
+    free(dt->audio_buf);
+    dt->audio_buf = NULL;
 }
 
 static void dt_push_frames(decoder_thread_t *dt, const int *frame_codes, int n_frames) {
@@ -1351,6 +1357,16 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * so a server-reused ctx doesn't inherit the previous request's effective weight. */
     ctx->ml_steer_w_eff = 0.0f;
 
+    /* Leaks-audit #3 MED: the RoPE cos/sin cache holds rope_cache_len (8192) positions.
+     * Prefill applies RoPE at positions [0, prefill_len); a longer prompt would index past
+     * the cache -> heap overread -> garbage rotations/audio. Refuse it rather than corrupt. */
+    if (prefill_len > ctx->rope_cache_len) {
+        fprintf(stderr, "Error: prompt too long (%d tokens > RoPE cache %d); shorten the text.\n",
+                prefill_len, ctx->rope_cache_len);
+        free(input_embeds);
+        return -1;
+    }
+
     double t_prefill = time_ms();
     if (delta_start < prefill_len) {
         if (delta_start > 0) {
@@ -1416,6 +1432,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     /* Autoregressive generation */
     int max_frames = ctx->max_tokens;
+    /* Leaks-audit #3 MED: generation RoPE position = prefill_len + frame; cap frames so the
+     * last position stays within the RoPE cache (prefill_len <= rope_cache_len is guaranteed
+     * by the prefill guard above). Without this, a run to max_tokens past 8192 reads OOB. */
+    if (max_frames > ctx->rope_cache_len - prefill_len)
+        max_frames = ctx->rope_cache_len - prefill_len;
     ctx->codec_codes = (int *)realloc(ctx->codec_codes, (int64_t)max_frames * 16 * sizeof(int));
     ctx->codec_frames = 0;
     ctx->prev_tokens = (int *)realloc(ctx->prev_tokens, max_frames * sizeof(int));

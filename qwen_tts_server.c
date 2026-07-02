@@ -63,11 +63,15 @@ static char *json_extract_string(const char *json, const char *key) {
     p++;
     const char *end = p;
     while (*end && *end != '"') {
-        if (*end == '\\') end++;
+        /* Leaks-audit #4 MED: only skip the escaped char if it isn't the NUL
+         * terminator. A body ending in a trailing backslash (\\\0) used to step
+         * over the NUL and walk out-of-bounds heap -> crash / huge len. */
+        if (*end == '\\' && end[1]) end++;
         end++;
     }
     int len = (int)(end - p);
     char *result = (char *)malloc(len + 1);
+    if (!result) return NULL;
     memcpy(result, p, len);
     result[len] = '\0';
     return result;

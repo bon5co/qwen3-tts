@@ -8,10 +8,19 @@
 #include <string.h>
 #include <math.h>
 
-/* Pre-allocated work buffers (avoids malloc per sample call) */
-static float *g_topk_tmp = NULL;
-static int   *g_topp_idx = NULL;
-static int    g_work_cap = 0;
+/* Pre-allocated work buffers (avoids malloc per sample call).
+ * __thread (per-thread, like g_seed below): concurrent synthesis is a real,
+ * supported config — `--serve --workers N` on macOS/GCD runs qwen_tts_generate
+ * on N persistent worker threads in parallel (g_serialize_synth==0), and the
+ * --batch-size scheduler thread synthesizes concurrently with the single-job
+ * clone worker. Process-global buffers here would (a) data-race the memcpy +
+ * quickselect -> corrupt the top-k threshold -> wrong sampling distribution, and
+ * (b) let ensure_work_buffers() free()/realloc a buffer another thread is mid-use
+ * (UAF/double-free). Per-thread buffers are allocated once per persistent worker
+ * (reachable-at-exit, harmless — same tradeoff as g_seed). Leaks-audit #2 HIGH. */
+static __thread float *g_topk_tmp = NULL;
+static __thread int   *g_topp_idx = NULL;
+static __thread int    g_work_cap = 0;
 
 static void ensure_work_buffers(int n) {
     if (n <= g_work_cap) return;
