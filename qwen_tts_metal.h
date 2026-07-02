@@ -59,6 +59,14 @@ void  qwen_metal_scale(void *ctx, float *out, const float *a, float s, int n);
 void  qwen_metal_rope(void *ctx, float *x, const float *cosv, const float *sinv,
                       int n_heads, int head_dim);
 
+/* FUSED RESIDENT FFN (the heavy block): rms_norm → gate_up matvec → SwiGLU →
+ * down matvec → residual, encoded as ONE command buffer with all intermediates
+ * kept in device buffers (no per-op CPU sync). gate_up [2*inter,H] interleaved,
+ * down [H,inter]; out += x. The resident-decode pattern. */
+void  qwen_metal_ffn_swiglu(void *ctx, float *out, const float *x, const float *norm_w,
+                            const uint16_t *Wgu, const uint16_t *Wd,
+                            int H, int inter, float eps);
+
 /* Amortized matvec cost with K dispatches in ONE command buffer (ms/op) —
  * the fused regime a real decode step runs in (isolates kernel throughput from
  * the per-op CPU<->GPU sync). */
