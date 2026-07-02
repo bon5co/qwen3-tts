@@ -114,6 +114,42 @@ $(TARGET): $(OBJS)
 
 blas: $(TARGET)
 
+# ── Experimental GPU backends (opt-in; `make blas` is NEVER affected) ──────────
+# These add the backend seam (qwen_tts_backend) + one GPU TU and rebuild a fresh
+# qwen_tts with -DQWEN_HAVE_{METAL,CUDA}. Clean rebuild so GPU/CPU .o never mix.
+# See plan_v4 §E4 / docs/gpu-accel-analysis.md. Metal is dev-testable on M1;
+# CUDA is cuBLAS-first (no nvcc for v1) and RTF-measured on the DGX/5090.
+GPU_OBJS = qwen_tts_backend.o qwen_tts_cuda.o
+CUDA_HOME ?= /usr/local/cuda
+
+.PHONY: metal cuda metal_build cuda_build
+
+# Metal (macOS): clang compiles the one ObjC TU; gcc the rest; +Metal/Foundation.
+metal:
+	$(MAKE) clean
+	$(MAKE) metal_build
+metal_build: EXTRA_CFLAGS += -DQWEN_HAVE_METAL
+metal_build: $(OBJS) $(GPU_OBJS) qwen_tts_metal.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_metal.o $(LDLIBS) \
+		-framework Metal -framework Foundation
+	@echo ""
+	@echo "Built ./$(TARGET) with Metal backend. Try: ./$(TARGET) --gpu-selftest --backend metal"
+
+# The ObjC TU is clang-only (gcc can't build ObjC); ARC manages the Metal objects.
+qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h
+	clang -fobjc-arc -O3 -Wall -Wextra -c -o $@ $<
+
+# CUDA (Linux/DGX): cuBLAS-first v1. Needs the CUDA toolkit on the build box.
+cuda:
+	$(MAKE) clean
+	$(MAKE) cuda_build
+cuda_build: EXTRA_CFLAGS += -DQWEN_HAVE_CUDA -I$(CUDA_HOME)/include
+cuda_build: $(OBJS) $(GPU_OBJS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) $(LDLIBS) \
+		-L$(CUDA_HOME)/lib64 -lcublas -lcudart
+	@echo ""
+	@echo "Built ./$(TARGET) with CUDA backend. Try: ./$(TARGET) --gpu-selftest --backend cuda"
+
 # CP micro-benchmark: separate binary instrumented with -DCP_MICROBENCH.
 # Partitions per-frame Code Predictor time among sub-ops (QKV/attn/FFN/norm/lm_head).
 # Clean rebuild into qwen_tts_cpbench so instrumented and normal .o never mix.
@@ -151,10 +187,13 @@ qwen_tts_tokenizer.o: qwen_tts_tokenizer.c qwen_tts_tokenizer.h
 qwen_tts_safetensors.o: qwen_tts_safetensors.c qwen_tts_safetensors.h
 qwen_tts_server.o: qwen_tts_server.c qwen_tts_server.h qwen_tts.h
 qwen_tts_voice_clone.o: qwen_tts_voice_clone.c qwen_tts_voice_clone.h qwen_tts.h qwen_tts_safetensors.h
+qwen_tts_backend.o: qwen_tts_backend.c qwen_tts_backend.h qwen_tts_kernels.h qwen_tts_metal.h qwen_tts_cuda.h
+qwen_tts_cuda.o: qwen_tts_cuda.c qwen_tts_cuda.h
 
-# Clean
+# Clean (also the opt-in GPU objects, which are NOT in $(OBJS) — else a stale
+# stub .o from a `make metal` build would silently be reused by `make cuda`).
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) qwen_tts_backend.o qwen_tts_cuda.o qwen_tts_metal.o
 
 # Debug build
 debug: CFLAGS = $(CFLAGS_BASE) -g -O0 -DDEBUG -fsanitize=address -fsanitize=undefined

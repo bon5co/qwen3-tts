@@ -8,6 +8,9 @@
 #include "qwen_tts_batch.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_server.h"
+#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
+#include "qwen_tts_backend.h"   /* experimental GPU backends (make metal / make cuda) */
+#endif
 
 #include <stdio.h>
 #include <lz4.h>
@@ -1392,6 +1395,8 @@ int main(int argc, char **argv) {
     int show_caps = 0;   /* --caps: print compiled SIMD/threading capabilities and exit */
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
+    int run_gpu_selftest = 0; /* --gpu-selftest: GPU-vs-CPU matvec/matmat correctness + timing, exit (GPU builds) */
+    const char *gpu_backend_str = NULL; /* --backend cpu|metal|cuda (v1: selects the --gpu-selftest target) */
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
     float cp_steer_weight = 1.0f;     /* --steer-weight: injection scale for the control vector */
@@ -1498,6 +1503,8 @@ int main(int argc, char **argv) {
         {"ml-frames",     required_argument, 0, 1048},
         {"self-test",     no_argument,       0, 1027},
         {"matmat-bench",  no_argument,       0, 1038},
+        {"gpu-selftest",  no_argument,       0, 1070},
+        {"backend",       required_argument, 0, 1071},
         {"roughness",     required_argument, 0, 1028},
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
@@ -1571,6 +1578,8 @@ int main(int argc, char **argv) {
             case 1048: ml_frames = atoi(optarg); break;
             case 1027: run_self_test = 1; break;
             case 1038: run_matmat_bench = 1; break;
+            case 1070: run_gpu_selftest = 1; break;
+            case 1071: gpu_backend_str = optarg; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
             case 1029: steer_vector_path = optarg; break;
             case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
@@ -1682,6 +1691,27 @@ int main(int argc, char **argv) {
     if (run_matmat_bench) {
         qwen_init_threads();
         return qwen_matmat_bench(stdout);
+    }
+
+    /* --gpu-selftest: compare the experimental GPU backend's matvec/matmat against
+     * the CPU reference (correctness + rough timing). GPU builds only. */
+    if (run_gpu_selftest) {
+#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
+        qwen_init_threads();
+        const char *want = gpu_backend_str;
+        if (!want) {
+#if defined(QWEN_HAVE_METAL)
+            want = "metal";
+#else
+            want = "cuda";
+#endif
+        }
+        return qwen_gpu_selftest(qwen_backend_kind_from_str(want), stdout);
+#else
+        (void)gpu_backend_str;
+        fprintf(stderr, "--gpu-selftest requires a GPU build: `make metal` or `make cuda`\n");
+        return 1;
+#endif
     }
 
     /* Voice library management (no model loading needed) */
