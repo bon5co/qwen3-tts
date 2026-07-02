@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 
 /* aligned_malloc/aligned_calloc now in qwen_tts_kernels.h */
 
@@ -904,12 +905,16 @@ static void batch_scatter(float *dst, const float *Yt, int B, int rows) {
  * falls back to B per-column matvecs — bit-matches single-stream; a diagnostic to isolate
  * the matmat from the wiring. Xt/Yt are caller-provided scratch ([cols*B] / [rows*B]).
  * Shared by the batched Talker AND Code Predictor (different dims). */
-static int g_batch_nomatmul = -1;
+static atomic_int g_batch_nomatmul = -1;  /* audit #10: race-free one-time env cache */
 void qwen_batch_proj(float *dst, const uint16_t *W, const float *src,
                      int rows, int cols, int srcstride, int B, int force_matvec,
                      float *Xt, float *Yt) {
-    if (g_batch_nomatmul < 0) g_batch_nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
-    if (g_batch_nomatmul || force_matvec) {
+    int nomatmul = atomic_load_explicit(&g_batch_nomatmul, memory_order_relaxed);
+    if (nomatmul < 0) {
+        nomatmul = getenv("QWEN_BATCH_NOMATMUL") ? 1 : 0;
+        atomic_store_explicit(&g_batch_nomatmul, nomatmul, memory_order_relaxed);
+    }
+    if (nomatmul || force_matvec) {
         for (int b = 0; b < B; b++)
             qwen_matvec_bf16(dst + (size_t)b * rows, W, src + (size_t)b * srcstride, rows, cols);
     } else {

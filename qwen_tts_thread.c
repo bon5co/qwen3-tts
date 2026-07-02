@@ -119,9 +119,15 @@ void qwen_threadpool_start(int n_threads) {
     qwen_threadpool_stop();
     if (want == 0) return;
     P.threads = (HANDLE *)malloc(sizeof(HANDLE) * (size_t)want);
-    P.nworkers = want;
-    for (int i = 0; i < want; i++)
+    if (!P.threads) { P.nworkers = 0; return; }  /* audit #9: fall back to serial */
+    int created = 0;
+    for (int i = 0; i < want; i++) {
         P.threads[i] = CreateThread(NULL, 0, worker_main, NULL, 0, NULL);
+        if (!P.threads[i]) break;
+        created++;
+    }
+    P.nworkers = created;
+    if (created == 0) { free(P.threads); P.threads = NULL; }
 }
 
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
@@ -234,9 +240,16 @@ void qwen_threadpool_start(int n_threads) {
     qwen_threadpool_stop();
     if (want == 0) return;
     P.threads = (pthread_t *)malloc(sizeof(pthread_t) * (size_t)want);
-    P.nworkers = want;
-    for (int i = 0; i < want; i++)
-        pthread_create(&P.threads[i], NULL, worker_main, NULL);
+    if (!P.threads) { P.nworkers = 0; return; }  /* audit #9: fall back to serial */
+    /* audit #9: cap nworkers to threads actually created; qwen_parallel runs
+     * serially when nworkers==0 and correctly with a partial pool otherwise. */
+    int created = 0;
+    for (int i = 0; i < want; i++) {
+        if (pthread_create(&P.threads[i], NULL, worker_main, NULL) != 0) break;
+        created++;
+    }
+    P.nworkers = created;
+    if (created == 0) { free(P.threads); P.threads = NULL; }
 }
 
 void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {

@@ -114,25 +114,27 @@ static int topk_filter(float *logits, int n, int k) {
 static int topp_filter(float *logits, int n, float p) {
     if (p >= 1.0f) return n;
     
-    /* Sort indices by probability */
     int *idx = g_topp_idx;
     for (int i = 0; i < n; i++) idx[i] = i;
 
-    for (int i = 0; i < n - 1; i++) {
+    /* Partial selection sort (audit perf fix): the old loop fully sorted all n logits
+     * — O(n^2), ~9.4M compares/frame at n=3072 — even though the nucleus is tiny. Extract
+     * the sorted prefix only until the cumulative probability exceeds p, then stop. This is
+     * PROVABLY EQUIVALENT to the old full-sort: selection sort produces the same prefix
+     * idx[0..cutoff-1] whether or not it continues, the cumsum sequence and cutoff are
+     * identical, and idx[cutoff..n-1] remains exactly the (unsorted) complement set — order
+     * is irrelevant when we only zero it below. Same sample, ~cutoff/n of the work. */
+    float cumsum = 0;
+    int cutoff = n;
+    for (int i = 0; i < n; i++) {
         int max_idx = i;
         for (int j = i + 1; j < n; j++)
             if (logits[idx[j]] > logits[idx[max_idx]]) max_idx = j;
         int t = idx[i]; idx[i] = idx[max_idx]; idx[max_idx] = t;
-    }
-
-    /* Find cutoff */
-    float cumsum = 0;
-    int cutoff = n;
-    for (int i = 0; i < n; i++) {
         cumsum += logits[idx[i]];
         if (cumsum > p) { cutoff = i + 1; break; }
     }
-    
+
     /* Zero out tokens outside the nucleus — in SORTED (probability) order via idx[].
      * BUG FIX (2026-06-10): the old loop zeroed logits[i] by RAW token index >= cutoff,
      * which kept low-probability low-id tokens and zeroed high-probability high-id ones —

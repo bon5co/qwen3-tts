@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -1722,9 +1723,10 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
     /* x86 native int8 dot (VNNI). Same shape as the ARM SDOT path: quantize the
      * shared activation once, then int8×int8 via dpbusd. QWEN_NO_VNNI=1 opts out. */
     enum { QXV_MAX = 8192 };
-    static int vnni_off = -1;
-    if (vnni_off < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_off = (e && e[0] == '1'); }
-    if (!vnni_off && cols <= QXV_MAX) {
+    static atomic_int vnni_off = -1;  /* audit #10: race-free one-time env cache (relaxed = plain load) */
+    int vnni_o = atomic_load_explicit(&vnni_off, memory_order_relaxed);
+    if (vnni_o < 0) { const char *e = getenv("QWEN_NO_VNNI"); vnni_o = (e && e[0] == '1'); atomic_store_explicit(&vnni_off, vnni_o, memory_order_relaxed); }
+    if (!vnni_o && cols <= QXV_MAX) {
         int8_t qx_buf[QXV_MAX];
         float sx = quantize_act_int8_x86(qx_buf, x, cols);
         int nt = g_n_threads;
@@ -1743,9 +1745,10 @@ void qwen_matvec_int8(float *y, const int8_t *W, const float *scale,
      * workers safely read it for the call's duration. cols beyond the cap (rare;
      * only very large matrices) falls through to the f32 path. */
     enum { QX_MAX = 8192 };
-    static int sdot_off = -1;  /* QWEN_NO_SDOT=1 forces the legacy f32 path (A/B bench) */
-    if (sdot_off < 0) { const char *e = getenv("QWEN_NO_SDOT"); sdot_off = (e && e[0] == '1'); }
-    if (!sdot_off && cols <= QX_MAX) {
+    static atomic_int sdot_off = -1;  /* QWEN_NO_SDOT=1 forces the legacy f32 path (A/B bench); audit #10 */
+    int sdot_o = atomic_load_explicit(&sdot_off, memory_order_relaxed);
+    if (sdot_o < 0) { const char *e = getenv("QWEN_NO_SDOT"); sdot_o = (e && e[0] == '1'); atomic_store_explicit(&sdot_off, sdot_o, memory_order_relaxed); }
+    if (!sdot_o && cols <= QX_MAX) {
         int8_t qx_buf[QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
         int nt = g_n_threads;

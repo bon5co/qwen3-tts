@@ -986,6 +986,8 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     if (!text_tokens || text_token_len == 0) {
         fprintf(stderr, "Error: text tokenization failed\n");
         free(text_tokens);
+        free(instruct_tokens);   /* audit #7: were leaked on this error path */
+        free(ref_text_tokens);
         return -1;
     }
 

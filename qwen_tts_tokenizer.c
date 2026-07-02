@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 
 
 /* ---- Hash table (open addressing, linear probing) ---- */
@@ -93,10 +94,13 @@ static bool ht_get(const hash_table_t *ht, const char *key, int key_len, int32_t
  * Remaining bytes (0-32, 127-160, 173) map to U+0100..U+0143. */
 static uint32_t byte_to_unicode[256];
 static uint8_t  unicode_to_byte[512]; /* codepoints up to ~U+0143 */
-static bool     byte_tables_initialized = false;
+/* audit #10: atomic flag with acquire/release so a worker that lazily loads its own
+ * tokenizer concurrently either sees the flag set (with all table writes visible) or
+ * runs the idempotent init itself — no torn read of the byte_to_unicode arrays. */
+static atomic_bool byte_tables_initialized = false;
 
 static void init_byte_tables(void) {
-    if (byte_tables_initialized) return;
+    if (atomic_load_explicit(&byte_tables_initialized, memory_order_acquire)) return;
     memset(unicode_to_byte, 0, sizeof(unicode_to_byte));
 
     /* "Good" bytes that map to themselves */
@@ -128,7 +132,7 @@ static void init_byte_tables(void) {
         if (cp < 512) unicode_to_byte[cp] = (uint8_t)b;
     }
 
-    byte_tables_initialized = true;
+    atomic_store_explicit(&byte_tables_initialized, true, memory_order_release);
 }
 
 /* Encode a single unicode codepoint to UTF-8, return number of bytes written */
