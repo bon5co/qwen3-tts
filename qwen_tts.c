@@ -2186,7 +2186,7 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     int **prev_tok = (int **)malloc((size_t)B * sizeof(int *));
     int **chcodes = (int **)malloc((size_t)B * sizeof(int *));
     float *last_hidden = (float *)calloc((size_t)B * h, sizeof(float));
-    float *logits = (float *)malloc((size_t)vocab * sizeof(float));
+    float *logits = (float *)malloc((size_t)B * vocab * sizeof(float));  /* A2: per-slot [B][vocab] */
     float *step_embed = (float *)malloc((size_t)B * h * sizeof(float));
     int *code0 = (int *)malloc((size_t)B * sizeof(int));
     int *cpcodes = (int *)malloc((size_t)B * 15 * sizeof(int));
@@ -2262,20 +2262,26 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             continue;
         }
 
-        /* ---- one frame: per-slot codec head + sample ---- */
+        /* ---- one frame: batched codec head (A2), then per-slot mask + sample ----
+         * Was B separate matvec_bf16 calls (codec_head re-read B times). qwen_batch_proj
+         * reads the weight ONCE for all B under the matmat path; under force_matvec it is
+         * B matvecs, bit-identical to the old per-slot path (so --batch-test stays exact).
+         * Inactive slots compute a (finite, ignored) head — same as the batched CP/step. */
+        qwen_batch_proj(logits, ctx->codec_head_bf16, last_hidden, vocab, h, h,
+                        B, force_matvec, bb->Xt, bb->Yt);
         for (int b = 0; b < B; b++) {
             if (!active[b]) { code0[b] = 0; continue; }
-            matvec_bf16(logits, ctx->codec_head_bf16, last_hidden + (size_t)b * h, vocab, h);
-            for (int t = 0; t < vocab; t++) { if (logits[t] > 100.0f) logits[t] = 100.0f; if (logits[t] < -100.0f) logits[t] = -100.0f; }
-            for (int t = 2048; t < vocab; t++) if (t != QWEN_TTS_CODEC_EOS) logits[t] = -1e30f;
+            float *lg = logits + (size_t)b * vocab;
+            for (int t = 0; t < vocab; t++) { if (lg[t] > 100.0f) lg[t] = 100.0f; if (lg[t] < -100.0f) lg[t] = -100.0f; }
+            for (int t = 2048; t < vocab; t++) if (t != QWEN_TTS_CODEC_EOS) lg[t] = -1e30f;
             int sf = sframe[b];
-            if (sf < 2) logits[QWEN_TTS_CODEC_EOS] = -1e30f;
+            if (sf < 2) lg[QWEN_TTS_CODEC_EOS] = -1e30f;
             int ef = tcl[b] * 3, bs = ef * 2;
-            if (ef > 0 && sf > bs) { float bo = 0.5f * (sf - bs); if (bo > 10.0f) bo = 10.0f; logits[QWEN_TTS_CODEC_EOS] += bo; }
+            if (ef > 0 && sf > bs) { float bo = 0.5f * (sf - bs); if (bo > 10.0f) bo = 10.0f; lg[QWEN_TTS_CODEC_EOS] += bo; }
             float ft = p_temp[b]; int ftk = p_topk[b];
             if (p_gw[b] > 0 && sf < p_gw[b]) { ft = 0.0f; ftk = 1; }
             qwen_set_seed(rng[b]);
-            int c0 = qwen_tts_sample(logits, vocab, ft, ftk, p_topp[b], p_rep[b], prev_tok[b], nprev[b]);
+            int c0 = qwen_tts_sample(lg, vocab, ft, ftk, p_topp[b], p_rep[b], prev_tok[b], nprev[b]);
             rng[b] = qwen_get_seed();
             if (c0 == QWEN_TTS_CODEC_EOS || chframes[b] >= GEN_CAP || pos[b] >= kv_max - 1) {
                 FINALIZE_SLOT(b); code0[b] = 0; continue;
