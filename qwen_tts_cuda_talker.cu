@@ -101,23 +101,30 @@ __global__ void k_trunc_bf16(float *x, int n) {
     x[i] = __uint_as_float(u & 0xFFFF0000u);
 }
 
-/* causal GQA attention, online softmax (flash-style). Q[1,n_heads,hd], K/V[seq_k,n_kv,hd].
- * One block per (head), threads split head_dim. */
+/* causal GQA attention, online softmax (flash-style, single-pass). Q[1,n_heads,hd],
+ * K/V[seq_k,n_kv,hd]. ONE block per head, blockDim = head_dim: thread t owns output dim t and
+ * accumulates online (no materialized scores). Score per key = block-reduce of q[t]*k[t]. This
+ * uses head_dim×n_heads threads vs the old 16-thread-total version. */
 __global__ void k_attn(const float *Q, const float *K, const float *V, float *O,
                        int seq_k, int n_heads, int n_kv, int hd, float scale, int qpos) {
-    int h = blockIdx.x; if (h>=n_heads) return;
+    int h = blockIdx.x, t = threadIdx.x; if (h>=n_heads || t>=hd) return;
     int kvh = h/(n_heads/n_kv);
     int valid = qpos+1; if (valid>seq_k) valid=seq_k;
-    const float *q = Q + (size_t)h*hd;
-    float *o = O + (size_t)h*hd;
-    float m=-1e30f;
-    for (int j=0;j<valid;++j){ const float *k=K+((size_t)j*n_kv+kvh)*hd; float d=0;
-        for(int t=0;t<hd;++t) d+=q[t]*k[t]; d*=scale; if(d>m)m=d; }
-    for(int t=0;t<hd;++t) o[t]=0; float den=0;
-    for (int j=0;j<valid;++j){ const float *k=K+((size_t)j*n_kv+kvh)*hd; float d=0;
-        for(int t=0;t<hd;++t) d+=q[t]*k[t]; d=expf(d*scale-m); den+=d;
-        const float *v=V+((size_t)j*n_kv+kvh)*hd; for(int t=0;t<hd;++t) o[t]+=d*v[t]; }
-    float inv=1.f/den; for(int t=0;t<hd;++t) o[t]*=inv;
+    float qt = Q[(size_t)h*hd + t];
+    extern __shared__ float sh[];
+    float m=-1e30f, denom=0.f, acc=0.f;
+    for (int j=0;j<valid;++j){
+        const float *k = K + ((size_t)j*n_kv+kvh)*hd;
+        sh[t] = qt * k[t]; __syncthreads();
+        for (int s=hd/2; s>0; s>>=1){ if(t<s) sh[t]+=sh[t+s]; __syncthreads(); }
+        float score = sh[0]*scale; __syncthreads();
+        float m_new = fmaxf(m, score);
+        float corr = expf(m - m_new), p = expf(score - m_new);
+        denom = denom*corr + p;
+        acc = acc*corr + p * V[((size_t)j*n_kv+kvh)*hd + t];
+        m = m_new;
+    }
+    O[(size_t)h*hd + t] = acc/denom;
 }
 
 /* ---- resident state ----------------------------------------------------- */
@@ -208,7 +215,7 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
         CK(cudaMemcpyAsync(kc,s->k,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         CK(cudaMemcpyAsync(vc,s->v,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
-        k_attn<<<nh,1>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
+        k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
         mv(s->wo[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
