@@ -1445,11 +1445,13 @@ int main(int argc, char **argv) {
              * GPU-resident (weights+KV on device, one sync/step) instead of the per-op matvec
              * hook. Decode-only; prefill stays CPU-batched + KV uploaded. Off = per-op path. */
             if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_FUSED_TALKER")) {
-                extern void *g_cuda_talker_state;
+                extern void *g_cuda_talker_state, *g_cuda_cp_state;
                 extern void *qwen_cuda_talker_init(qwen_tts_ctx_t *);
+                extern void *qwen_cuda_cp_init(qwen_tts_ctx_t *);
                 g_cuda_talker_state = qwen_cuda_talker_init(ctx);
-                if (g_cuda_talker_state)
-                    fprintf(stderr, "GPU fused Talker step ENABLED (resident, 1 sync/step)\n");
+                g_cuda_cp_state = qwen_cuda_cp_init(ctx);
+                if (g_cuda_talker_state && g_cuda_cp_state)
+                    fprintf(stderr, "GPU fused Talker+CP steps ENABLED (resident, 1 sync/step each)\n");
             }
 #endif
         }

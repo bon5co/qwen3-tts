@@ -739,9 +739,24 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
     CPB_MARK(CPB_RESNORM);
 }
 
+/* GPU-resident fused CP step (qwen_tts_cuda_talker.cu). Set alongside the fused Talker.
+ * Emotion steer is a pre-step input add (done in qwen_cp_predict), so the fused step is emo-safe;
+ * only cp_roughness (the q2-down blend) forces the CPU path. */
+void *g_cuda_cp_state = NULL;
+#ifdef QWEN_HAVE_CUDA
+extern void qwen_cuda_cp_step(void *state, float *x, int pos);
+#endif
+
 static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
+
+#ifdef QWEN_HAVE_CUDA
+    if (g_cuda_cp_state && ctx->cp_roughness <= 0.0f) {
+        qwen_cuda_cp_step(g_cuda_cp_state, x, pos);   /* x updated in place (residual stream) */
+        return;
+    }
+#endif
 
     /* First layer: standard input RMSNorm, then body produces fused norm for next */
     qwen_rms_norm(x_norm, x, ctx->cp_layers[0].input_norm, 1, cp_h, c->rms_norm_eps);
