@@ -259,7 +259,7 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
     k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->tnorm,s->xn,H,s->eps);
-    CK(cudaDeviceSynchronize());
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(hidden_out,s->xn,H*sizeof(float),cudaMemcpyDeviceToHost));
 }
 
@@ -373,7 +373,7 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
         mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
-    CK(cudaDeviceSynchronize());
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,H*sizeof(float),cudaMemcpyDeviceToHost));   /* residual, NOT normed */
 }
 

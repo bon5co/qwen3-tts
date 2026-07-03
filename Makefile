@@ -170,13 +170,15 @@ cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o q
 qwen_tts_cuda_kernels.o: qwen_tts_cuda_kernels.cu
 	$(NVCC) $(NVCC_ARCH) -O3 -c -o $@ $<
 
-# GPU-resident fused Talker step (needs cuBLAS + the C headers). -I. for qwen_tts.h.
+# GPU-resident fused Talker step + resident decoder. --default-stream per-thread so the
+# main-thread (Talker/CP) and the background decoder thread use INDEPENDENT default streams
+# → the GPU overlaps generation and decode instead of serializing them (RTF win).
 qwen_tts_cuda_talker.o: qwen_tts_cuda_talker.cu
-	$(NVCC) $(NVCC_ARCH) -O3 -I. -I$(CUDA_HOME)/include -c -o $@ $<
+	$(NVCC) $(NVCC_ARCH) -O3 --default-stream per-thread -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 # GPU-resident ConvNet speech decoder (M3).
 qwen_tts_cuda_decoder.o: qwen_tts_cuda_decoder.cu
-	$(NVCC) $(NVCC_ARCH) -O3 -I. -I$(CUDA_HOME)/include -c -o $@ $<
+	$(NVCC) $(NVCC_ARCH) -O3 --default-stream per-thread -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 # CP micro-benchmark: separate binary instrumented with -DCP_MICROBENCH.
 # Partitions per-frame Code Predictor time among sub-ops (QKV/attn/FFN/norm/lm_head).

@@ -1523,9 +1523,11 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
      * decoder_thread_fn() call at the end (done=1 → it processes all and returns). */
     int dt_no_overlap = (getenv("QWEN_NO_OVERLAP") != NULL);
 #ifdef QWEN_HAVE_CUDA
-    /* The GPU-resident decoder shares the one GPU with the fused Talker+CP; a background
-     * decoder thread would CONTEND with generation and slow it. Force synchronous decode so
-     * the two run sequentially on the device (gen then decoder) — no contention. */
+    /* M3 scheduling — MEASURED on GB10: on ONE GPU, overlapping generation (fused Talker/CP) with
+     * the resident decoder makes it WORSE (RTF 0.78 vs 0.62) — they contend for the same SMs, so
+     * generation slows (14→20 ms/f) while the decoder overlaps. Sequential wins. So force
+     * synchronous decode when the resident decoder is on and NOT streaming (full-file: RTF matters).
+     * Streaming keeps overlap (TTFA matters — sync would push first audio to the very end). */
     { extern int g_cuda_decoder_conv_on; if (g_cuda_decoder_conv_on && !ctx->stream) dt_no_overlap = 1; }
 #endif
     qwen_sd_stream_init(&ctx->sd_stream);

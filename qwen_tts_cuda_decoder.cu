@@ -186,7 +186,7 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
     kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(sd->final_snake.alpha,cur_ch),dev_w(sd->final_snake.beta,cur_ch),cur_ch,cur_len);
     int audio_len=cur_len; float *daudio=dbg(&O,(size_t)audio_len);
     kd_conv1d<<<GRID2(audio_len,1),TPB>>>(cur,dev_w(sd->final_conv_weight,(size_t)cur_ch*7),dev_w(sd->final_conv_bias,1),daudio,cur_ch,1,cur_len,7,1);
-    CK(cudaDeviceSynchronize());
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
     float *audio=(float*)malloc((size_t)audio_len*sizeof(float)); if(!audio) return -1;
     cudaMemcpy(audio,daudio,(size_t)audio_len*sizeof(float),cudaMemcpyDeviceToHost);
     for(int i=0;i<audio_len;++i){ if(audio[i]<-1.f)audio[i]=-1.f; if(audio[i]>1.f)audio[i]=1.f; }
