@@ -150,19 +150,22 @@ void qwen_cuda_matvec_bf16(void *ctx, float *y, const uint16_t *W,
 int g_cuda_decoder_on = 0;
 
 static cublasHandle_t g_sd_handle = NULL;
-static float *g_sdA=NULL,*g_sdB=NULL,*g_sdC=NULL,*g_sdCT=NULL;
-static size_t g_sdA_cap=0,g_sdB_cap=0,g_sdC_cap=0,g_sdCT_cap=0;
+static float *g_sdA=NULL,*g_sdB=NULL,*g_sdC=NULL;   /* DEVICE buffers */
+static size_t g_sdA_cap=0,g_sdB_cap=0,g_sdC_cap=0;
+static float *g_sdCT_host=NULL; static size_t g_sdCT_host_cap=0;   /* HOST temp for strided-C scatter */
 static float *sd_grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)cudaFree(*buf); if(cudaMalloc((void**)buf,need*sizeof(float))!=cudaSuccess){*buf=NULL;*cap=0;return NULL;} *cap=need; } return *buf; }
+static float *sd_grow_host(float **buf,size_t *cap,size_t need){ if(*cap<need){ float *nb=(float*)realloc(*buf,need*sizeof(float)); if(!nb) return NULL; *buf=nb; *cap=need; } return *buf; }
 
 /* Returns 0 if computed on the GPU, -1 to tell the caller to fall back to CPU cblas.
  * The huge convs on the final upsampled sequence hang/oversubscribe on GB10 unified memory;
  * cap the work and fall back for those (still offloads the bulk of medium convs). */
-#define SD_SGEMM_MAX_ELEMS (32u*1024u*1024u)   /* 32M floats = 128 MB per buffer */
+#define SD_SGEMM_MAX_ELEMS (256u*1024u*1024u)  /* 256M floats = 1 GB per buffer (GB10 has plenty) */
 int qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,
                        float alpha,const float *A,int lda,const float *B,int ldb,
                        float beta,float *C,int ldc) {
     if (beta != 0.0f) return -1;   /* accumulate not supported (decoder uses beta=0) */
     size_t Asz=(size_t)(transA?K:M)*lda, Bsz=(size_t)(transB?N:K)*ldb, Csz=(size_t)M*N;
+    if (getenv("QWEN_SD_DEBUG")) { fprintf(stderr,"sd_sgemm M=%d N=%d K=%d ta=%d tb=%d lda=%d ldb=%d ldc=%d\n",M,N,K,transA,transB,lda,ldb,ldc); fflush(stderr); }
     if (Asz>SD_SGEMM_MAX_ELEMS || Bsz>SD_SGEMM_MAX_ELEMS || Csz>SD_SGEMM_MAX_ELEMS) return -1;  /* too big → CPU */
     if (!g_sd_handle) { if (cublasCreate(&g_sd_handle)!=CUBLAS_STATUS_SUCCESS){ g_cuda_decoder_on=0; return -1; } }
     float *dA=sd_grow(&g_sdA,&g_sdA_cap,Asz), *dB=sd_grow(&g_sdB,&g_sdB_cap,Bsz), *dC=sd_grow(&g_sdC,&g_sdC_cap,Csz);
@@ -176,7 +179,7 @@ int qwen_cuda_sd_sgemm(int transA,int transB,int M,int N,int K,
     if (ldc==N) {
         cudaMemcpy(C,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
     } else {
-        float *t=sd_grow(&g_sdCT,&g_sdCT_cap,Csz); if(!t) return -1;
+        float *t=sd_grow_host(&g_sdCT_host,&g_sdCT_host_cap,Csz); if(!t) return -1;  /* HOST temp (bug was device) */
         cudaMemcpy(t,dC,Csz*sizeof(float),cudaMemcpyDeviceToHost);
         for(int m=0;m<M;m++) memcpy(C+(size_t)m*ldc, t+(size_t)m*N, (size_t)N*sizeof(float));  /* scatter to strided C */
     }
