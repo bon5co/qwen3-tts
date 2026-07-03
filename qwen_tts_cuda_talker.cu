@@ -88,16 +88,26 @@ __global__ void k_rmsnorm_ph(float *x, const float *w, int head_dim, float eps) 
     for (int i=tid;i<head_dim;i+=tc) xh[i] = xh[i]*inv*w[i];
 }
 
-/* NeoX split-half RoPE, cos/sin at position pos (half = head_dim/2). */
-__global__ void k_rope_neox(float *x, const float *cosp, const float *sinp, int n_heads, int head_dim) {
+/* NeoX split-half RoPE. cos/sin BASE + device pos (so the launch is CUDA-graph-invariant). */
+__global__ void k_rope_neox(float *x, const float *cos_base, const float *sin_base,
+                            int n_heads, int head_dim, const int *d_pos) {
     int half = head_dim/2;
     int gid = blockIdx.x*blockDim.x + threadIdx.x;
     if (gid >= n_heads*half) return;
+    const float *cosp = cos_base + (size_t)(*d_pos)*half, *sinp = sin_base + (size_t)(*d_pos)*half;
     int h = gid/half, i = gid%half;
     float *xh = x + (size_t)h*head_dim;
     float c = cosp[i], sn = sinp[i];
     float x1 = xh[i], x2 = xh[i+half];
     xh[i] = x1*c - x2*sn; xh[i+half] = x2*c + x1*sn;
+}
+
+/* store k,v (already bf16-truncated) into the layer's KV cache at device pos (graph-invariant). */
+__global__ void k_kv_store(float *kc_layer, float *vc_layer, const float *k, const float *v,
+                           int kvd, const int *d_pos) {
+    int i = blockIdx.x*blockDim.x + threadIdx.x; if (i>=kvd) return;
+    size_t off = (size_t)(*d_pos)*kvd + i;
+    kc_layer[off] = k[i]; vc_layer[off] = v[i];
 }
 
 __global__ void k_swiglu_il(const float *in, float *out, int n) {
@@ -122,10 +132,10 @@ __global__ void k_trunc_bf16(float *x, int n) {
  * accumulates online (no materialized scores). Score per key = block-reduce of q[t]*k[t]. This
  * uses head_dim×n_heads threads vs the old 16-thread-total version. */
 __global__ void k_attn(const float *Q, const float *K, const float *V, float *O,
-                       int seq_k, int n_heads, int n_kv, int hd, float scale, int qpos) {
+                       int n_heads, int n_kv, int hd, float scale, const int *d_pos) {
     int h = blockIdx.x, t = threadIdx.x; if (h>=n_heads || t>=hd) return;
     int kvh = h/(n_heads/n_kv);
-    int valid = qpos+1; if (valid>seq_k) valid=seq_k;
+    int valid = (*d_pos)+1;
     float qt = Q[(size_t)h*hd + t];
     extern __shared__ float sh[];
     float m=-1e30f, denom=0.f, acc=0.f;
@@ -154,6 +164,8 @@ typedef struct {
     float *tnorm, *rope_cos, *rope_sin;
     float *kcache,*vcache;                           /* [n_layers*kv_max*kv_dim] f32 */
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;     /* work buffers */
+    int *d_pos;                                      /* device position (graph-invariant) */
+    cudaGraphExec_t exec; int cap_ready;             /* CUDA graph of the 28-layer step */
 } cuda_talker_t;
 
 static __nv_bfloat16 *up_bf16(const uint16_t *w, size_t n) {
@@ -221,17 +233,19 @@ extern "C" void *qwen_cuda_talker_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->v,s->kv_dim*sizeof(float))); CK(cudaMalloc(&s->attn,s->q_dim*sizeof(float)));
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
-    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, %s weights)\n",L,H,used_int8?"int8":"bf16");
+    CK(cudaMalloc(&s->d_pos,sizeof(int)));
+    fprintf(stderr,"CUDA talker: resident fused step ready (%d layers, hidden=%d, %s weights, CUDA graph)\n",L,H,used_int8?"int8":"bf16");
     return s;
 }
 
 
-extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidden_out, int pos) {
-    cuda_talker_t *s=(cuda_talker_t*)st;
+/* The 28-layer step body — pure kernel launches (read d_x/d_pos, write d_xn). Captured ONCE
+ * into a CUDA graph; every op is pos-independent (rope/kv_store/attn read *d_pos device-side),
+ * so the same graph replays for any position → ~420 launches/frame become one graph launch. */
+static void talker_body(cuda_talker_t *s) {
     int H=s->hidden, qd=s->q_dim, kvd=s->kv_dim, hd=s->head_dim, half=hd/2;
     int nh=s->n_heads, nkv=s->n_kv, inter=s->inter;
     float scale=1.f/sqrtf((float)hd);
-    CK(cudaMemcpy(s->x,embed,H*sizeof(float),cudaMemcpyHostToDevice));
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
         mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
@@ -239,17 +253,13 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
         mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
-        const float *cosp=s->rope_cos+(size_t)pos*half, *sinp=s->rope_sin+(size_t)pos*half;
-        k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,cosp,sinp,nh,hd);
-        k_rope_neox<<<CEIL(nkv*half,TPB),TPB>>>(s->k,cosp,sinp,nkv,hd);
+        k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos);
+        k_rope_neox<<<CEIL(nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos);
         k_trunc_bf16<<<CEIL(kvd,TPB),TPB>>>(s->k,kvd);
         k_trunc_bf16<<<CEIL(kvd,TPB),TPB>>>(s->v,kvd);
-        float *kc=s->kcache+((size_t)l*s->kv_max+pos)*kvd;
-        float *vc=s->vcache+((size_t)l*s->kv_max+pos)*kvd;
-        CK(cudaMemcpyAsync(kc,s->k,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpyAsync(vc,s->v,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
-        k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
+        k_kv_store<<<CEIL(kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos);
+        k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos);
         mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -259,6 +269,23 @@ extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidde
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
     k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->tnorm,s->xn,H,s->eps);
+}
+
+extern "C" void qwen_cuda_talker_step(void *st, const float *embed, float *hidden_out, int pos) {
+    cuda_talker_t *s=(cuda_talker_t*)st;
+    int H=s->hidden;
+    CK(cudaMemcpy(s->x,embed,H*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(s->d_pos,&pos,sizeof(int),cudaMemcpyHostToDevice));
+    if (!s->cap_ready) {
+        cudaGraph_t g;
+        cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        talker_body(s);
+        cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (cudaGraphInstantiate(&s->exec, g, 0) != cudaSuccess) { fprintf(stderr,"talker graph instantiate failed\n"); }
+        cudaGraphDestroy(g);
+        s->cap_ready=1;
+    }
+    CK(cudaGraphLaunch(s->exec, cudaStreamPerThread));
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(hidden_out,s->xn,H*sizeof(float),cudaMemcpyDeviceToHost));
 }
@@ -295,6 +322,7 @@ typedef struct {
     float *rope_cos,*rope_sin;
     float *kcache,*vcache;
     float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
+    int *d_pos; cudaGraphExec_t exec; int cap_ready;   /* CUDA graph of the 5-layer CP step */
 } cuda_cp_t;
 
 extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
@@ -336,17 +364,16 @@ extern "C" void *qwen_cuda_cp_init(qwen_tts_ctx_t *ctx) {
     CK(cudaMalloc(&s->v,s->kv_dim*sizeof(float))); CK(cudaMalloc(&s->attn,s->q_dim*sizeof(float)));
     CK(cudaMalloc(&s->proj,H*sizeof(float))); CK(cudaMalloc(&s->gate,s->inter*sizeof(float)));
     CK(cudaMalloc(&s->gu,(size_t)2*s->inter*sizeof(float)));
-    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, %s)\n",L,H,used_int8?"int8":"bf16");
+    CK(cudaMalloc(&s->d_pos,sizeof(int)));
+    fprintf(stderr,"CUDA CP: resident fused step ready (%d layers, hidden=%d, %s, CUDA graph)\n",L,H,used_int8?"int8":"bf16");
     return s;
 }
 
 /* One resident CP transformer step. x[cp_h] in/out (residual stream; caller norms). */
-extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
-    cuda_cp_t *s=(cuda_cp_t*)st;
+static void cp_body(cuda_cp_t *s) {
     int H=s->hidden, qd=s->q_dim, kvd=s->kv_dim, hd=s->head_dim, half=hd/2;
     int nh=s->n_heads, nkv=s->n_kv, inter=s->inter;
     float scale=1.f/sqrtf((float)hd);
-    CK(cudaMemcpy(s->x,x,H*sizeof(float),cudaMemcpyHostToDevice));
     for (int l=0;l<s->n_layers;++l){
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
         mv(s->wq[l],s->wqs[l],s->xn,s->q,qd,H);
@@ -354,17 +381,13 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
         mv(s->wv[l],s->wvs[l],s->xn,s->v,kvd,H);
         k_rmsnorm_ph<<<nh, TPB, TPB*sizeof(float)>>>(s->q,s->qn[l],hd,s->eps);
         k_rmsnorm_ph<<<nkv,TPB, TPB*sizeof(float)>>>(s->k,s->kn[l],hd,s->eps);
-        const float *cosp=s->rope_cos+(size_t)pos*half, *sinp=s->rope_sin+(size_t)pos*half;
-        k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,cosp,sinp,nh,hd);
-        k_rope_neox<<<CEIL(nkv*half,TPB),TPB>>>(s->k,cosp,sinp,nkv,hd);
+        k_rope_neox<<<CEIL(nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos);
+        k_rope_neox<<<CEIL(nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos);
         k_trunc_bf16<<<CEIL(kvd,TPB),TPB>>>(s->k,kvd);
         k_trunc_bf16<<<CEIL(kvd,TPB),TPB>>>(s->v,kvd);
-        float *kc=s->kcache+((size_t)l*s->kv_max+pos)*kvd;
-        float *vc=s->vcache+((size_t)l*s->kv_max+pos)*kvd;
-        CK(cudaMemcpyAsync(kc,s->k,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
-        CK(cudaMemcpyAsync(vc,s->v,kvd*sizeof(float),cudaMemcpyDeviceToDevice));
         float *Kl=s->kcache+(size_t)l*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*s->kv_max*kvd;
-        k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,pos+1,nh,nkv,hd,scale,pos);
+        k_kv_store<<<CEIL(kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos);
+        k_attn<<<nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos);
         mv(s->wo[l],s->wos[l],s->attn,s->proj,H,qd);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
         k_rmsnorm_full<<<1,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
@@ -373,6 +396,23 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
         mv(s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter);
         k_add_ip<<<CEIL(H,TPB),TPB>>>(s->x,s->proj,H);
     }
+}
+
+extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
+    cuda_cp_t *s=(cuda_cp_t*)st;
+    int H=s->hidden;
+    CK(cudaMemcpy(s->x,x,H*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(s->d_pos,&pos,sizeof(int),cudaMemcpyHostToDevice));
+    if (!s->cap_ready) {
+        cudaGraph_t g;
+        cudaStreamBeginCapture(cudaStreamPerThread, cudaStreamCaptureModeThreadLocal);
+        cp_body(s);
+        cudaStreamEndCapture(cudaStreamPerThread, &g);
+        if (cudaGraphInstantiate(&s->exec, g, 0) != cudaSuccess) fprintf(stderr,"CP graph instantiate failed\n");
+        cudaGraphDestroy(g);
+        s->cap_ready=1;
+    }
+    CK(cudaGraphLaunch(s->exec, cudaStreamPerThread));
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,H*sizeof(float),cudaMemcpyDeviceToHost));   /* residual, NOT normed */
 }
@@ -388,7 +428,8 @@ extern "C" void qwen_cuda_cp_free(void *st) {
     free(s->inorm);free(s->pnorm);free(s->qn);free(s->kn);
     cudaFree(s->rope_cos);cudaFree(s->rope_sin);cudaFree(s->kcache);cudaFree(s->vcache);
     cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);cudaFree(s->k);cudaFree(s->v);
-    cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);cudaFree(s->gu);
+    cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);cudaFree(s->gu);cudaFree(s->d_pos);
+    if(s->cap_ready) cudaGraphExecDestroy(s->exec);
     free(s);
 }
 
@@ -403,6 +444,7 @@ extern "C" void qwen_cuda_talker_free(void *st) {
     free(s->inorm);free(s->pnorm);free(s->qn);free(s->kn);
     cudaFree(s->tnorm);cudaFree(s->rope_cos);cudaFree(s->rope_sin);cudaFree(s->kcache);cudaFree(s->vcache);
     cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);cudaFree(s->k);cudaFree(s->v);
-    cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);cudaFree(s->gu);
+    cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);cudaFree(s->gu);cudaFree(s->d_pos);
+    if(s->cap_ready) cudaGraphExecDestroy(s->exec);
     free(s);
 }
