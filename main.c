@@ -1440,6 +1440,18 @@ int main(int argc, char **argv) {
             qwen_backend_install_global(gpu_backend);
             fprintf(stderr, "GPU offload: bf16 matvec via '%s' backend "
                             "(EXPERIMENTAL; CPU stays default elsewhere)\n", gpu_backend->name);
+#if defined(QWEN_HAVE_CUDA)
+            /* Fused-forward epic (M1b): QWEN_CUDA_FUSED_TALKER=1 → run the WHOLE Talker step
+             * GPU-resident (weights+KV on device, one sync/step) instead of the per-op matvec
+             * hook. Decode-only; prefill stays CPU-batched + KV uploaded. Off = per-op path. */
+            if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_FUSED_TALKER")) {
+                extern void *g_cuda_talker_state;
+                extern void *qwen_cuda_talker_init(qwen_tts_ctx_t *);
+                g_cuda_talker_state = qwen_cuda_talker_init(ctx);
+                if (g_cuda_talker_state)
+                    fprintf(stderr, "GPU fused Talker step ENABLED (resident, 1 sync/step)\n");
+            }
+#endif
         }
     }
 #endif

@@ -1395,6 +1395,16 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
             }
         }
     }
+#ifdef QWEN_HAVE_CUDA
+    /* Fused GPU Talker: the CPU batched prefill populated the host bf16 KV; upload it to the
+     * device cache once so the fused decode steps (which read the device KV) see the prompt. */
+    {
+        extern void *g_cuda_talker_state;
+        extern void qwen_cuda_talker_upload_kv(void *, qwen_tts_ctx_t *, int);
+        if (g_cuda_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f))
+            qwen_cuda_talker_upload_kv(g_cuda_talker_state, ctx, ctx->kv_len);
+    }
+#endif
     double prefill_ms = time_ms() - t_prefill;
     if (!ctx->silent) {
         if (delta_start > 0)

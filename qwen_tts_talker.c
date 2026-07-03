@@ -485,6 +485,14 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
  * Single-token Talker Step
  * ======================================================================== */
 
+/* GPU-resident fused Talker step (qwen_tts_cuda_talker.cu). When set, both the decode step
+ * and the sequential prefill delegate to it (it builds its OWN device KV from pos 0). Disabled
+ * automatically when emotion steering is active (the fused step doesn't apply ml_steer yet). */
+void *g_cuda_talker_state = NULL;
+#ifdef QWEN_HAVE_CUDA
+extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+#endif
+
 int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     qwen_tts_config_t *c = &ctx->config;
     int h = c->hidden_size;
@@ -493,6 +501,14 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
     int inter = c->intermediate_size;
     int pos = ctx->kv_len;
     float eps = c->rms_norm_eps;
+
+#ifdef QWEN_HAVE_CUDA
+    if (g_cuda_talker_state && !(ctx->ml_steer && ctx->ml_steer_w_eff != 0.0f)) {
+        qwen_cuda_talker_step(g_cuda_talker_state, embed, hidden_out, pos);
+        ctx->kv_len = pos + 1;
+        return 0;
+    }
+#endif
 
     if (kv_cache_grow(ctx, pos + 1) != 0) return -1;
 

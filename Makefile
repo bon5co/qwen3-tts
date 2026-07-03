@@ -144,7 +144,16 @@ qwen_tts_metal.o: qwen_tts_metal.m qwen_tts_metal.h qwen_tts_kernels.h
 # toolkit on the build box. NVCC_ARCH overrides the gencode (default sm_80 = Ampere+,
 # bf16 tensor cores). qwen_tts_cuda_kernels.cu is compiled by nvcc, the rest by gcc.
 NVCC ?= $(CUDA_HOME)/bin/nvcc
-NVCC_ARCH ?= -arch=sm_80
+# PORTABLE multi-arch default: native cubins for the common CUDA GPUs + a PTX
+# fallback so it also runs (via JIT) on archs not listed — old AND new cards, not
+# just the DGX. Ampere sm_80/86 (A100/3090/3060), Ada sm_89 (40xx), Blackwell
+# sm_120 (5090/5070) + compute_120 PTX (JITs onto sm_121 GB10 and future archs).
+# Override for a single-arch fast build, e.g. `make cuda NVCC_ARCH="-arch=sm_121"`.
+NVCC_ARCH ?= -gencode arch=compute_80,code=sm_80 \
+             -gencode arch=compute_86,code=sm_86 \
+             -gencode arch=compute_89,code=sm_89 \
+             -gencode arch=compute_120,code=sm_120 \
+             -gencode arch=compute_120,code=compute_120
 cuda:
 	$(MAKE) clean
 	$(MAKE) cuda_build
