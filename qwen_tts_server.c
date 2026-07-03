@@ -14,6 +14,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_thread.h"   /* qwen_parallel_is_reentrant() */
 #include "qwen_tts_emotion.h"  /* qwen_tts_apply_emotion() — server --emotion support */
+#include "qwen_tts_compose.h"  /* inline per-sentence emotion markup ([joy]…[sad]…) */
 #include "qwen_tts_audio.h"    /* qwen_audio_apply_gain / qwen_audio_time_stretch */
 
 #include <stdio.h>
@@ -212,6 +213,11 @@ static void send_chunked_end(int fd) {
     write(fd, "0\r\n\r\n", 5);
 }
 
+/* Adapter: feed a composer span's PCM through the HTTP chunk encoder (applies per-chunk gain). */
+static void compose_stream_emit(const float *pcm, int n, void *user) {
+    stream_http_callback(pcm, n, user);
+}
+
 /* ── WAV in-memory builder ───────────────────────────────────────────── */
 
 static void *build_wav(const float *samples, int n_samples, int *out_size) {
@@ -371,6 +377,24 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     int seed = (int)json_extract_number(body, "seed", -1);
     if (seed >= 0) ctx->seed = (uint32_t)seed;
 
+    /* Inline paralinguistics ([laugh]/[sigh] -> validated onomatopoeia in the active voice,
+     * one generation), mirroring the CLI. Runs on ALL requests so the substituted text flows
+     * into either the plain or the per-sentence-compose path. Pin the validated seed + bump
+     * temperature only when the client didn't set them. */
+    {
+        int vivian_id = qwen_tts_speaker_id("vivian");
+        int para_voice = (vivian_id >= 0 && ctx->speaker_id == vivian_id) ? 1 : 0;
+        int did = 0, para_seed = 7;
+        char *sub = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
+        if (sub && did) {
+            free(text); text = sub;
+            if (seed < 0) ctx->seed = (uint32_t)para_seed;
+            if (strstr(body, "\"temperature\"") == NULL) ctx->temperature = 1.1f;
+        } else {
+            free(sub);
+        }
+    }
+
     /* Emotion (CLI --emotion parity): sets the CP steering vector for
      * (emotion, language) on ctx (applied during generation for BOTH the full
      * and streaming paths) + returns the effective volume/rate DSP. Explicit
@@ -427,7 +451,26 @@ static void handle_tts(qwen_tts_ctx_t *ctx, int fd, const char *body) {
 
     float *audio = NULL;
     int n_samples = 0;
-    if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0 || !audio || n_samples == 0) {
+
+    /* Per-sentence dynamic emotion: if the text carries inline markup ([joy]…[sad]…, [pause],
+     * fillers), synthesize span-by-span with each span's own emotion and concatenate — same
+     * mechanism as the CLI --compose / auto-detected --text. Plain text takes the fast path. */
+    if (qwen_compose_has_markup(text)) {
+        char *language = json_extract_string(body, "language");
+        qwen_cspan_t *spans = NULL; int nspans = 0;
+        if (qwen_compose_parse(text, &spans, &nspans) != 0 || nspans == 0) {
+            send_error(fd, 500, "markup parse failed");
+            free(language); free(text); return;
+        }
+        fprintf(stderr, "[HTTP] inline markup -> per-sentence compose (%d spans)\n", nspans);
+        int rc = qwen_compose_render_buffer(ctx, spans, nspans, language, 0.12f, &audio, &n_samples, 1);
+        qwen_compose_free_spans(spans, nspans);
+        free(language);
+        if (rc != 0 || !audio || n_samples == 0) {
+            send_error(fd, 500, "generation failed");
+            free(audio); free(text); return;
+        }
+    } else if (qwen_tts_generate(ctx, text, &audio, &n_samples) != 0 || !audio || n_samples == 0) {
         send_error(fd, 500, "generation failed");
         free(text);
         free(audio);
@@ -485,11 +528,29 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     /* Send chunked response header */
     send_chunked_header(fd);
 
+    /* Per-sentence dynamic emotion: inline markup streams span-by-span — each sentence is
+     * synthesized with its own emotion and flushed as it completes (low time-to-first-audio),
+     * so a single request can switch mood paragraph by paragraph. Plain text streams as one take. */
+    if (qwen_compose_has_markup(text)) {
+        char *language = json_extract_string(body, "language");
+        qwen_cspan_t *spans = NULL; int nspans = 0;
+        if (qwen_compose_parse(text, &spans, &nspans) == 0 && nspans > 0) {
+            fprintf(stderr, "[HTTP] inline markup -> per-sentence compose stream (%d spans)\n", nspans);
+            ctx->stream = 0;        /* each span is a full internal decode; we emit its buffer per span */
+            ctx->audio_cb = NULL;
+            qwen_compose_render_stream(ctx, spans, nspans, language, 0.12f,
+                                       compose_stream_emit, &state, 1);
+        }
+        qwen_compose_free_spans(spans, nspans);
+        free(language);
+        free(text);
+    } else {
     float *audio = NULL;
     int n_samples = 0;
     qwen_tts_generate(ctx, text, &audio, &n_samples);
     free(audio);
     free(text);
+    }
 
     /* Terminate chunked encoding */
     send_chunked_end(fd);

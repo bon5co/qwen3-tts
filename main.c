@@ -5,6 +5,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_audio.h"
 #include "qwen_tts_emotion.h"
+#include "qwen_tts_compose.h"   /* inline expressive-markup composer (shared with the server) */
 #include "qwen_tts_batch.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_server.h"
@@ -369,46 +370,9 @@ static int load_ml_steer(qwen_tts_ctx_t *ctx, const char *path, float weight, in
  * Used by --compose AND auto-detected inside --text. Each span is synthesized with
  * its own recipe and concatenated (model-generated -> seamless, same voice/codec). */
 
-/* steer_weight: <0 = use the mood recipe's weight; >=0 = override (0 = NO steering).
- * rate/volume: >0 = override the recipe value, else inherit it. */
-typedef struct { int is_pause; float pause_s; char mood[48]; char *text;
-                 float steer_weight; float rate; float volume; int is_filler; } cspan_t;
-
-/* English paralinguistic macro = a self-contained soft filler recipe.
- * Ear-validated 2026-06-07: steering on a short, time-stretched vowel goes metallic/
- * "growl", so fillers use NO steering — just a breathy onomatopoeia (leading 'h' =
- * aspiration), a gentle slowdown and a low volume. Not true breaths (no <breath> token),
- * but they read as weary/aspirated in context. */
-typedef struct { const char *tag; const char *text; float steer_weight; float rate; float volume; } cmacro_t;
-static const cmacro_t COMPOSE_MACROS[] = {
-    /* tag        onomatopoeia  steer  rate   volume   (ear-validated 2026-06-07, ryan IT/EN)
-     * NOTE: keep rate >= ~0.90 — slower stretches the short vowel into a metallic WSOLA
-     * artifact. A trailing "..." can make the model emit a 2nd spurious vocalization. */
-    /* sighs / relief */
-    { "sigh",    "Hah...",    0.0f, 1.12f, 0.67f },  /* "aaaahhhww" sigh — the "..." IS the sigh (no dots -> a laugh!); rate shaves length */
-    { "sighs",   "Hah...",    0.0f, 1.12f, 0.67f },
-    { "ahh",     "Haaa...",   0.0f, 0.90f, 0.70f },  /* "ahhhww" pleasure/relief — TOP */
-    { "relief",  "Haaa...",   0.0f, 0.90f, 0.70f },
-    { "phew",    "Uao...",    0.0f, 1.00f, 0.82f },  /* big tired relief "ooowww" — TOP */
-    /* thinking / hesitation / dismissive */
-    { "hmm",     "Hmmm...",   0.0f, 0.88f, 0.65f },  /* pensive "hmm" — TOP */
-    { "mmm",     "\xe5\x97\xaf", 0.0f, 1.00f, 0.85f }, /* CN 嗯 = soft assent "mmm", less smug than [hmm] — TOP */
-    { "hmpf",    "Hmpf...",   0.0f, 1.00f, 0.75f },  /* closed "mmmm" — TOP */
-    { "mah",     "Mah...",    0.0f, 0.95f, 0.78f },  /* dismissive "mah" (very IT) — TOP */
-    { "uhm",     "Uhm...",    0.0f, 0.95f, 0.72f },  /* tired/bored drawl — TOP */
-    /* laughs (language-dependent) */
-    { "laugh",   "Eheh...",   0.0f, 0.95f, 0.78f },  /* real chuckle "eheheh" — TOP (IT) */
-    { "laughs",  "Eheh...",   0.0f, 0.95f, 0.78f },
-    { "haha",    "Haha!",     0.0f, 1.00f, 0.80f },  /* short laugh — TOP (EN) */
-    { "heh",     "Hehhh...",  0.0f, 0.95f, 0.70f },  /* smug "eh eh" (EN) */
-    /* pain */
-    { "ouch",    "Ouch!",     0.0f, 1.00f, 0.85f },  /* sharp pain (EN) — TOP */
-    { "ahi",     "Ahi!",      0.0f, 1.00f, 0.85f },  /* sharp pain (IT) */
-    /* irritation */
-    { "huff",    "Uff...",    0.0f, 1.00f, 0.78f },  /* irritated huff */
-    { "ugh",     "Ugh...",    0.0f, 1.00f, 0.78f },
-    { NULL, NULL, 0.0f, 0.0f, 0.0f }
-};
+/* The span type + the paralinguistic soft-filler macro table now live in qwen_tts_compose.c
+ * (shared with the server). `cspan_t` is the local alias kept for the batch/compose call sites. */
+typedef qwen_cspan_t cspan_t;
 
 /* Paralinguistic events rendered via a STEERING VECTOR (the validated win, plan §8.9-DONE/§9.13):
  * the inline [tag] becomes a native-trigger onomatopoeia ANCHOR (which the model performs) and the
@@ -428,73 +392,8 @@ static const cmacro_t COMPOSE_MACROS[] = {
  *   [laugh] → 哈哈哈 (CN 3-char)   [sigh] → ahh (Latin)
  * and seed 7 makes BOTH fire (哈哈哈 s7 laughs / s42 hyperventilates; ahh s7 = clean sigh). SHORT form only
  * (哈哈哈 not longer; long over-laughs into a pant); no event-instruct (goes metallic). See the doc for WIN/KO. */
-/* Per-(tag × voice) onomatopoeia + validated seed. The mapping is VOICE-DEPENDENT (ear 2026-07-01,
- * docs/para-experiments.md): laugh is universal (哈哈哈 s7) but sigh differs — 唉 s42 on ryan/clone,
- * `ahh` s7 on vivian (which over-does 唉). voice_class: 0 = ryan/clone/default, 1 = vivian. */
-static void para_pick(const char *tag, int voice_class, const char **onom, int *seed) {
-    *onom = NULL; *seed = 7;
-    if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
-        *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 7;              /* 哈哈哈 — all voices */
-    } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
-        if (voice_class == 1) { *onom = "ahh"; *seed = 7; }                    /* vivian */
-        else                  { *onom = "\xe5\x94\x89"; *seed = 42; }          /* 唉 — ryan/clone */
-    }
-}
-/* Replace every [laugh]/[sigh] tag in `text` with its validated onomatopoeia, COMMA-DELIMITED (the win
- * carriers set the event off with commas — "…credere, 哈哈哈, è…" — so it renders as a discrete event;
- * without the trailing comma it slurs into the next word). Other tags ([sad]/[pause]/…) pass through.
- * Returns a new string (caller owns); sets *did=1 and *seed to the FIRST substituted tag's validated seed. */
-static char *para_inline_substitute(const char *text, int voice_class, int *did, int *seed) {
-    *did = 0;
-    if (!text) return NULL;
-    size_t cap = strlen(text) + 48, n = 0;
-    char *out = (char *)malloc(cap);
-    if (!out) return NULL;
-    #define PIS_ENS(extra) do { while (n + (extra) + 1 > cap) { cap *= 2; char *nb = (char *)realloc(out, cap); if (!nb) { free(out); return NULL; } out = nb; } } while (0)
-    const char *p = text;
-    while (*p) {
-        if (*p == '[') {
-            const char *c = strchr(p, ']');
-            if (c) {
-                size_t tl = (size_t)(c - p - 1);
-                char tag[32];
-                if (tl < sizeof(tag)) {
-                    memcpy(tag, p + 1, tl); tag[tl] = 0;
-                    char *t = tag; while (*t == ' ') t++;
-                    char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
-                    const char *onom; int sd;
-                    para_pick(t, voice_class, &onom, &sd);
-                    if (onom) {
-                        /* comma BEFORE: strip trailing spaces + one comma in out, then emit ", " */
-                        while (n > 0 && out[n - 1] == ' ') n--;
-                        if (n > 0 && out[n - 1] == ',') n--;
-                        size_t ol = strlen(onom);
-                        PIS_ENS(ol + 4);
-                        if (n > 0) { out[n++] = ','; out[n++] = ' '; }         /* not at sentence start */
-                        memcpy(out + n, onom, ol); n += ol;
-                        out[n++] = ','; out[n++] = ' ';                        /* comma AFTER (the pause) */
-                        if (!*did) *seed = sd;                                 /* pin the first tag's seed */
-                        *did = 1;
-                        p = c + 1;
-                        while (*p == ' ') p++;                                 /* absorb following spaces */
-                        if (*p == ',') p++;                                    /* and a redundant comma */
-                        while (*p == ' ') p++;
-                        continue;
-                    }
-                }
-            }
-        }
-        PIS_ENS(1);
-        out[n++] = *p++;
-    }
-    #undef PIS_ENS
-    out[n] = 0;
-    return out;
-}
-/* Is `t` one of the inline paralinguistic event tags ([laugh]/[sigh]/…)? */
-static int is_para_event_tag(const char *t) {
-    const char *o; int s; para_pick(t, 0, &o, &s); return o != NULL;
-}
+/* para_pick / para_inline_substitute / is_para_event_tag moved to qwen_tts_compose.c
+ * (shared with the server). Use qwen_compose_para_substitute / qwen_compose_is_para_event_tag. */
 
 /* ── --emotion auto-router (1.7B): the ear-validated per-(voice×emotion) recipe ────────────────
  * `--emotion <name>` reproduces the weeks-long shippable recipe table (plan_emo_v3 §8.3 recipe_final,
@@ -600,159 +499,6 @@ static const char *default_emotion_instruct(const char *spec) {
     if (!strcmp(tok, "disgust"))  return "Speak with deep disgust and revulsion, lip-curling contempt, as if something repels you.";
     if (!strcmp(tok, "surprise")) return "Speak with sudden astonishment and surprise, gasping and caught off guard.";
     return NULL;
-}
-
-static int cspan_push(cspan_t **arr, int *n, int *cap, cspan_t s) {
-    if (*n >= *cap) {
-        int nc = *cap * 2 + 8;
-        cspan_t *t = (cspan_t *)realloc(*arr, (size_t)nc * sizeof(cspan_t));
-        if (!t) return -1;
-        *arr = t; *cap = nc;
-    }
-    (*arr)[(*n)++] = s;
-    return 0;
-}
-
-/* "400ms"/"1s"/"0.5s"/"0.5" -> seconds */
-static float parse_duration_s(const char *s) {
-    while (*s == ' ') s++;
-    float v = (float)atof(s);
-    const char *u = s;
-    while (*u && ((*u >= '0' && *u <= '9') || *u == '.' || *u == '+' || *u == '-')) u++;
-    while (*u == ' ') u++;
-    if (strncasecmp(u, "ms", 2) == 0) return v / 1000.0f;
-    return v;  /* "s" or bare = seconds */
-}
-
-/* Parse inline markup into a span list. Caller frees each span.text and the array. */
-static int parse_markup(const char *input, cspan_t **out, int *out_n) {
-    cspan_t *arr = NULL; int n = 0, cap = 0;
-    char cur_mood[48] = "";
-    char *seg = (char *)malloc(strlen(input) + 1);
-    if (!seg) return -1;
-    int seglen = 0;
-    #define MK_FLUSH() do {                                                      \
-        int _a = 0, _b = seglen;                                                 \
-        while (_a < _b && (seg[_a]==' '||seg[_a]=='\t'||seg[_a]=='\n')) _a++;     \
-        while (_b > _a && (seg[_b-1]==' '||seg[_b-1]=='\t'||seg[_b-1]=='\n')) _b--; \
-        if (_b > _a) {                                                           \
-            cspan_t _s; _s.is_pause = 0; _s.pause_s = 0; _s.is_filler = 0;        \
-            _s.steer_weight = -1.0f; _s.rate = 0; _s.volume = 0;                  \
-            snprintf(_s.mood, sizeof(_s.mood), "%s", cur_mood);                   \
-            _s.text = (char *)malloc((size_t)(_b - _a) + 1);                      \
-            if (!_s.text) { free(seg); free(arr); return -1; }                    \
-            memcpy(_s.text, seg + _a, (size_t)(_b - _a)); _s.text[_b - _a] = 0;   \
-            if (cspan_push(&arr, &n, &cap, _s) != 0) { free(_s.text); free(seg); free(arr); return -1; } \
-        }                                                                        \
-        seglen = 0;                                                              \
-    } while (0)
-
-    for (const char *p = input; *p; ) {
-        if (*p == '|') { MK_FLUSH(); p++; continue; }
-        if (*p == '[') {
-            const char *close = strchr(p, ']');
-            if (close) {
-                size_t tl = (size_t)(close - p - 1);
-                char tag[64];
-                if (tl < sizeof(tag)) {
-                    memcpy(tag, p + 1, tl); tag[tl] = 0;
-                    char *t = tag; while (*t == ' ') t++;
-                    char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
-                    int handled = 0;
-
-                    if (strncasecmp(t, "pause", 5) == 0 || strncasecmp(t, "break", 5) == 0) {
-                        const char *col = strchr(t, ':'); const char *eq = strchr(t, '=');
-                        const char *num = col ? col + 1 : (eq ? eq + 1 : t + 5);
-                        MK_FLUSH();
-                        cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(num);
-                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
-                        handled = 1;
-                    } else if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') {
-                        MK_FLUSH();
-                        cspan_t s; memset(&s, 0, sizeof(s)); s.is_pause = 1; s.pause_s = parse_duration_s(t);
-                        if (cspan_push(&arr, &n, &cap, s) != 0) { free(seg); free(arr); return -1; }
-                        handled = 1;
-                    } else {
-                        /* [laugh]/[sigh] are handled INLINE upstream (para_inline_substitute) before compose,
-                         * so they don't reach here from --text. COMPOSE_MACROS = the old DSP soft fillers
-                         * ([huff]/[ugh]/[hmm]/…). */
-                        for (int m = 0; COMPOSE_MACROS[m].tag && !handled; m++) {
-                            if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) {
-                                MK_FLUSH();
-                                cspan_t s; s.is_pause = 0; s.pause_s = 0; s.is_filler = 1;
-                                s.steer_weight = COMPOSE_MACROS[m].steer_weight;
-                                s.rate = COMPOSE_MACROS[m].rate;
-                                s.volume = COMPOSE_MACROS[m].volume;
-                                s.mood[0] = 0;  /* macros are no-steer prosody; mood unused */
-                                s.text = strdup(COMPOSE_MACROS[m].text);
-                                if (!s.text || cspan_push(&arr, &n, &cap, s) != 0) { free(s.text); free(seg); free(arr); return -1; }
-                                handled = 1;
-                            }
-                        }
-                        if (!handled) {
-                            if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) {
-                                MK_FLUSH(); cur_mood[0] = 0; handled = 1;
-                            } else if (qwen_emotion_lookup(t)) {
-                                MK_FLUSH(); snprintf(cur_mood, sizeof(cur_mood), "%s", t); handled = 1;
-                            }
-                        }
-                    }
-                    if (handled) { p = close + 1; continue; }
-                }
-            }
-            seg[seglen++] = *p++;   /* unrecognized -> literal '[' */
-            continue;
-        }
-        seg[seglen++] = *p++;
-    }
-    MK_FLUSH();
-    free(seg);
-    #undef MK_FLUSH
-    *out = arr; *out_n = n;
-    return 0;
-}
-
-/* Quick scan: does `text` contain at least one RECOGNIZED inline tag? (auto-route) */
-static int text_has_markup(const char *text) {
-    for (const char *p = strchr(text, '['); p; p = strchr(p + 1, '[')) {
-        const char *c = strchr(p, ']');
-        if (!c) continue;
-        size_t tl = (size_t)(c - p - 1);
-        char tag[64];
-        if (tl >= sizeof(tag)) continue;
-        memcpy(tag, p + 1, tl); tag[tl] = 0;
-        char *t = tag; while (*t == ' ') t++;
-        char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
-        if (strncasecmp(t, "pause", 5) == 0 || strncasecmp(t, "break", 5) == 0) return 1;
-        if ((t[0] >= '0' && t[0] <= '9') || t[0] == '.') return 1;
-        if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) return 1;
-        if (is_para_event_tag(t)) return 1;
-        for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
-        if (qwen_emotion_lookup(t)) return 1;
-    }
-    return 0;
-}
-
-/* Does `text` contain at least one PARALINGUISTIC event tag (steering-vector [laugh]/[sigh] OR a
- * COMPOSE_MACRO filler [huff]/[ugh]/…)? When a para event rides together with a routed `--emotion`,
- * the engine switches the EMOTION application to the ear-validated para+emo setup (COMBINE: the
- * language-correction .expr keeps the EN-captured para anchor from drifting the accent), and the
- * para steering vector uses its per-voice weight. The pure-emotion (no para) path is UNCHANGED —
- * presets stay STEER-only as shipped. (Excludes [pause]/[neutral]/emotion-mood tags.) */
-static int text_has_para_event(const char *text) {
-    for (const char *p = strchr(text, '['); p; p = strchr(p + 1, '[')) {
-        const char *c = strchr(p, ']');
-        if (!c) continue;
-        size_t tl = (size_t)(c - p - 1);
-        char tag[64];
-        if (tl >= sizeof(tag)) continue;
-        memcpy(tag, p + 1, tl); tag[tl] = 0;
-        char *t = tag; while (*t == ' ') t++;
-        char *te = t + strlen(t); while (te > t && te[-1] == ' ') *--te = 0;
-        if (is_para_event_tag(t)) return 1;
-        for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
-    }
-    return 0;
 }
 
 static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
@@ -920,90 +666,17 @@ static int run_batch(qwen_tts_ctx_t *ctx, const char *text, int target_words, in
     return rc;
 }
 
-/* Synthesize a parsed span list and concatenate into one WAV. Returns 0 on success. */
+/* Synthesize a parsed span list into one WAV file (thin wrapper over the shared composer). */
 static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
                         const char *language, float default_pause,
                         const char *output, int silent) {
-    const int SR = QWEN_TTS_SAMPLE_RATE;
-    float *out = NULL; size_t out_n = 0, out_cap = 0;
-    int spoken = 0, idx = 0, last_spoken = 0, prev_filler = 0;
-    #define RS_APPEND(src, cnt) do {                                       \
-        size_t _c = (cnt);                                                 \
-        if (out_n + _c > out_cap) {                                        \
-            out_cap = (out_n + _c) * 2 + 1024;                             \
-            float *_t = (float *)realloc(out, out_cap * sizeof(float));    \
-            if (!_t) { free(out); return -1; }                            \
-            out = _t;                                                      \
-        }                                                                  \
-        if (src) memcpy(out + out_n, (src), _c * sizeof(float));           \
-        else memset(out + out_n, 0, _c * sizeof(float));                   \
-        out_n += _c;                                                       \
-    } while (0)
-
-    for (int i = 0; i < nspans; i++) {
-        if (spans[i].is_pause) {
-            if (spans[i].pause_s > 0) RS_APPEND(NULL, (size_t)(spans[i].pause_s * SR));
-            if (!silent) fprintf(stderr, "  [pause %.2fs]\n", spans[i].pause_s);
-            last_spoken = 0; prev_filler = 0;
-            continue;
-        }
-        const char *mood = spans[i].mood[0] ? spans[i].mood : NULL;
-        float vol = 1.0f, rate = 1.0f;
-        int   sw_set = spans[i].steer_weight >= 0.0f;          /* macro -> explicit (0 = no steer) */
-        float sw     = sw_set ? spans[i].steer_weight : 1.0f;
-        if (qwen_tts_apply_emotion(ctx, mood, NULL, language, sw, sw_set, 0.0f, 0, 1.0f, 0, 1.0f, 0,
-                               &vol, &rate, silent) != 0) { free(out); return -1; }
-        if (spans[i].rate   > 0.0f) rate = spans[i].rate;     /* macro filler overrides recipe rate */
-        if (spans[i].volume > 0.0f) vol  = spans[i].volume;   /* and volume */
-        /* No silence gap around a paralinguistic filler — it should flow OUT of / INTO the speech
-         * (the "stuck/detached" defect was the 120ms pause + hard seam). We crossfade instead (below). */
-        int xfade_seam = (spans[i].is_filler || prev_filler);
-        if (last_spoken && default_pause > 0 && !xfade_seam) RS_APPEND(NULL, (size_t)(default_pause * SR));
-        if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", idx, mood ? mood : "neutral", spans[i].text);
-
-        /* Each span is an INDEPENDENT synthesis: force a cold prefill so the previous
-         * span's KV/trajectory can't leak in via delta-prefill (which would change this
-         * span's delivery vs synthesizing it alone — ear-caught 2026-06-07). */
-        ctx->prev_prefill_len = 0;
-
-        float *audio = NULL; int n = 0;
-        int grc = qwen_tts_generate(ctx, spans[i].text, &audio, &n);
-
-        if (grc != 0 || !audio || n <= 0) {
-            fprintf(stderr, "Compose: synthesis failed for span %d\n", idx);
-            free(audio); free(out); return -1;
-        }
-        float *seg = audio; int seg_n = n; float *stretched = NULL;
-        if (rate != 1.0f) {
-            int sn = 0;
-            if (qwen_audio_time_stretch(audio, n, rate, SR, &stretched, &sn) == 0) { seg = stretched; seg_n = sn; }
-        }
-        if (vol != 1.0f) qwen_audio_apply_gain(seg, seg_n, vol);
-        /* Crossfade a paralinguistic-filler seam so the laugh/sigh blends into the speech instead of
-         * sounding pasted-on. ~45ms equal-gain overlap-add on the existing tail + the new head. */
-        if (xfade_seam && out_n > 0 && seg_n > 0) {
-            size_t xf = (size_t)(0.045f * SR);
-            if (xf > out_n) xf = out_n;
-            if (xf > (size_t)seg_n) xf = (size_t)seg_n;
-            for (size_t k = 0; k < xf; k++) {
-                float a = (float)(xf - k) / (float)xf;          /* fade out previous tail */
-                out[out_n - xf + k] = out[out_n - xf + k] * a + seg[k] * (1.0f - a);
-            }
-            RS_APPEND(seg + xf, (size_t)seg_n - xf);
-        } else {
-            RS_APPEND(seg, (size_t)seg_n);
-        }
-        free(stretched); free(audio);
-        spoken++; idx++; last_spoken = 1; prev_filler = spans[i].is_filler;
-    }
-
-    if (out_n == 0) { fprintf(stderr, "Compose: nothing to synthesize\n"); free(out); return -1; }
-    int rc = qwen_tts_write_wav(output, out, (int)out_n, SR);
+    float *audio = NULL; int n = 0;
+    int rc = qwen_compose_render_buffer(ctx, spans, nspans, language, default_pause, &audio, &n, silent);
+    if (rc != 0) return rc;
+    rc = qwen_tts_write_wav(output, audio, n, QWEN_TTS_SAMPLE_RATE);
     if (rc == 0 && !silent)
-        fprintf(stderr, "Wrote %s (%zu samples, %.2fs) [composed %d spans]\n",
-                output, out_n, (double)out_n / SR, spoken);
-    free(out);
-    #undef RS_APPEND
+        fprintf(stderr, "Wrote %s (%d samples, %.2fs)\n", output, n, (double)n / QWEN_TTS_SAMPLE_RATE);
+    free(audio);
     return rc;
 }
 
@@ -1011,10 +684,9 @@ static int render_spans(qwen_tts_ctx_t *ctx, cspan_t *spans, int nspans,
 static int run_compose(qwen_tts_ctx_t *ctx, const char *spec, const char *language,
                        float default_pause, const char *output, int silent) {
     cspan_t *spans = NULL; int n = 0;
-    if (parse_markup(spec, &spans, &n) != 0) { fprintf(stderr, "Compose: parse error\n"); return -1; }
+    if (qwen_compose_parse(spec, &spans, &n) != 0) { fprintf(stderr, "Compose: parse error\n"); return -1; }
     int rc = render_spans(ctx, spans, n, language, default_pause, output, silent);
-    for (int i = 0; i < n; i++) if (!spans[i].is_pause) free(spans[i].text);
-    free(spans);
+    qwen_compose_free_spans(spans, n);
     return rc;
 }
 
@@ -1744,7 +1416,7 @@ int main(int argc, char **argv) {
     if (text && !no_compose) {
         int did = 0, para_seed = 7;
         int para_voice = (!load_voice && speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0;
-        para_sub_text = para_inline_substitute(text, para_voice, &did, &para_seed);
+        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
         if (para_sub_text && did) {
             text = para_sub_text;
             if (seed < 0) seed = para_seed;      /* pin the validated per-tag seed (laugh 7 / sigh 42) */
@@ -1756,7 +1428,7 @@ int main(int argc, char **argv) {
 
     /* Para-active (legacy): kept only for the explicit --compose per-span path; the --text auto path above
      * has already inlined [laugh]/[sigh], so text_has_para_event(text) is normally 0 here. */
-    int para_active = text && !no_compose && text_has_para_event(text);
+    int para_active = text && !no_compose && qwen_compose_has_para_event(text);
     if (emotion_spec && !compose_spec && ctx->config.hidden_size >= 2048 && emotion_tok(emotion_spec)) {
         const char *etok = emotion_tok(emotion_spec);
         char evk[64];
@@ -1812,7 +1484,7 @@ int main(int argc, char **argv) {
     /* Auto-route a tagged --text (e.g. "Ciao [sad] ... [sigh]") through the
      * inline-markup composer, so users get expressive markup without a new flag. */
     int compose_from_text = 0;
-    if (!compose_spec && !no_compose && text && text_has_markup(text)) {
+    if (!compose_spec && !no_compose && text && qwen_compose_has_markup(text)) {
         compose_spec = text;
         compose_from_text = 1;   /* inline [tags] in --text: the WHOLE text is one --emotion, so keep the
                                   * routed emotion's global expr/steer (applied below) — the compose loop
@@ -1821,7 +1493,7 @@ int main(int argc, char **argv) {
                                   * and does NOT get the blanket emotion router.) */
         if (!silent) fprintf(stderr, "Inline markup detected in --text -> compose mode\n");
     }
-    if (no_compose && !silent && text && text_has_markup(text))
+    if (no_compose && !silent && text && qwen_compose_has_markup(text))
         fprintf(stderr, "--no-compose: passing inline [tags] literally to the model\n");
     /* On the 1.7B model, a routed --emotion (anger/sad/joy/fear/disgust/surprise) is handled by the
      * COMBINE auto-router AFTER the voice block (expr+qlsteer), NOT the legacy .vec CP-steer here —

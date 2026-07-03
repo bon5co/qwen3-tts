@@ -61,6 +61,7 @@ SRCS = main.c \
        qwen_tts_kernels_avx.c \
        qwen_tts_audio.c \
        qwen_tts_emotion.c \
+       qwen_tts_compose.c \
        qwen_tts_sampling.c \
        qwen_tts_tokenizer.c \
        qwen_tts_safetensors.c \

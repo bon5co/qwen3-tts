@@ -60,6 +60,14 @@ curl -s http://localhost:8080/v1/tts \
 curl -s http://localhost:8080/v1/tts \
   -d '{"text":"What a wonderful day!","speaker":"ryan","language":"English","emotion":"joy"}' \
   -o joy.wav
+
+# Per-sentence DYNAMIC emotion — inline [mood] tags switch emotion mid-text within ONE request.
+# The server auto-detects markup, synthesizes each span with its own emotion and concatenates.
+# Same tag set as the CLI: [joy] [sad] [excited] [proud] [calm] [angry] … + [neutral], [pause:400ms],
+# and paralinguistics [laugh]/[sigh]. Works on /v1/tts (full) and /v1/tts/stream (span-by-span).
+curl -s http://localhost:8080/v1/tts \
+  -d '{"text":"[joy] What wonderful news! [sad] But I have to go now. [pause:400ms] [calm] Take care.","speaker":"ryan","language":"English"}' \
+  -o dynamic.wav
 ```
 
 ### `POST /v1/tts/stream` — Streaming PCM
@@ -140,6 +148,7 @@ temperature=0.5, top_k=50, top_p=1.0, rep_penalty=1.05, seed=random.
 | `emotion` | Named mood — same recipe as the CLI `--emotion`: `joy`, `happy`, `excited`, `proud`, `news`, `dramatic`, `calm`, `sad`, `gloomy`, `annoyed`, `stern`, `angry`. Sets the Code-Predictor steering vector for the `(emotion, language)` pair (applied during generation, so it works on **both** `/v1/tts` and `/v1/tts/stream`) and applies the recipe's volume/tempo. Best on 1.7B. |
 | `volume` | Linear output gain (`1.0` = unchanged). Overrides the emotion recipe's volume; applied on both full and streaming paths. |
 | `rate` | Pitch-preserving tempo (`>1` faster). Overrides the emotion recipe's rate. Applied on `/v1/tts`; **not** on `/v1/tts/stream` (needs the full buffer). |
+| inline `[mood]` markup (in `text`) | **Per-sentence dynamic emotion.** If the `text` carries inline tags — `[joy]`/`[sad]`/`[excited]`/… to switch mood mid-text, `[neutral]` to reset, `[pause:400ms]`/`[break:1s]` for gaps, `[laugh]`/`[sigh]` paralinguistics — the server splits the text into spans, synthesizes each with its own emotion, and concatenates them. Auto-detected on **both** endpoints; `/v1/tts/stream` flushes span-by-span (low time-to-first-audio). This is the same composer as the CLI's `--compose` / auto-detected `--text`. The top-level `emotion` field sets a single mood for the whole request; inline tags let one request span several. Same tag set as [docs/markup.md](markup.md). |
 
 Each request resets its **sampling parameters** to defaults (speaker, language, temperature,
 top-k/p, rep-penalty, seed) **and clears any prior emotion steering**, so nothing leaks between requests.
