@@ -11,8 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
 
-extern "C" { int g_cuda_decoder_conv_on = 0; }
+extern "C" {
+#include "qwen_tts.h"
+int g_cuda_decoder_conv_on = 0;
+}
 
 #define CK(x) do { cudaError_t e_=(x); if(e_!=cudaSuccess){fprintf(stderr,"CUDA-dec %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e_));} } while(0)
 #define TPB 256
@@ -111,5 +115,81 @@ static float *grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)
  * Validate: mel-corr vs CPU conv_decoder_forward MUST be 1.0 (bit-identical, same fp ops). Then wire into
  * conv_decoder_forward (if g_cuda_decoder_conv_on: upload signal, call this, return) + add to Makefile cuda.
  * ============================================================================ */
+/* ping-pong device buffers */
+typedef struct { float *p; size_t cap; } DB;
+static float *dbg(DB *d,size_t need){ if(d->cap<need){ if(d->p)cudaFree(d->p); if(cudaMalloc(&d->p,need*sizeof(float))!=cudaSuccess){d->p=NULL;d->cap=0;return NULL;} d->cap=need; } return d->p; }
+static DB S={0,0},O={0,0},R={0,0},P={0,0};   /* signal / op-out / residual / pointwise */
+#define SWAP() do{ DB _t=S; S=O; O=_t; cur=S.p; }while(0)
+#define GRID2(len,ch) dim3(CEIL((len),TPB),(ch))
+
 extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cur_ch, int cur_len,
-                                          float **audio_out, int *n_out);
+                                          float **audio_out, int *n_out) {
+    qwen_tts_ctx_t *ctx=(qwen_tts_ctx_t*)ctxv;
+    qwen_speech_decoder_t *sd=&ctx->speech_dec;
+    float *cur=dbg(&S,(size_t)cur_ch*cur_len); if(!cur) return -1;
+    cudaMemcpy(cur,signal_host,(size_t)cur_ch*cur_len*sizeof(float),cudaMemcpyHostToDevice);
+
+    /* ConvNeXt upsample ×2 (2× each) */
+    for(int b=0;b<2;++b){
+        qwen_sd_convnext_t *cn=&sd->convnext[b];
+        int nl=cur_len*2;
+        float *up=dbg(&O,(size_t)cur_ch*nl);
+        kd_convT<<<GRID2(nl,cur_ch),TPB>>>(cur,dev_w(cn->conv_weight,(size_t)cur_ch*cur_ch*2),dev_w(cn->conv_bias,cur_ch),up,cur_ch,cur_ch,cur_len,nl,2,2);
+        SWAP(); cur_len=nl;
+        float *res=dbg(&R,(size_t)cur_ch*cur_len); cudaMemcpy(res,cur,(size_t)cur_ch*cur_len*sizeof(float),cudaMemcpyDeviceToDevice);
+        float *dw=dbg(&O,(size_t)cur_ch*cur_len);
+        kd_depthwise7<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(cn->dwconv_weight,(size_t)cur_ch*7),dev_w(cn->dwconv_bias,cur_ch),dw,cur_ch,cur_len);
+        SWAP();
+        kd_layernorm_ct<<<cur_len,TPB,TPB*sizeof(float)>>>(cur,dev_w(cn->norm_weight,cur_ch),dev_w(cn->norm_bias,cur_ch),cur_ch,cur_len,1e-5f);
+        float *pw=dbg(&P,(size_t)4096*cur_len);
+        kd_conv1d<<<GRID2(cur_len,4096),TPB>>>(cur,dev_w(cn->pwconv1_weight,(size_t)4096*cur_ch),dev_w(cn->pwconv1_bias,4096),pw,cur_ch,4096,cur_len,1,1);
+        kd_gelu<<<CEIL((size_t)4096*cur_len,TPB),TPB>>>(pw,(size_t)4096*cur_len);
+        float *o2=dbg(&O,(size_t)cur_ch*cur_len);
+        kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(pw,dev_w(cn->pwconv2_weight,(size_t)cur_ch*4096),dev_w(cn->pwconv2_bias,cur_ch),o2,4096,cur_ch,cur_len,1,1);
+        SWAP();
+        kd_gamma_res<<<GRID2(cur_len,cur_ch),TPB>>>(cur,res,dev_w(cn->gamma,cur_ch),cur_ch,cur_len);
+    }
+
+    /* Initial conv (cur_ch→1536, k=7) */
+    { int oc=1536; float *o=dbg(&O,(size_t)oc*cur_len);
+      kd_conv1d<<<GRID2(cur_len,oc),TPB>>>(cur,dev_w(sd->initial_conv_weight,(size_t)oc*cur_ch*7),dev_w(sd->initial_conv_bias,oc),o,cur_ch,oc,cur_len,7,1);
+      SWAP(); cur_ch=oc; }
+
+    /* 4 decoder upsample blocks */
+    int up_rates[4]={8,5,4,3}, out_channels[4]={768,384,192,96}, dils[3]={1,3,9};
+    for(int b=0;b<4;++b){
+        qwen_sd_upsample_block_t *ub=&sd->upsample_blocks[b];
+        int rate=up_rates[b], ksz=rate*2, oc=out_channels[b];
+        if(ub->upsample.snake_alpha)
+            kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,ub->upsample.snake_alpha?dev_w(ub->upsample.snake_alpha,cur_ch):NULL,dev_w(ub->upsample.snake_beta,cur_ch),cur_ch,cur_len);
+        int ul=cur_len*rate; float *o=dbg(&O,(size_t)oc*ul);
+        kd_convT<<<GRID2(ul,oc),TPB>>>(cur,dev_w(ub->upsample.conv_weight,(size_t)cur_ch*oc*ksz),dev_w(ub->upsample.conv_bias,oc),o,cur_ch,oc,cur_len,ul,ksz,rate);
+        SWAP(); cur_ch=oc; cur_len=ul;
+        for(int r=0;r<3;++r){
+            int dil=dils[r];
+            float *res=dbg(&R,(size_t)cur_ch*cur_len); cudaMemcpy(res,cur,(size_t)cur_ch*cur_len*sizeof(float),cudaMemcpyDeviceToDevice);
+            if(ub->res_blocks[r].snake1_alpha)
+                kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].snake1_alpha,cur_ch),dev_w(ub->res_blocks[r].snake1_beta,cur_ch),cur_ch,cur_len);
+            float *c1=dbg(&O,(size_t)cur_ch*cur_len);
+            kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].conv1_weight,(size_t)cur_ch*cur_ch*7),dev_w(ub->res_blocks[r].conv1_bias,cur_ch),c1,cur_ch,cur_ch,cur_len,7,dil);
+            SWAP();
+            if(ub->res_blocks[r].snake2_alpha)
+                kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].snake2_alpha,cur_ch),dev_w(ub->res_blocks[r].snake2_beta,cur_ch),cur_ch,cur_len);
+            float *c2=dbg(&O,(size_t)cur_ch*cur_len);
+            kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].conv2_weight,(size_t)cur_ch*cur_ch*1),dev_w(ub->res_blocks[r].conv2_bias,cur_ch),c2,cur_ch,cur_ch,cur_len,1,1);
+            SWAP();
+            kd_add<<<CEIL((size_t)cur_ch*cur_len,TPB),TPB>>>(cur,res,(size_t)cur_ch*cur_len);   /* cur = c2 + res */
+        }
+    }
+
+    /* Final snake + conv (cur_ch→1, k=7) */
+    kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(sd->final_snake.alpha,cur_ch),dev_w(sd->final_snake.beta,cur_ch),cur_ch,cur_len);
+    int audio_len=cur_len; float *daudio=dbg(&O,(size_t)audio_len);
+    kd_conv1d<<<GRID2(audio_len,1),TPB>>>(cur,dev_w(sd->final_conv_weight,(size_t)cur_ch*7),dev_w(sd->final_conv_bias,1),daudio,cur_ch,1,cur_len,7,1);
+    CK(cudaDeviceSynchronize());
+    float *audio=(float*)malloc((size_t)audio_len*sizeof(float)); if(!audio) return -1;
+    cudaMemcpy(audio,daudio,(size_t)audio_len*sizeof(float),cudaMemcpyDeviceToHost);
+    for(int i=0;i<audio_len;++i){ if(audio[i]<-1.f)audio[i]=-1.f; if(audio[i]>1.f)audio[i]=1.f; }
+    *audio_out=audio; *n_out=audio_len;
+    return 0;
+}

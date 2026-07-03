@@ -158,8 +158,8 @@ cuda:
 	$(MAKE) clean
 	$(MAKE) cuda_build
 cuda_build: EXTRA_CFLAGS += -DQWEN_HAVE_CUDA -I$(CUDA_HOME)/include
-cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o $(LDLIBS) \
+cuda_build: $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(GPU_OBJS) qwen_tts_cuda_kernels.o qwen_tts_cuda_talker.o qwen_tts_cuda_decoder.o $(LDLIBS) \
 		-L$(CUDA_HOME)/lib64 -lcublas -lcudart -lstdc++
 	@# -lstdc++: the nvcc-compiled .cu object pulls in C++ ABI (__cxa_guard*/libstdc++);
 	@#          the final link is driven by gcc, which doesn't add it automatically.
@@ -172,6 +172,10 @@ qwen_tts_cuda_kernels.o: qwen_tts_cuda_kernels.cu
 
 # GPU-resident fused Talker step (needs cuBLAS + the C headers). -I. for qwen_tts.h.
 qwen_tts_cuda_talker.o: qwen_tts_cuda_talker.cu
+	$(NVCC) $(NVCC_ARCH) -O3 -I. -I$(CUDA_HOME)/include -c -o $@ $<
+
+# GPU-resident ConvNet speech decoder (M3).
+qwen_tts_cuda_decoder.o: qwen_tts_cuda_decoder.cu
 	$(NVCC) $(NVCC_ARCH) -O3 -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
 # CP micro-benchmark: separate binary instrumented with -DCP_MICROBENCH.

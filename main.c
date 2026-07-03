@@ -1459,6 +1459,12 @@ int main(int argc, char **argv) {
                 g_cuda_decoder_on = 1;
                 fprintf(stderr, "GPU Speech-decoder convs via cuBLAS ENABLED\n");
             }
+            /* M3 (real): GPU-RESIDENT ConvNet decoder — QWEN_CUDA_CONVDEC=1. */
+            if (bk == QWEN_BACKEND_CUDA && getenv("QWEN_CUDA_CONVDEC")) {
+                extern int g_cuda_decoder_conv_on;
+                g_cuda_decoder_conv_on = 1;
+                fprintf(stderr, "GPU-RESIDENT ConvNet decoder ENABLED\n");
+            }
 #endif
         }
     }

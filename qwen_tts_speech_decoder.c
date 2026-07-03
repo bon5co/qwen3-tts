@@ -1234,10 +1234,22 @@ void qwen_sd_stream_free(qwen_sd_stream_state_t *st) {
  * on a signal in channel-first format [latent_dim, n_frames].
  * Returns audio samples. This is the same pipeline as steps 7-10 in the
  * full decode, extracted as a helper to avoid duplication. */
+#ifdef QWEN_HAVE_CUDA
+extern int g_cuda_decoder_conv_on;
+extern int qwen_cuda_conv_decoder_run(void *ctx, float *signal, int cur_ch, int cur_len, float **audio_out, int *n_out);
+#endif
+
 static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
                                  float *signal, int cur_ch, int cur_len,
                                  float **audio_out, int *n_samples_out) {
     qwen_speech_decoder_t *sd = &ctx->speech_dec;
+#ifdef QWEN_HAVE_CUDA
+    if (g_cuda_decoder_conv_on) {   /* GPU-resident ConvNet decoder (M3): activations stay on device */
+        int rc = qwen_cuda_conv_decoder_run(ctx, signal, cur_ch, cur_len, audio_out, n_samples_out);
+        free(signal);   /* the GPU path copies signal in; free the host copy here */
+        return rc;
+    }
+#endif
 
     /* ConvNeXt upsample (2 blocks, 2x each → 4x total) */
     for (int b = 0; b < 2; b++) {
