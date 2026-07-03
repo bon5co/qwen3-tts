@@ -945,6 +945,7 @@ int main(int argc, char **argv) {
     int run_self_test = 0; /* --self-test: kernel numeric self-test (matvec vs f32 ref) and exit */
     int run_matmat_bench = 0; /* --matmat-bench: batched matmat vs B*matvec throughput, per precision, exit */
     int run_gpu_selftest = 0; /* --gpu-selftest: GPU-vs-CPU matvec/matmat correctness + timing, exit (GPU builds) */
+    int run_gpu_selftest_talker = 0; /* --gpu-selftest-talker: fused resident Talker step vs CPU (needs model) */
     const char *gpu_backend_str = NULL; /* --backend cpu|metal|cuda (v1: selects the --gpu-selftest target) */
     float cp_roughness = 0.0f;        /* --roughness: q2-down blend on the CP (texture knob) */
     const char *steer_vector_path = NULL; /* --steer-vector: emotion control vector (.vec) */
@@ -1054,6 +1055,7 @@ int main(int argc, char **argv) {
         {"matmat-bench",  no_argument,       0, 1038},
         {"gpu-selftest",  no_argument,       0, 1070},
         {"backend",       required_argument, 0, 1071},
+        {"gpu-selftest-talker", no_argument, 0, 1072},
         {"roughness",     required_argument, 0, 1028},
         {"steer-vector",  required_argument, 0, 1029},
         {"steer-weight",  required_argument, 0, 1030},
@@ -1129,6 +1131,7 @@ int main(int argc, char **argv) {
             case 1038: run_matmat_bench = 1; break;
             case 1070: run_gpu_selftest = 1; break;
             case 1071: gpu_backend_str = optarg; break;
+            case 1072: run_gpu_selftest_talker = 1; break;
             case 1028: cp_roughness = (float)atof(optarg); roughness_set = 1; break;
             case 1029: steer_vector_path = optarg; break;
             case 1030: cp_steer_weight = (float)atof(optarg); steer_weight_set = 1; break;
@@ -1301,7 +1304,8 @@ int main(int argc, char **argv) {
     }
     /* --save-voice without --text = create voice only (no generation) */
     int create_voice_only = (save_voice && !text && serve_port <= 0);
-    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench) {
+    if (!text && !compose_spec && serve_port <= 0 && !create_voice_only && !run_batch_test && !run_batch_bench
+        && !run_gpu_selftest_talker) {
         fprintf(stderr, "Error: --text, --compose or --serve is required\n");
         return 1;
     }
@@ -1379,6 +1383,51 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to load model\n");
         return 1;
     }
+
+#if defined(QWEN_HAVE_CUDA)
+    /* --gpu-selftest-talker: validate the GPU-resident fused Talker step against the CPU
+     * qwen_talker_step (same weights, same deterministic embeds, each builds its own KV).
+     * Correctness gate for the fused-forward epic (plan_v4). GPU builds only; needs the model. */
+    if (run_gpu_selftest_talker) {
+        extern int qwen_talker_step(qwen_tts_ctx_t *, float *, float *);
+        extern void *qwen_cuda_talker_init(qwen_tts_ctx_t *);
+        extern void  qwen_cuda_talker_step(void *, const float *, float *, int);
+        extern void  qwen_cuda_talker_free(void *);
+        int h = ctx->config.hidden_size, N = 6, fail = 0;
+        float *emb = (float *)malloc((size_t)N * h * sizeof(float));
+        float *hc  = (float *)malloc((size_t)N * h * sizeof(float));
+        float *hg  = (float *)malloc((size_t)N * h * sizeof(float));
+        uint64_t rng = 0x1234567ull;
+        for (int i = 0; i < N * h; i++) { rng = rng * 6364136223846793005ull + 1442695040888963407ull;
+            emb[i] = (float)((rng >> 40) / (double)(1u << 24)) * 2.0f - 1.0f; }
+        ctx->ml_steer = NULL; ctx->kv_len = 0;
+        for (int s = 0; s < N; s++) qwen_talker_step(ctx, emb + (size_t)s * h, hc + (size_t)s * h);
+        void *st = qwen_cuda_talker_init(ctx);
+        if (!st) { fprintf(stderr, "gpu-selftest-talker: init failed\n"); return 1; }
+        for (int s = 0; s < N; s++) qwen_cuda_talker_step(st, emb + (size_t)s * h, hg + (size_t)s * h, s);
+        qwen_cuda_talker_free(st);
+        for (int s = 0; s < N; s++) {
+            double mx = 0, ref = 0, se = 0, sr = 0; int argmax_c = 0, argmax_g = 0;
+            double bc = -1e30, bg = -1e30;
+            for (int i = 0; i < h; i++) {
+                double c = hc[s*h+i], g = hg[s*h+i], d = fabs(c - g);
+                if (d > mx) mx = d; if (fabs(c) > ref) ref = fabs(c);
+                se += d*d; sr += c*c;
+                if (c > bc) { bc = c; argmax_c = i; }
+                if (g > bg) { bg = g; argmax_g = i; }
+            }
+            double rel = mx / (ref + 1e-9), rmsrel = sqrt(se) / (sqrt(sr) + 1e-9);
+            printf("  step %d: max-rel=%.3e  RMS-rel=%.3e  argmax(cpu=%d gpu=%d %s)  %s\n",
+                   s, rel, rmsrel, argmax_c, argmax_g, argmax_c==argmax_g?"match":"FORK",
+                   rmsrel < 2e-3 ? "PASS" : "FAIL");
+            if (!(rmsrel < 2e-3)) fail = 1;
+        }
+        printf("gpu-selftest-talker: %s\n", fail ? "FAIL" : "PASS");
+        free(emb); free(hc); free(hg);
+        qwen_tts_unload(ctx);
+        return fail;
+    }
+#endif
 
 #if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)
     /* Optional GPU offload (opt-in): route the bf16 matvec hot path through the

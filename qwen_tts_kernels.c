@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>       /* clock_gettime / CLOCK_MONOTONIC / struct timespec (matmat-bench).
+                         * macOS pulls this in transitively; Linux (esp. aarch64) needs it explicit. */
 #include <stdatomic.h>
 #include <sys/types.h>
 #ifdef __APPLE__

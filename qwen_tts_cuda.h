@@ -52,6 +52,13 @@ void  qwen_cuda_conv1d(float *out, const float *in, const float *weight, const f
 void  qwen_cuda_conv_transpose1d(float *out, const float *in, const float *weight, const float *bias,
                                  int in_ch, int out_ch, int in_len, int out_len, int ksz, int stride);
 
+/* GPU-RESIDENT fused Talker step (qwen_tts_cuda_talker.cu, nvcc). Weights+KV resident;
+ * one sync/step. init reads the loaded model; step runs the whole Talker step on-device. */
+struct qwen_tts_ctx;
+void *qwen_cuda_talker_init(struct qwen_tts_ctx *ctx);
+void  qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
+void  qwen_cuda_talker_free(void *state);
+
 #ifdef __cplusplus
 }
 #endif
