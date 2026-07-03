@@ -37,30 +37,33 @@ extern "C" {
 
 /* ---- kernels (device pointers, NO per-op copy) -------------------------- */
 
-/* y[rows] = W[rows,cols] @ x[cols].  W row-major bf16, x/y f32.  One block per output row;
- * threads stride over cols, warp/block reduce. Reads bf16 weights (half the bytes of fp32). */
+/* y[rows] = W[rows,cols] @ x[cols].  W row-major bf16, x/y f32.  ONE WARP per output row:
+ * 32 lanes stride over cols (coalesced bf16 reads), reduce via __shfl (no __syncthreads, no
+ * shared mem). Bandwidth-efficient (each lane does cols/32 MACs) — approaches the DRAM limit,
+ * unlike a 256-thread tree reduce where the reduction dominates the tiny per-thread work. */
 __global__ void k_matvec_bf16(const __nv_bfloat16 *W, const float *x, float *y, int rows, int cols) {
-    int row = blockIdx.x; if (row >= rows) return;
+    int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
     const __nv_bfloat16 *wr = W + (size_t)row * cols;
-    extern __shared__ float red[];
     float s = 0.f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) s += __bfloat162float(wr[i]) * x[i];
-    red[threadIdx.x] = s; __syncthreads();
-    for (int st = blockDim.x/2; st > 0; st >>= 1) { if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x+st]; __syncthreads(); }
-    if (threadIdx.x == 0) y[row] = red[0];
+    for (int i = lane; i < cols; i += 32) s += __bfloat162float(wr[i]) * x[i];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) y[row] = s;
 }
 
-/* y[rows] = diag(scale) · (W_int8[rows,cols] @ x[cols]).  int8 weight (1 byte, half of bf16) ×
- * f32 activation, per-row scale. Bandwidth-optimal for the decode; keeps the activation f32. */
+/* Same, int8 weight (1 byte) × f32 activation, per-row scale. Warp-per-row. */
 __global__ void k_matvec_int8(const int8_t *W, const float *scale, const float *x, float *y, int rows, int cols) {
-    int row = blockIdx.x; if (row >= rows) return;
+    int row = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    int lane = threadIdx.x & 31;
+    if (row >= rows) return;
     const int8_t *wr = W + (size_t)row * cols;
-    extern __shared__ float red[];
     float s = 0.f;
-    for (int i = threadIdx.x; i < cols; i += blockDim.x) s += (float)wr[i] * x[i];
-    red[threadIdx.x] = s; __syncthreads();
-    for (int st = blockDim.x/2; st > 0; st >>= 1) { if (threadIdx.x < st) red[threadIdx.x] += red[threadIdx.x+st]; __syncthreads(); }
-    if (threadIdx.x == 0) y[row] = scale[row] * red[0];
+    for (int i = lane; i < cols; i += 32) s += (float)wr[i] * x[i];
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) s += __shfl_down_sync(0xffffffffu, s, o);
+    if (lane == 0) y[row] = scale[row] * s;
 }
 
 __global__ void k_rmsnorm_full(const float *x, const float *w, float *y, int dim, float eps) {
@@ -166,10 +169,12 @@ static float *up_f32(const float *w, size_t n) {
     float *d=NULL; CK(cudaMalloc(&d,n*sizeof(float)));
     CK(cudaMemcpy(d,w,n*sizeof(float),cudaMemcpyHostToDevice)); return d;
 }
-/* dispatch: scale!=NULL → int8 weight path; else bf16. */
+/* dispatch: scale!=NULL → int8 weight path; else bf16. Warp-per-row: one warp (32 lanes) per
+ * output row, TPB/32 rows per block. No shared mem. */
 static inline void mv(const void *W, const float *scale, const float *dX, float *dY, int rows, int cols) {
-    if (scale) k_matvec_int8<<<rows,TPB,TPB*sizeof(float)>>>((const int8_t*)W, scale, dX, dY, rows, cols);
-    else       k_matvec_bf16<<<rows,TPB,TPB*sizeof(float)>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
+    int grid = CEIL(rows*32, TPB);
+    if (scale) k_matvec_int8<<<grid,TPB>>>((const int8_t*)W, scale, dX, dY, rows, cols);
+    else       k_matvec_bf16<<<grid,TPB>>>((const __nv_bfloat16*)W, dX, dY, rows, cols);
 }
 /* per-weight upload: prefer int8 (half the bytes of bf16) when the engine quantized it. */
 #define UPW(dst, dsts, w8, w8s, wbf, n, rows) do { \
