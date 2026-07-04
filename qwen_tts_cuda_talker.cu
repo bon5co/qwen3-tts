@@ -533,6 +533,9 @@ extern "C" void qwen_cuda_talker_batch_free(void *st){
  * throughput scaling (batched ms/frame for B seqs vs single ms/frame for 1 seq). */
 static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3+t.tv_nsec/1e6; }
 extern "C" void qwen_cuda_talker_free(void *);   /* defined below (after the CP section) */
+extern "C" void *qwen_cuda_cp_batch_init(void *, int);   /* defined below (CP section) */
+extern "C" void  qwen_cuda_cp_batch_step(void *, float *, const int *);
+extern "C" void  qwen_cuda_cp_batch_free(void *);
 extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
     int H=ctx->config.hidden_size, kvm=ctx->kv_max;
     if(frames>kvm-2) frames=kvm-2; if(frames<8) frames=8;
@@ -566,6 +569,45 @@ extern "C" int qwen_cuda_batch_selftest(qwen_tts_ctx_t *ctx, int B, int frames){
             B,frames,ts,tb,B,tb/B, B*ts/tb);
     free(e1);free(eB);free(h1);free(hB);free(posB);
     qwen_cuda_talker_batch_free(Bs); qwen_cuda_talker_free(S);
+
+    /* --- Code Predictor: correctness + throughput (16 passes/frame, the CP loop) --- */
+    extern void *qwen_cuda_cp_init(qwen_tts_ctx_t *);
+    extern void  qwen_cuda_cp_step(void *, float *, int);
+    extern void  qwen_cuda_cp_free(void *);
+    int cph=ctx->config.cp_hidden_size, cpkv=ctx->cp_kv_max;
+    void *CS=qwen_cuda_cp_init(ctx); void *CB=qwen_cuda_cp_batch_init(CS,B);
+    if(CS&&CB){
+        float *cx1=(float*)malloc(cph*sizeof(float)), *cxB=(float*)malloc((size_t)B*cph*sizeof(float));
+        int *cpos=(int*)malloc(B*sizeof(int));
+        double cdiff=0; int cchk=cpkv<16?cpkv:16;
+        for(int p=0;p<cchk;++p){
+            float v; for(int i=0;i<cph;++i){ v=0.02f*sinf(0.13f*(i+1)+0.2f*p); cx1[i]=v; for(int b=0;b<B;++b) cxB[(size_t)b*cph+i]=v; }
+            for(int b=0;b<B;++b) cpos[b]=p;
+            qwen_cuda_cp_step(CS,cx1,p);
+            qwen_cuda_cp_batch_step(CB,cxB,cpos);
+            for(int b=0;b<B;++b) for(int i=0;i<cph;++i){ double d=fabs(cxB[(size_t)b*cph+i]-cx1[i]); if(d>cdiff)cdiff=d; }
+        }
+        fprintf(stderr,"batch selftest: CP correctness max|batched-single|=%.2e over %d steps (%s)\n",
+                cdiff,cchk, cdiff<1e-3?"PASS":"FAIL");
+        /* throughput: 16 passes/frame (CP KV holds 16), pos 0..15 lockstep */
+        int passes=cpkv<16?cpkv:16;
+        for(int i=0;i<cph;++i){ float v=0.02f*sinf(0.13f*(i+1)); cx1[i]=v; for(int b=0;b<B;++b) cxB[(size_t)b*cph+i]=v; }
+        for(int p=0;p<passes;++p) qwen_cuda_cp_step(CS,cx1,p);                 /* warmup */
+        for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos); }
+        int NF=frames/4; if(NF<10) NF=10;
+        double c0=now_ms();
+        for(int f=0;f<NF;++f) for(int p=0;p<passes;++p) qwen_cuda_cp_step(CS,cx1,p);
+        double cs=(now_ms()-c0)/NF;
+        c0=now_ms();
+        for(int f=0;f<NF;++f) for(int p=0;p<passes;++p){ for(int b=0;b<B;++b) cpos[b]=p; qwen_cuda_cp_batch_step(CB,cxB,cpos); }
+        double cb=(now_ms()-c0)/NF;
+        fprintf(stderr,"batch CP throughput (B=%d, %d passes/frame): single %.2f ms/f (1 seq) | batched %.2f ms/f (%d seq) | GAIN %.2fx\n",
+                B,passes,cs,cb,B, B*cs/cb);
+        fprintf(stderr,"batch GEN (Talker+CP) aggregate throughput GAIN (B=%d): %.2fx\n", B, B*(ts+cs)/(tb+cb));
+        free(cx1);free(cxB);free(cpos);
+        if(cdiff>=1e-3) maxdiff=cdiff;
+    }
+    if(CB) qwen_cuda_cp_batch_free(CB); if(CS) qwen_cuda_cp_free(CS);
     return maxdiff<1e-3?0:1;
 }
 
@@ -678,6 +720,80 @@ extern "C" void qwen_cuda_cp_step(void *st, float *x, int pos) {
     CK(cudaGraphLaunch(s->exec, cudaStreamPerThread));
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     CK(cudaMemcpy(x,s->x,H*sizeof(float),cudaMemcpyDeviceToHost));   /* residual, NOT normed */
+}
+
+/* ---- BATCHED CP step (B sequences in lockstep through one pass; caller does the per-seq
+ * argmax + embed between passes). Reuses the _b kernels + mvB. No final norm (caller norms). --- */
+typedef struct {
+    int B, hidden, q_dim, kv_dim, inter, n_heads, n_kv, head_dim, n_layers, kv_max; float eps;
+    void **wq,**wk,**wv,**wo,**wgu,**wdn; float **wqs,**wks,**wvs,**wos,**wgus,**wdns;
+    float **inorm,**pnorm,**qn,**kn; float *rope_cos,*rope_sin;
+    float *kcache,*vcache; float *x,*xn,*q,*k,*v,*attn,*proj,*gate,*gu;
+    int prec; int *d_pos;
+} cuda_cp_batch_t;
+
+static void cp_body_batch(cuda_cp_batch_t *s){
+    int B=s->B,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,hd=s->head_dim,half=hd/2;
+    int nh=s->n_heads,nkv=s->n_kv,inter=s->inter; float scale=1.f/sqrtf((float)hd);
+    for(int l=0;l<s->n_layers;++l){
+        k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->inorm[l],s->xn,H,s->eps);
+        mvB(s->prec,s->wq[l],s->wqs[l],s->xn,s->q,qd,H,B);
+        mvB(s->prec,s->wk[l],s->wks[l],s->xn,s->k,kvd,H,B);
+        mvB(s->prec,s->wv[l],s->wvs[l],s->xn,s->v,kvd,H,B);
+        k_rmsnorm_ph_b<<<B*nh,TPB,TPB*sizeof(float)>>>(s->q,s->qn[l],hd,nh,qd,s->eps);
+        k_rmsnorm_ph_b<<<B*nkv,TPB,TPB*sizeof(float)>>>(s->k,s->kn[l],hd,nkv,kvd,s->eps);
+        k_rope_neox_b<<<CEIL(B*nh*half,TPB),TPB>>>(s->q,s->rope_cos,s->rope_sin,nh,hd,s->d_pos,qd,B);
+        k_rope_neox_b<<<CEIL(B*nkv*half,TPB),TPB>>>(s->k,s->rope_cos,s->rope_sin,nkv,hd,s->d_pos,kvd,B);
+        k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->k,B*kvd);
+        k_trunc_bf16<<<CEIL(B*kvd,TPB),TPB>>>(s->v,B*kvd);
+        float *Kl=s->kcache+(size_t)l*B*s->kv_max*kvd, *Vl=s->vcache+(size_t)l*B*s->kv_max*kvd;
+        k_kv_store_b<<<CEIL(B*kvd,TPB),TPB>>>(Kl,Vl,s->k,s->v,kvd,s->d_pos,s->kv_max,B);
+        k_attn_b<<<B*nh,hd,hd*sizeof(float)>>>(s->q,Kl,Vl,s->attn,nh,nkv,hd,scale,s->d_pos,s->kv_max,qd,kvd);
+        mvB(s->prec,s->wo[l],s->wos[l],s->attn,s->proj,H,qd,B);
+        k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
+        k_rmsnorm_full_b<<<B,TPB,TPB*sizeof(float)>>>(s->x,s->pnorm[l],s->xn,H,s->eps);
+        mvB(s->prec,s->wgu[l],s->wgus[l],s->xn,s->gu,2*inter,H,B);
+        k_swiglu_il_b<<<CEIL(B*inter,TPB),TPB>>>(s->gu,s->gate,inter,B);
+        mvB(s->prec,s->wdn[l],s->wdns[l],s->gate,s->proj,H,inter,B);
+        k_add_ip<<<CEIL(B*H,TPB),TPB>>>(s->x,s->proj,B*H);
+    }
+}
+extern "C" void *qwen_cuda_cp_batch_init(void *single, int B){
+    cuda_cp_t *ss=(cuda_cp_t*)single; if(!ss||B<1||B>QB_MAX) return NULL;
+    cuda_cp_batch_t *s=(cuda_cp_batch_t*)calloc(1,sizeof(*s));
+    s->B=B; s->hidden=ss->hidden; s->q_dim=ss->q_dim; s->kv_dim=ss->kv_dim; s->inter=ss->inter;
+    s->n_heads=ss->n_heads; s->n_kv=ss->n_kv; s->head_dim=ss->head_dim; s->n_layers=ss->n_layers;
+    s->kv_max=ss->kv_max; s->eps=ss->eps; s->prec=ss->prec;
+    s->wq=ss->wq; s->wk=ss->wk; s->wv=ss->wv; s->wo=ss->wo; s->wgu=ss->wgu; s->wdn=ss->wdn;
+    s->wqs=ss->wqs; s->wks=ss->wks; s->wvs=ss->wvs; s->wos=ss->wos; s->wgus=ss->wgus; s->wdns=ss->wdns;
+    s->inorm=ss->inorm; s->pnorm=ss->pnorm; s->qn=ss->qn; s->kn=ss->kn;
+    s->rope_cos=ss->rope_cos; s->rope_sin=ss->rope_sin;
+    int L=s->n_layers,H=s->hidden,qd=s->q_dim,kvd=s->kv_dim,inter=s->inter;
+    CK(cudaMalloc(&s->kcache,(size_t)L*B*s->kv_max*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->vcache,(size_t)L*B*s->kv_max*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->x,(size_t)B*H*sizeof(float)));   CK(cudaMalloc(&s->xn,(size_t)B*H*sizeof(float)));
+    CK(cudaMalloc(&s->q,(size_t)B*qd*sizeof(float)));   CK(cudaMalloc(&s->k,(size_t)B*kvd*sizeof(float)));
+    CK(cudaMalloc(&s->v,(size_t)B*kvd*sizeof(float)));  CK(cudaMalloc(&s->attn,(size_t)B*qd*sizeof(float)));
+    CK(cudaMalloc(&s->proj,(size_t)B*H*sizeof(float))); CK(cudaMalloc(&s->gate,(size_t)B*inter*sizeof(float)));
+    CK(cudaMalloc(&s->gu,(size_t)B*2*inter*sizeof(float)));
+    CK(cudaMalloc(&s->d_pos,B*sizeof(int)));
+    return s;
+}
+/* x=[B][cp_h] host (each row = the caller's per-seq embed/residual seed), pos_arr=[B] host;
+ * x updated in place with the B residual streams (caller norms + argmaxes each). */
+extern "C" void qwen_cuda_cp_batch_step(void *st,float *x,const int *pos_arr){
+    cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; int B=s->B,H=s->hidden;
+    CK(cudaMemcpy(s->x,x,(size_t)B*H*sizeof(float),cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(s->d_pos,pos_arr,B*sizeof(int),cudaMemcpyHostToDevice));
+    cp_body_batch(s);
+    CK(cudaStreamSynchronize(cudaStreamPerThread));
+    CK(cudaMemcpy(x,s->x,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
+}
+extern "C" void qwen_cuda_cp_batch_free(void *st){
+    cuda_cp_batch_t *s=(cuda_cp_batch_t*)st; if(!s) return;
+    cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
+    cudaFree(s->k);cudaFree(s->v);cudaFree(s->attn);cudaFree(s->proj);cudaFree(s->gate);
+    cudaFree(s->gu);cudaFree(s->d_pos); free(s);
 }
 
 extern "C" void qwen_cuda_cp_free(void *st) {
