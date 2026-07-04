@@ -748,6 +748,7 @@ void *g_cuda_cp_state = NULL;
 void *g_cuda_cp_batch_state = NULL;
 #ifdef QWEN_HAVE_METAL
 void *g_metal_cp_state = NULL;   /* GPU-resident fused CP step (Metal, G2) */
+void *g_metal_cp_frame_state = NULL;   /* device-frame CP (whole 16-pass loop on GPU, 1 sync/frame) */
 #endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_cp_step(void *state, float *x, int pos);
@@ -809,6 +810,17 @@ int qwen_cp_predict(qwen_tts_ctx_t *ctx, float *talker_hidden, int code0, int *o
     qwen_tts_config_t *c = &ctx->config;
     int cp_h = c->cp_hidden_size;
     int emb_dim = ctx->cp_emb_dim;  /* talker_hidden for 1.7B, cp_hidden for 0.6B */
+
+#ifdef QWEN_HAVE_METAL
+    /* Device-frame CP: whole 16-pass RVQ loop + argmax + embed on GPU, 1 sync/frame (the M1 win).
+     * Falls back to the CPU/per-pass loop for steer/roughness/teacher-forcing. */
+    { extern void *g_metal_cp_frame_state; extern void qwen_metal_cp_frame(void *, const float *, int, int *);
+      if (g_metal_cp_frame_state && !(ctx->cp_steer_vec && ctx->cp_steer_weight != 0.0f)
+          && ctx->cp_roughness <= 0.0f && !ctx->tf_ref_codes) {
+        qwen_metal_cp_frame(g_metal_cp_frame_state, talker_hidden, code0, out_codes);
+        return 0;
+      } }
+#endif
 
     ql_init();  /* one-time env probe (QWEN_DUMP_CODES / QWEN_FFN_SPARSITY / QWEN_STEER_CAPTURE) */
 

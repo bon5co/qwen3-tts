@@ -305,7 +305,27 @@ static const char *QWEN_METAL_SRC =
 "}\n"
 /* in-place a += b */
 "kernel void eadd_ip(device float *a [[buffer(0)]], device const float *b [[buffer(1)]],\n"
-"    uint i [[thread_position_in_grid]]) { a[i] += b[i]; }\n";
+"    uint i [[thread_position_in_grid]]) { a[i] += b[i]; }\n"
+/* ---- device-frame CP: embed gather + argmax (16 passes on GPU, 1 sync/frame) ---------- */
+/* out[i] = bf16_to_f32(table[idx*dim + i]); idx = code[cslot] (device int). code<0 → zeros. */
+"kernel void embed_gather_bf16(device const ushort *table [[buffer(0)]], device const int *code [[buffer(1)]],\n"
+"    device float *out [[buffer(2)]], constant uint &dim [[buffer(3)]], constant uint &cslot [[buffer(4)]],\n"
+"    constant uint &vocab [[buffer(5)]], uint i [[thread_position_in_grid]]) {\n"
+"    if (i >= dim) return; int idx = code[cslot];\n"
+"    out[i] = (idx >= 0 && (uint)idx < vocab) ? bf16_to_f32(table[(ulong)idx*dim + i]) : 0.0f;\n"
+"}\n"
+"kernel void copy_vec(device const float *src [[buffer(0)]], device float *dst [[buffer(1)]],\n"
+"    uint i [[thread_position_in_grid]]) { dst[i] = src[i]; }\n"
+/* argmax over logits[rows]: one threadgroup, reduce (max,idx). Writes code[cslot]. */
+"kernel void argmax_vec(device const float *logits [[buffer(0)]], device int *code [[buffer(1)]],\n"
+"    constant uint &rows [[buffer(2)]], constant uint &cslot [[buffer(3)]],\n"
+"    uint tid [[thread_position_in_threadgroup]], uint tc [[threads_per_threadgroup]]) {\n"
+"    threadgroup float mv[256]; threadgroup int mi[256]; float best=-1e30f; int bi=0;\n"
+"    for (uint r=tid;r<rows;r+=tc){ float v=logits[r]; if(v>best){best=v;bi=(int)r;} }\n"
+"    mv[tid]=best; mi[tid]=bi; threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    for (uint st=tc/2;st>0;st>>=1){ if(tid<st){ if(mv[tid+st]>mv[tid]){mv[tid]=mv[tid+st];mi[tid]=mi[tid+st];} } threadgroup_barrier(mem_flags::mem_threadgroup); }\n"
+"    if (tid==0) code[cslot] = mi[0];\n"
+"}\n";
 
 /* ---- context: device, queue, pipelines, resident weight cache, IO pool --- */
 typedef struct { const void *key; void *buf; } wcache_ent;   /* buf = bridge-retained id<MTLBuffer> */
@@ -320,6 +340,7 @@ typedef struct {
     void *pso_rms_b, *pso_swiglu_b;
     /* fused-step pipelines (resident Talker/CP) */
     void *pso_rope_neox, *pso_rms_ph, *pso_kv_store, *pso_attn_res, *pso_eadd_ip;
+    void *pso_embed_gather, *pso_copy_vec, *pso_argmax;   /* device-frame CP */
     /* resident weight cache (by pointer) */
     wcache_ent *wc; int wc_n, wc_cap;
     /* reusable IO buffers (grow on demand) */
@@ -379,12 +400,16 @@ void *qwen_metal_init(void) {
         c->pso_kv_store = make_pso(dev, lib, "kv_store");
         c->pso_attn_res = make_pso(dev, lib, "attn_resident");
         c->pso_eadd_ip = make_pso(dev, lib, "eadd_ip");
+        c->pso_embed_gather = make_pso(dev, lib, "embed_gather_bf16");
+        c->pso_copy_vec = make_pso(dev, lib, "copy_vec");
+        c->pso_argmax = make_pso(dev, lib, "argmax_vec");
         if (!c->pso_matvec_bf16 || !c->pso_matmat_bf16 || !c->pso_matvec_int8 ||
             !c->pso_matvec_q4_0 || !c->pso_rms || !c->pso_swiglu || !c->pso_silu ||
             !c->pso_add || !c->pso_mul || !c->pso_scale || !c->pso_rope ||
             !c->pso_snake || !c->pso_attn || !c->pso_matmat_f32 || !c->pso_conv1d || !c->pso_convt1d ||
             !c->pso_rms_b || !c->pso_swiglu_b ||
-            !c->pso_rope_neox || !c->pso_rms_ph || !c->pso_kv_store || !c->pso_attn_res || !c->pso_eadd_ip) {
+            !c->pso_rope_neox || !c->pso_rms_ph || !c->pso_kv_store || !c->pso_attn_res || !c->pso_eadd_ip ||
+            !c->pso_embed_gather || !c->pso_copy_vec || !c->pso_argmax) {
             qwen_metal_free(c); return NULL;
         }
         return c;
@@ -409,6 +434,7 @@ void qwen_metal_free(void *ctx) {
     release_ptr(&c->pso_rms_b); release_ptr(&c->pso_swiglu_b);
     release_ptr(&c->pso_rope_neox); release_ptr(&c->pso_rms_ph); release_ptr(&c->pso_kv_store);
     release_ptr(&c->pso_attn_res); release_ptr(&c->pso_eadd_ip);
+    release_ptr(&c->pso_embed_gather); release_ptr(&c->pso_copy_vec); release_ptr(&c->pso_argmax);
     release_ptr(&c->queue); release_ptr(&c->device);
     free(c);
 }
@@ -1490,6 +1516,47 @@ void *qwen_metal_cp_init(void *metal_ctx, qwen_tts_ctx_t *ctx) {
     }
 }
 
+/* Encode the 5-layer CP transformer into an existing encoder (no commit). xb = residual in/out. */
+static void enc_cp_layers(id<MTLComputeCommandEncoder> e, qwen_metal_talker_t *s, uint32_t upos) {
+    qwen_metal_ctx *c = s->mc;
+    id<MTLBuffer> xb=MTB(s->xb), xnb=MTB(s->xnb), qb=MTB(s->qb), kb=MTB(s->kb), vb=MTB(s->vb);
+    id<MTLBuffer> attnb=MTB(s->attnb), projb=MTB(s->projb), gateb=MTB(s->gateb), gub=MTB(s->gub);
+    id<MTLBuffer> kc=MTB(s->kcache), vc=MTB(s->vcache);
+    int H=s->H, qd=s->qd, kvd=s->kvd, hd=s->hd, nh=s->nh, nkv=s->nkv, inter=s->inter;
+    float scale = 1.0f/sqrtf((float)hd);
+    for (int l=0; l<s->L; ++l) {
+        qwen_cp_layer_t *ly = &s->ctx->cp_layers[l];
+        uint32_t kvbase = (uint32_t)((size_t)l*s->kv_max*kvd);
+        enc_rms(e, s, xb, xnb, ly->input_norm, H, 1);
+        enc_mv(e, s, ly->wq_bf16, ly->wq_int8, ly->wq_scale, ly->wq_q4, xnb, qb, qd, H, 0);
+        enc_mv(e, s, ly->wk_bf16, ly->wk_int8, ly->wk_scale, ly->wk_q4, xnb, kb, kvd, H, 0);
+        enc_mv(e, s, ly->wv_bf16, ly->wv_int8, ly->wv_scale, ly->wv_q4, xnb, vb, kvd, H, 1);
+        enc_rms_ph(e, s, qb, ly->q_norm, nh, 0);
+        enc_rms_ph(e, s, kb, ly->k_norm, nkv, 1);
+        enc_rope(e, s, qb, nh, upos, 0);
+        enc_rope(e, s, kb, nkv, upos, 1);
+        { uint32_t ukvd=(uint32_t)kvd; [e setComputePipelineState:MTB(c->pso_kv_store)];
+          [e setBuffer:kc offset:0 atIndex:0]; [e setBuffer:vc offset:0 atIndex:1]; [e setBuffer:kb offset:0 atIndex:2]; [e setBuffer:vb offset:0 atIndex:3];
+          [e setBytes:&ukvd length:4 atIndex:4]; [e setBytes:&upos length:4 atIndex:5]; [e setBytes:&kvbase length:4 atIndex:6];
+          NSUInteger tp=(NSUInteger)kvd<256?(NSUInteger)kvd:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)kvd+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e); }
+        { uint32_t unh=(uint32_t)nh, unkv=(uint32_t)nkv, uhd=(uint32_t)hd; [e setComputePipelineState:MTB(c->pso_attn_res)];
+          [e setBuffer:qb offset:0 atIndex:0]; [e setBuffer:kc offset:0 atIndex:1]; [e setBuffer:vc offset:0 atIndex:2]; [e setBuffer:attnb offset:0 atIndex:3];
+          [e setBytes:&unh length:4 atIndex:4]; [e setBytes:&unkv length:4 atIndex:5]; [e setBytes:&uhd length:4 atIndex:6];
+          [e setBytes:&scale length:4 atIndex:7]; [e setBytes:&upos length:4 atIndex:8]; [e setBytes:&kvbase length:4 atIndex:9];
+          [e dispatchThreadgroups:MTLSizeMake((NSUInteger)nh,1,1) threadsPerThreadgroup:MTLSizeMake((NSUInteger)hd,1,1)]; enc_bar(e); }
+        enc_mv(e, s, ly->wo_bf16, ly->wo_int8, ly->wo_scale, ly->wo_q4, attnb, projb, H, qd, 1);
+        [e setComputePipelineState:MTB(c->pso_eadd_ip)]; [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
+        { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+        enc_rms(e, s, xb, xnb, ly->post_attn_norm, H, 1);
+        enc_mv(e, s, ly->gate_up_fused_bf16, ly->gate_up_fused_int8, ly->gate_up_fused_scale, ly->gate_up_fused_q4, xnb, gub, 2*inter, H, 1);
+        [e setComputePipelineState:MTB(c->pso_swiglu)]; [e setBuffer:gub offset:0 atIndex:0]; [e setBuffer:gateb offset:0 atIndex:1];
+        { NSUInteger tp=(NSUInteger)inter<256?(NSUInteger)inter:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)inter+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+        enc_mv(e, s, ly->down_bf16, ly->down_int8, ly->down_scale, ly->down_q4, gateb, projb, H, inter, 1);
+        [e setComputePipelineState:MTB(c->pso_eadd_ip)]; [e setBuffer:xb offset:0 atIndex:0]; [e setBuffer:projb offset:0 atIndex:1];
+        { NSUInteger tp=(NSUInteger)H<256?(NSUInteger)H:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)H+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+    }
+}
+
 /* x[cp_h] in/out (residual stream; caller norms). pos = the CP pass position (0..15). */
 void qwen_metal_cp_step(void *st, float *x, int pos) {
     qwen_metal_talker_t *s = st; if (!s) return;
@@ -1559,3 +1626,116 @@ void qwen_metal_cp_step(void *st, float *x, int pos) {
 }
 
 void qwen_metal_cp_free(void *st) { qwen_metal_talker_free(st); }
+
+/* ======================================================================== *
+ *  DEVICE-FRAME CP (Metal): the whole 16-pass RVQ loop + argmax + embed on GPU,
+ *  ONE command buffer / ONE wait per frame (vs 16 commit+wait). The M1 win — the
+ *  CP was sync-round-trip-bound (measured: 16 waits ≈ 30 ms/f). Mirrors qwen_cp_predict. */
+typedef struct {
+    qwen_metal_talker_t *cp; qwen_tts_ctx_t *ctx; qwen_metal_ctx *mc;
+    int cp_h, emb_dim, h, codebook, cvocab, has_proj, lm_prec;
+    void *emb_buf, *normed, *logits, *codes_dev;
+} qwen_metal_cpframe_t;
+
+void *qwen_metal_cp_frame_init(void *metal_ctx, qwen_tts_ctx_t *ctx) {
+    if (!ctx || !metal_ctx) return NULL;
+    if (!ctx->cp_lm_head_int8[0] && !ctx->cp_lm_head_q4[0] && !ctx->cp_lm_head_bf16[0]) return NULL;
+    @autoreleasepool {
+        qwen_metal_ctx *c = (qwen_metal_ctx *)metal_ctx; qwen_tts_config_t *cf = &ctx->config;
+        qwen_metal_cpframe_t *f = calloc(1, sizeof(*f));
+        f->mc = c; f->ctx = ctx; f->cp_h = cf->cp_hidden_size; f->emb_dim = ctx->cp_emb_dim;
+        f->h = cf->hidden_size; f->codebook = cf->codebook_size; f->cvocab = cf->codec_vocab_size;
+        f->has_proj = (ctx->cp_mtp_proj_bf16 != NULL);
+        f->lm_prec = ctx->cp_lm_head_q4[0] ? 2 : (ctx->cp_lm_head_int8[0] ? 1 : 0);
+        f->cp = (qwen_metal_talker_t *)qwen_metal_cp_init(metal_ctx, ctx);
+        if (!f->cp) { free(f); return NULL; }
+        int emax = f->emb_dim > f->h ? f->emb_dim : f->h;
+        f->emb_buf = (__bridge_retained void *)mk_buf(c, (size_t)emax*sizeof(float));
+        f->normed  = (__bridge_retained void *)mk_buf(c, (size_t)f->cp_h*sizeof(float));
+        f->logits  = (__bridge_retained void *)mk_buf(c, (size_t)f->codebook*sizeof(float));
+        f->codes_dev = (__bridge_retained void *)mk_buf(c, 16*sizeof(int));
+        fprintf(stderr, "Metal CP device-frame ready (proj=%s, lm=%s, 1 sync/frame)\n",
+                f->has_proj?"yes":"identity", f->lm_prec==2?"q4":f->lm_prec==1?"int8":"bf16");
+        return f;
+    }
+}
+
+/* GPU embed→(proj)→cp_x seed for a pass; table bf16, code slot in codes_dev, vocab guard. */
+static void enc_seed(id<MTLComputeCommandEncoder> e, qwen_metal_cpframe_t *f,
+                     const uint16_t *table, uint32_t cslot, uint32_t vocab, int dim) {
+    qwen_metal_ctx *c = f->mc; qwen_metal_talker_t *s = f->cp;
+    id<MTLBuffer> emb = MTB(f->emb_buf), cpx = MTB(s->xb), codes = MTB(f->codes_dev);
+    uint32_t ud=(uint32_t)dim;
+    [e setComputePipelineState:MTB(c->pso_embed_gather)];
+    [e setBuffer:weight_buf(c,table,(size_t)vocab*dim*sizeof(uint16_t)) offset:0 atIndex:0];
+    [e setBuffer:codes offset:0 atIndex:1]; [e setBuffer:emb offset:0 atIndex:2];
+    [e setBytes:&ud length:4 atIndex:3]; [e setBytes:&cslot length:4 atIndex:4]; [e setBytes:&vocab length:4 atIndex:5];
+    { NSUInteger tp=(NSUInteger)dim<256?(NSUInteger)dim:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)dim+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; } enc_bar(e);
+    if (f->has_proj) {
+        enc_mv(e, s, f->ctx->cp_mtp_proj_bf16, NULL, NULL, NULL, emb, cpx, f->cp_h, f->emb_dim, 0);
+        if (f->ctx->cp_mtp_proj_bias) {
+            [e setComputePipelineState:MTB(c->pso_eadd_ip)]; [e setBuffer:cpx offset:0 atIndex:0];
+            [e setBuffer:weight_buf(c,f->ctx->cp_mtp_proj_bias,(size_t)f->cp_h*sizeof(float)) offset:0 atIndex:1];
+            NSUInteger tp=(NSUInteger)f->cp_h<256?(NSUInteger)f->cp_h:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)f->cp_h+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)];
+        }
+        enc_bar(e);
+    } else {
+        [e setComputePipelineState:MTB(c->pso_copy_vec)]; [e setBuffer:emb offset:0 atIndex:0]; [e setBuffer:cpx offset:0 atIndex:1];
+        NSUInteger tp=(NSUInteger)f->cp_h<256?(NSUInteger)f->cp_h:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)f->cp_h+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e);
+    }
+}
+/* rmsnorm(cp_x → normed, cp_norm) + lm_head[g] matvec → logits + argmax → codes_dev[oslot]. */
+static void enc_predict(id<MTLComputeCommandEncoder> e, qwen_metal_cpframe_t *f, int g, uint32_t oslot) {
+    qwen_metal_ctx *c = f->mc; qwen_metal_talker_t *s = f->cp;
+    id<MTLBuffer> normed=MTB(f->normed), logits=MTB(f->logits), codes=MTB(f->codes_dev);
+    enc_rms(e, s, MTB(s->xb), normed, f->ctx->cp_norm, f->cp_h, 1);
+    enc_mv(e, s, f->ctx->cp_lm_head_bf16[g], f->ctx->cp_lm_head_int8[g], f->ctx->cp_lm_head_scale[g],
+           f->ctx->cp_lm_head_q4[g], normed, logits, f->codebook, f->cp_h, 1);
+    uint32_t rows=(uint32_t)f->codebook, os=oslot;
+    [e setComputePipelineState:MTB(c->pso_argmax)];
+    [e setBuffer:logits offset:0 atIndex:0]; [e setBuffer:codes offset:0 atIndex:1];
+    [e setBytes:&rows length:4 atIndex:2]; [e setBytes:&os length:4 atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)]; enc_bar(e);
+}
+
+/* Whole frame: talker_hidden + code0 → out_codes[15], 1 command buffer, 1 wait. */
+void qwen_metal_cp_frame(void *st, const float *talker_hidden, int code0, int *out_codes) {
+    qwen_metal_cpframe_t *f = st; if (!f) return;
+    @autoreleasepool {
+        qwen_metal_ctx *c = f->mc; qwen_metal_talker_t *s = f->cp;
+        id<MTLCommandQueue> q = (__bridge id<MTLCommandQueue>)c->queue;
+        id<MTLBuffer> emb=MTB(f->emb_buf), cpx=MTB(s->xb), codes=MTB(f->codes_dev);
+        ((int *)codes.contents)[0] = code0;   /* codes_dev[0] = code0 (from the Talker) */
+        static int cprof=-1; if(cprof<0) cprof=getenv("QWEN_METAL_PROFILE")?1:0;
+        static double t=0; static long n=0; double t0=cprof?nowms():0;
+        id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        /* pass 0: project talker_hidden → cp_x, transformer(pos 0) */
+        memcpy(emb.contents, talker_hidden, (size_t)f->h*sizeof(float));
+        if (f->has_proj) {
+            enc_mv(e, s, f->ctx->cp_mtp_proj_bf16, NULL, NULL, NULL, emb, cpx, f->cp_h, f->emb_dim, 0);
+            if (f->ctx->cp_mtp_proj_bias) { [e setComputePipelineState:MTB(c->pso_eadd_ip)]; [e setBuffer:cpx offset:0 atIndex:0];
+                [e setBuffer:weight_buf(c,f->ctx->cp_mtp_proj_bias,(size_t)f->cp_h*sizeof(float)) offset:0 atIndex:1];
+                NSUInteger tp=(NSUInteger)f->cp_h<256?(NSUInteger)f->cp_h:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)f->cp_h+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; }
+            enc_bar(e);
+        } else { [e setComputePipelineState:MTB(c->pso_copy_vec)]; [e setBuffer:emb offset:0 atIndex:0]; [e setBuffer:cpx offset:0 atIndex:1];
+            NSUInteger tp=(NSUInteger)f->cp_h<256?(NSUInteger)f->cp_h:256; [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)f->cp_h+tp-1)/tp,1,1) threadsPerThreadgroup:MTLSizeMake(tp,1,1)]; enc_bar(e); }
+        enc_cp_layers(e, s, 0);
+        /* 15 codebooks: g=0 embeds code0 via TALKER codec emb; g>=1 via cp_codec_emb[g-1] */
+        for (int g = 0; g < 15; g++) {
+            if (g == 0) enc_seed(e, f, f->ctx->codec_embedding_bf16, 0, (uint32_t)f->cvocab, f->h);
+            else        enc_seed(e, f, f->ctx->cp_codec_emb_bf16[g-1], (uint32_t)g, (uint32_t)f->codebook, f->emb_dim);
+            enc_cp_layers(e, s, (uint32_t)(g+1));
+            enc_predict(e, f, g, (uint32_t)(g+1));   /* argmax → codes_dev[g+1] = out[g] */
+        }
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        if(cprof){ t+=nowms()-t0; if(++n%50==0) fprintf(stderr,"[MTL-CPFRAME] %.2f ms/frame (1 sync)\n", t/n); }
+        int *cd = (int *)codes.contents; for (int g=0; g<15; g++) out_codes[g] = cd[g+1];
+    }
+}
+void qwen_metal_cp_frame_free(void *st) {
+    qwen_metal_cpframe_t *f = st; if (!f) return;
+    qwen_metal_cp_free(f->cp);
+    void *ps[] = {f->emb_buf, f->normed, f->logits, f->codes_dev};
+    for (unsigned i=0;i<4;++i){ void *p=ps[i]; if(p){ id o=(__bridge_transfer id)p; (void)o; } }
+    free(f);
+}

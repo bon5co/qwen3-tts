@@ -109,6 +109,10 @@ void  qwen_metal_talker_free(void *state);
 void *qwen_metal_cp_init(void *metal_ctx, struct qwen_tts_ctx *ctx);
 void  qwen_metal_cp_step(void *state, float *x, int pos);
 void  qwen_metal_cp_free(void *state);
+/* Device-frame CP: whole 16-pass RVQ loop + argmax + embed on GPU, 1 sync/frame. */
+void *qwen_metal_cp_frame_init(void *metal_ctx, struct qwen_tts_ctx *ctx);
+void  qwen_metal_cp_frame(void *state, const float *talker_hidden, int code0, int *out_codes);
+void  qwen_metal_cp_frame_free(void *state);
 
 #ifdef __cplusplus
 }
