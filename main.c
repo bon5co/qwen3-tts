@@ -1535,10 +1535,11 @@ int main(int argc, char **argv) {
             /* G2: QWEN_METAL_FUSED_TALKER=1 → run the whole Talker step GPU-resident on Metal
              * (weights+KV in MTLBuffers, one command buffer/step) instead of the per-op hook. */
             if (bk == QWEN_BACKEND_METAL && getenv("QWEN_METAL_FUSED_TALKER")) {
-                extern void *g_metal_talker_state;
+                extern void *g_metal_talker_state, *g_metal_cp_state;
                 g_metal_talker_state = qwen_metal_talker_init(gpu_backend->impl, ctx);
-                if (g_metal_talker_state)
-                    fprintf(stderr, "GPU fused Talker step ENABLED (Metal, resident)\n");
+                g_metal_cp_state = qwen_metal_cp_init(gpu_backend->impl, ctx);
+                if (g_metal_talker_state && g_metal_cp_state)
+                    fprintf(stderr, "GPU fused Talker+CP steps ENABLED (Metal, resident)\n");
             }
 #endif
         }

@@ -746,6 +746,9 @@ void *g_cuda_cp_state = NULL;
 /* GPU-resident BATCHED CP step (throughput path). batch_cp_transformer_step delegates to it;
  * the per-seq argmax/embed between passes stay on CPU (in qwen_batch_cp_predict). */
 void *g_cuda_cp_batch_state = NULL;
+#ifdef QWEN_HAVE_METAL
+void *g_metal_cp_state = NULL;   /* GPU-resident fused CP step (Metal, G2) */
+#endif
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_cp_step(void *state, float *x, int pos);
 extern void qwen_cuda_cp_batch_step(void *state, float *x, const int *pos_arr);
@@ -758,6 +761,13 @@ static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, in
 #ifdef QWEN_HAVE_CUDA
     if (g_cuda_cp_state && ctx->cp_roughness <= 0.0f) {
         qwen_cuda_cp_step(g_cuda_cp_state, x, pos);   /* x updated in place (residual stream) */
+        return;
+    }
+#endif
+#ifdef QWEN_HAVE_METAL
+    if (g_metal_cp_state && ctx->cp_roughness <= 0.0f) {
+        extern void qwen_metal_cp_step(void *, float *, int);
+        qwen_metal_cp_step(g_metal_cp_state, x, pos);
         return;
     }
 #endif
