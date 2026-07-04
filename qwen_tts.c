@@ -2289,7 +2289,14 @@ static void *prefill_helper_main(void *arg) {
 
 int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sink) {
     if (B < 1) B = 1;
-    if (ctx->layers[0].wq_bf16 == NULL) return -2;   /* bf16 batched step only */
+    /* The CPU batch path is bf16-only; the GPU batched path (QWEN_CUDA_BATCH) handles int8/q4
+     * on the device, so the bf16 requirement is waived when it will be used. */
+    int want_cuda_batch = 0;
+#ifdef QWEN_HAVE_CUDA
+    { extern void *g_cuda_talker_state, *g_cuda_cp_state;
+      want_cuda_batch = (getenv("QWEN_CUDA_BATCH") && g_cuda_talker_state && g_cuda_cp_state && B <= 8); }
+#endif
+    if (ctx->layers[0].wq_bf16 == NULL && !want_cuda_batch) return -2;   /* CPU batched step is bf16 only */
     int h = ctx->config.hidden_size;
     int kvd = ctx->config.num_kv_heads * ctx->config.head_dim;
     int num_layers = ctx->config.num_layers;
@@ -2304,6 +2311,28 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     qwen_batch_t *bb = qwen_batch_alloc(ctx, B, kv_max);
     if (!bb) return -1;
     bb->force_matvec = force_matvec;
+
+    /* ---- GPU batched Talker+CP (throughput path): opt-in via QWEN_CUDA_BATCH, needs the fused
+     * single states (QWEN_CUDA_FUSED_TALKER --backend cuda). The GPU batched steps maintain their
+     * own device KV (seeded per slot on admit); the 3 batched calls below delegate automatically. */
+    int cuda_batch = 0;
+#ifdef QWEN_HAVE_CUDA
+    extern void *g_cuda_talker_state, *g_cuda_cp_state, *g_cuda_talker_batch_state, *g_cuda_cp_batch_state;
+    extern void *qwen_cuda_talker_batch_init(void *, int);
+    extern void *qwen_cuda_cp_batch_init(void *, int);
+    extern void  qwen_cuda_talker_batch_upload_slot(void *, int, const uint16_t *, const uint16_t *, int, int);
+    extern void  qwen_cuda_talker_batch_free(void *);
+    extern void  qwen_cuda_cp_batch_free(void *);
+    if (want_cuda_batch) {
+        g_cuda_talker_batch_state = qwen_cuda_talker_batch_init(g_cuda_talker_state, B);
+        g_cuda_cp_batch_state = qwen_cuda_cp_batch_init(g_cuda_cp_state, B);
+        cuda_batch = (g_cuda_talker_batch_state && g_cuda_cp_batch_state);
+        if (cuda_batch) fprintf(stderr, "[serve] GPU batched Talker+CP ENABLED (B=%d, matvec->matmat)\n", B);
+        else fprintf(stderr, "[serve] GPU batched init failed — falling back to CPU batch path\n");
+    } else if (getenv("QWEN_CUDA_BATCH") && B > 8) {
+        fprintf(stderr, "[serve] QWEN_CUDA_BATCH: batch-size %d > 8 (QB_MAX) — using CPU batch path\n", B);
+    }
+#endif
 
     /* per-slot state */
     uint8_t *active = (uint8_t *)calloc(B, 1);
@@ -2388,6 +2417,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
                 }
                 memcpy(last_hidden + (size_t)b * h, p->last_hidden, (size_t)h * sizeof(float));
                 tcl[b] = p->tcl; pos[b] = p->pl;
+#ifdef QWEN_HAVE_CUDA
+                if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
+#endif
                 p_temp[b] = p->req.temperature; p_topk[b] = p->req.top_k; p_topp[b] = p->req.top_p;
                 p_rep[b] = p->req.rep_penalty; p_gw[b] = p->req.greedy_warmup; rng[b] = p->req.seed;
                 nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
@@ -2426,6 +2458,9 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
             qwen_rms_norm(last_hidden + (size_t)b * h, ctx->dec_x, ctx->talker_norm, 1, h, eps);
             tcl[b] = ctx->bg_text_content_len;
             pos[b] = pl;
+#ifdef QWEN_HAVE_CUDA
+            if (cuda_batch) qwen_cuda_talker_batch_upload_slot(g_cuda_talker_batch_state, b, bb->kv_k, bb->kv_v, kv_max, pos[b]);
+#endif
             p_temp[b] = req.temperature; p_topk[b] = req.top_k; p_topp[b] = req.top_p;
             p_rep[b] = req.rep_penalty; p_gw[b] = req.greedy_warmup; rng[b] = req.seed;
             nprev[b] = 0; chframes[b] = 0; sframe[b] = 0;
@@ -2536,5 +2571,11 @@ int qwen_tts_serve_continuous(qwen_tts_ctx_t *ctx, int B, qwen_batch_sink_t *sin
     free(nprev); free(chframes); free(sframe); free(prev_tok); free(chcodes);
     free(last_hidden); free(logits); free(step_embed); free(code0); free(cpcodes);
     qwen_batch_free(bb);
+#ifdef QWEN_HAVE_CUDA
+    if (cuda_batch) {
+        qwen_cuda_talker_batch_free(g_cuda_talker_batch_state); g_cuda_talker_batch_state = NULL;
+        qwen_cuda_cp_batch_free(g_cuda_cp_batch_state); g_cuda_cp_batch_state = NULL;
+    }
+#endif
     return 0;
 }

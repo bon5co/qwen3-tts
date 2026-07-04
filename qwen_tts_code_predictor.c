@@ -743,8 +743,12 @@ static void cp_layer_body(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos,
  * Emotion steer is a pre-step input add (done in qwen_cp_predict), so the fused step is emo-safe;
  * only cp_roughness (the q2-down blend) forces the CPU path. */
 void *g_cuda_cp_state = NULL;
+/* GPU-resident BATCHED CP step (throughput path). batch_cp_transformer_step delegates to it;
+ * the per-seq argmax/embed between passes stay on CPU (in qwen_batch_cp_predict). */
+void *g_cuda_cp_batch_state = NULL;
 #ifdef QWEN_HAVE_CUDA
 extern void qwen_cuda_cp_step(void *state, float *x, int pos);
+extern void qwen_cuda_cp_batch_step(void *state, float *x, const int *pos_arr);
 #endif
 
 static void cp_transformer_step(qwen_tts_ctx_t *ctx, float *x, float *x_norm, int pos) {
@@ -971,6 +975,16 @@ static void batch_cp_transformer_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                       float *x, float *x_norm, int pos) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h; float eps = c->rms_norm_eps;
+#ifdef QWEN_HAVE_CUDA
+    /* GPU batched path: the whole 5-layer step runs on device (x = [B][cp_h] residual, updated
+     * in place). Lockstep — all B at the same pos. The caller's per-seq argmax/embed stay on CPU. */
+    extern void *g_cuda_cp_batch_state;
+    if (g_cuda_cp_batch_state && B <= 16) {
+        int pos_arr[16]; for (int b = 0; b < B; b++) pos_arr[b] = pos;
+        qwen_cuda_cp_batch_step(g_cuda_cp_batch_state, x, pos_arr);
+        return;
+    }
+#endif
     for (int b = 0; b < B; b++)
         qwen_rms_norm(x_norm + (size_t)b * ch, x + (size_t)b * ch, ctx->cp_layers[0].input_norm, 1, ch, eps);
     for (int layer = 0; layer < c->cp_num_layers; layer++)
@@ -981,7 +995,13 @@ int qwen_batch_cp_predict(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                           const float *talker_hidden, const int *code0, int *out_codes) {
     qwen_tts_config_t *c = &ctx->config;
     int B = bb->B, ch = bb->cp_h, h = c->hidden_size, emb_dim = ctx->cp_emb_dim;
-    if (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0]) return -2;  /* v1: bf16 only */
+    /* CPU path needs bf16 transformer weights; the GPU batched path runs the transformer on the
+     * device (int8/q4) and only uses the precision-aware argmax + (always-bf16) embeddings/proj. */
+    int cp_gpu = 0;
+#ifdef QWEN_HAVE_CUDA
+    { extern void *g_cuda_cp_batch_state; cp_gpu = (g_cuda_cp_batch_state != NULL); }
+#endif
+    if (!cp_gpu && (!ctx->cp_layers[0].wq_bf16 || !ctx->cp_lm_head_bf16[0])) return -2;  /* v1 CPU: bf16 only */
     float *cx = bb->cp_x, *cxn = bb->cp_x_norm;
     float emb_buf[4096], normed[2048];
 

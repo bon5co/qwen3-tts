@@ -489,7 +489,12 @@ int qwen_talker_load(qwen_tts_ctx_t *ctx) {
  * and the sequential prefill delegate to it (it builds its OWN device KV from pos 0). Disabled
  * automatically when emotion steering is active (the fused step doesn't apply ml_steer yet). */
 void *g_cuda_talker_state = NULL;
+/* GPU-resident BATCHED Talker step (throughput path). When set, qwen_batch_talker_step_ragged
+ * delegates to it (maintains its OWN device KV [B][kv_max][kvd]; seeded per slot on admit via
+ * qwen_cuda_talker_batch_upload_slot). Created by qwen_tts_serve_continuous when QWEN_CUDA_BATCH=1. */
+void *g_cuda_talker_batch_state = NULL;
 #ifdef QWEN_HAVE_CUDA
+extern void qwen_cuda_talker_batch_step(void *state, const float *embeds, const int *pos_arr, float *hidden_out);
 extern void qwen_cuda_talker_step(void *state, const float *embed, float *hidden_out, int pos);
 #endif
 
@@ -1136,6 +1141,15 @@ int qwen_batch_talker_step(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
 int qwen_batch_talker_step_ragged(qwen_tts_ctx_t *ctx, qwen_batch_t *bb,
                                   const float *embeds, const int *pos_arr,
                                   const uint8_t *active, float *hidden_out) {
+#ifdef QWEN_HAVE_CUDA
+    /* GPU batched path: the resident device KV is authoritative (seeded per slot on admit).
+     * Processes all B rows (inactive slots' outputs are ignored by the orchestrator). */
+    extern void *g_cuda_talker_batch_state;
+    if (g_cuda_talker_batch_state) {
+        qwen_cuda_talker_batch_step(g_cuda_talker_batch_state, embeds, pos_arr, hidden_out);
+        return 0;
+    }
+#endif
     return batch_talker_step_impl(ctx, bb, embeds, pos_arr, active, hidden_out);
 }
 

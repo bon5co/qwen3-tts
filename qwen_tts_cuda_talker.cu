@@ -522,6 +522,23 @@ extern "C" void qwen_cuda_talker_batch_step(void *st,const float *embeds,const i
     CK(cudaStreamSynchronize(cudaStreamPerThread));
     if(hidden_out) CK(cudaMemcpy(hidden_out,s->xn,(size_t)B*H*sizeof(float),cudaMemcpyDeviceToHost));
 }
+/* Seed slot b's device KV from the batch engine's bf16 KV (bb->kv_k/kv_v, layout
+ * ((b*num_layers+l)*kv_max+pos)*kv_dim). Called on admit before the first decode step so the
+ * GPU-resident batched Talker attends to the prompt. prefill_len = prompt length. */
+extern "C" void qwen_cuda_talker_batch_upload_slot(void *st,int b,const uint16_t *kv_k,const uint16_t *kv_v,
+                                                   int src_kv_max,int prefill_len){
+    cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; if(!s||prefill_len<=0) return;
+    int L=s->n_layers,B=s->B,kvd=s->kv_dim,dkvm=s->kv_max; size_t nper=(size_t)prefill_len*kvd;
+    float *hk=(float*)malloc(nper*sizeof(float)), *hv=(float*)malloc(nper*sizeof(float));
+    for(int l=0;l<L;++l){
+        const uint16_t *ck=kv_k+(((size_t)b*L+l)*src_kv_max)*kvd, *cv=kv_v+(((size_t)b*L+l)*src_kv_max)*kvd;
+        for(size_t i=0;i<nper;++i){ union{uint32_t u;float f;}a,c; a.u=(uint32_t)ck[i]<<16; hk[i]=a.f; c.u=(uint32_t)cv[i]<<16; hv[i]=c.f; }
+        float *dk=s->kcache+(((size_t)l*B+b)*dkvm)*kvd, *dv=s->vcache+(((size_t)l*B+b)*dkvm)*kvd;
+        CK(cudaMemcpy(dk,hk,nper*sizeof(float),cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dv,hv,nper*sizeof(float),cudaMemcpyHostToDevice));
+    }
+    free(hk); free(hv);
+}
 extern "C" void qwen_cuda_talker_batch_free(void *st){
     cuda_talker_batch_t *s=(cuda_talker_batch_t*)st; if(!s) return;
     cudaFree(s->kcache);cudaFree(s->vcache);cudaFree(s->x);cudaFree(s->xn);cudaFree(s->q);
