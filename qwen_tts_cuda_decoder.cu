@@ -90,6 +90,16 @@ static void dmatmul(float *out,const float *W,const float *in,int M,int K,int N)
     cublasSgemm(g_dh,CUBLAS_OP_N,CUBLAS_OP_N,N,M,K,&a,in,N,W,K,&b,out,N);
 }
 
+/* im2col for a causal DILATED conv1d: col[(ic*ksz+k), t] = in[ic, t-(ksz-1)*dil + k*dil] (0 if OOB).
+ * Then out[oc,t] = W[oc, ic*ksz+k] @ col[ic*ksz+k, t] via cuBLAS — same math as kd_conv1d but the
+ * ksz=7 convs (initial + resblock conv1) become the compute-bound 40× gemm regime, all resident. */
+__global__ void kd_im2col(const float *in,float *col,int in_ch,int length,int ksz,int dil){
+    int t=blockIdx.x*blockDim.x+threadIdx.x, row=blockIdx.y;   /* row = ic*ksz + k */
+    if(t>=length||row>=in_ch*ksz) return;
+    int ic=row/ksz, k=row%ksz, pad=(ksz-1)*dil, ip=t-pad+k*dil;
+    col[(size_t)row*length+t] = (ip>=0&&ip<length) ? in[(size_t)ic*length+ip] : 0.f;
+}
+
 /* ---- resident weight cache (by host pointer) ---------------------------- */
 typedef struct { const void *key; float *dbuf; } dwc;
 static dwc *g_dwc=NULL; static int g_dwc_n=0,g_dwc_cap=0;
@@ -134,9 +144,22 @@ static float *grow(float **buf,size_t *cap,size_t need){ if(*cap<need){ if(*buf)
 /* ping-pong device buffers */
 typedef struct { float *p; size_t cap; } DB;
 static float *dbg(DB *d,size_t need){ if(d->cap<need){ if(d->p)cudaFree(d->p); if(cudaMalloc(&d->p,need*sizeof(float))!=cudaSuccess){d->p=NULL;d->cap=0;return NULL;} d->cap=need; } return d->p; }
-static DB S={0,0},O={0,0},R={0,0},P={0,0};   /* signal / op-out / residual / pointwise */
+static DB S={0,0},O={0,0},R={0,0},P={0,0},Col={0,0};   /* signal / op-out / residual / pointwise / im2col */
 #define SWAP() do{ DB _t=S; S=O; O=_t; cur=S.p; }while(0)
 #define GRID2(len,ch) dim3(CEIL((len),TPB),(ch))
+
+/* causal dilated conv1d (ksz=7) via im2col + cuBLAS, all resident (no transfer). Bit-equivalent to
+ * kd_conv1d up to gemm fp-accumulation order (mel-corr 1.0, like the pointwise convs). */
+static int g_naive7=-1;   /* A/B toggle: QWEN_DEC_NAIVE7=1 → old naive kd_conv1d for the ksz=7 convs */
+static void conv1d_gemm(const float *cur,const float *W,const float *bias,float *out,
+                        int in_ch,int out_ch,int length,int ksz,int dil){
+    if(g_naive7<0) g_naive7 = getenv("QWEN_DEC_NAIVE7") ? 1 : 0;
+    if(g_naive7){ kd_conv1d<<<GRID2(length,out_ch),TPB>>>(cur,W,bias,out,in_ch,out_ch,length,ksz,dil); return; }
+    int K=in_ch*ksz; float *col=dbg(&Col,(size_t)K*length); if(!col) return;
+    kd_im2col<<<GRID2(length,K),TPB>>>(cur,col,in_ch,length,ksz,dil);
+    dmatmul(out,W,col,out_ch,K,length);                                   /* out[out_ch,len]=W[out_ch,K]@col[K,len] */
+    if(bias) kd_add_bias<<<GRID2(length,out_ch),TPB>>>(out,bias,out_ch,length);
+}
 
 extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cur_ch, int cur_len,
                                           float **audio_out, int *n_out) {
@@ -168,9 +191,9 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
         kd_gamma_res<<<GRID2(cur_len,cur_ch),TPB>>>(cur,res,dev_w(cn->gamma,cur_ch),cur_ch,cur_len);
     }
 
-    /* Initial conv (cur_ch→1536, k=7) */
+    /* Initial conv (cur_ch→1536, k=7) — im2col + cuBLAS (resident) */
     { int oc=1536; float *o=dbg(&O,(size_t)oc*cur_len);
-      kd_conv1d<<<GRID2(cur_len,oc),TPB>>>(cur,dev_w(sd->initial_conv_weight,(size_t)oc*cur_ch*7),dev_w(sd->initial_conv_bias,oc),o,cur_ch,oc,cur_len,7,1);
+      conv1d_gemm(cur,dev_w(sd->initial_conv_weight,(size_t)oc*cur_ch*7),dev_w(sd->initial_conv_bias,oc),o,cur_ch,oc,cur_len,7,1);
       SWAP(); cur_ch=oc; }
 
     /* 4 decoder upsample blocks */
@@ -189,7 +212,7 @@ extern "C" int qwen_cuda_conv_decoder_run(void *ctxv, float *signal_host, int cu
             if(ub->res_blocks[r].snake1_alpha)
                 kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].snake1_alpha,cur_ch),dev_w(ub->res_blocks[r].snake1_beta,cur_ch),cur_ch,cur_len);
             float *c1=dbg(&O,(size_t)cur_ch*cur_len);
-            kd_conv1d<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].conv1_weight,(size_t)cur_ch*cur_ch*7),dev_w(ub->res_blocks[r].conv1_bias,cur_ch),c1,cur_ch,cur_ch,cur_len,7,dil);
+            conv1d_gemm(cur,dev_w(ub->res_blocks[r].conv1_weight,(size_t)cur_ch*cur_ch*7),dev_w(ub->res_blocks[r].conv1_bias,cur_ch),c1,cur_ch,cur_ch,cur_len,7,dil);
             SWAP();
             if(ub->res_blocks[r].snake2_alpha)
                 kd_snake<<<GRID2(cur_len,cur_ch),TPB>>>(cur,dev_w(ub->res_blocks[r].snake2_alpha,cur_ch),dev_w(ub->res_blocks[r].snake2_beta,cur_ch),cur_ch,cur_len);
