@@ -55,12 +55,15 @@ for all B sequences) — the compute-bound regime where the GPU shines. Enabled 
 - **Batch independence (correctness):** a request's audio is **byte-identical** whether it runs
   solo or inside a batch of 8 (md5 match) — batching never changes or degrades any output.
 - **Per-step (Talker+CP) throughput:** **3.35× at B=8** (Talker 4.1×, CP 2.7×) vs one sequence.
-- **End-to-end server throughput:** **~2.4× at B=8** on short clips — diluted below the
-  per-step ceiling by non-batched prefill and the per-slot decoder; longer clips trend toward the
-  3.35× ceiling. Higher-bandwidth GPUs sustain larger effective batches.
+- **End-to-end server throughput:** **~3× at B=8** — both WAV and streaming. The speech decoder
+  is amortized per frame (interleaved with generation), so a whole batch finishing together no
+  longer serializes into a decode burst. Remaining gap to the 3.35× per-step ceiling is the
+  non-batched prefill; longer clips trend toward the ceiling. Higher-bandwidth GPUs sustain
+  larger effective batches.
 
 Streaming (`/v1/tts/stream`) batches too: concurrent streams share the batched fused steps and
-each gets its own incremental PCM chunks.
+each gets its own incremental PCM chunks. WAV requests use the same incremental decoder internally
+(bit-identical to the seam-free full decode, mel-corr 1.0) so they reach the same throughput.
 
 ## How to run
 
