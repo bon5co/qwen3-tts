@@ -1040,6 +1040,7 @@ int main(int argc, char **argv) {
         {"delete-voice",  required_argument, 0, 1017},
         {"int8",          no_argument,       0, 1014},
         {"int4",          no_argument,       0, 1015},
+        {"quant-mixed",   no_argument,       0, 1073},
         {"voice-name",    required_argument, 0, 1022},
         {"greedy-warmup", required_argument, 0, 1023},
         {"target-cv",     required_argument, 0, 1024},
@@ -1116,6 +1117,7 @@ int main(int argc, char **argv) {
             case 1055: expr_weight = atof(optarg); break;/* --expr-weight: scale factored-LoRA delta */
             case 1014: use_int8 = 1; break;
             case 1015: use_int4 = 1; break;
+            case 1073: use_int4 = 1; setenv("QWEN_CP_PREC", "int8", 1); break;  /* --quant-mixed: int4 Talker + int8 CP (best CUDA quant) */
             case 1022: voice_name = optarg; break;
             case 1023: { int gw = atoi(optarg); ctx_greedy_warmup = gw; } break;
             case 1024: target_cv_dir = optarg; break;
@@ -1198,6 +1200,7 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --expr-weight <m>          Dose a .expr (factored LoRA AND dense): 1=as trained, 0.6=subtler, 1.5=stronger\n");
                 fprintf(stderr, "  --int8                     INT8 quantized Talker + Code Predictor\n");
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
+                fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
                 fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B): sad/joy/anger/fear/disgust/surprise. PRESET voice =\n");
                 fprintf(stderr, "                             STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
