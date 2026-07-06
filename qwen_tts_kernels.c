@@ -147,6 +147,13 @@ void qwen_caps_report(void *out) {
      * See docs/hardware-testing.md for the per-platform plan. */
 #if defined(__x86_64__)
     __builtin_cpu_init();
+    /* clang's __builtin_cpu_supports rejects the "amx-int8" feature string (gcc-only) →
+     * "invalid cpu feature string for builtin". Compute it guarded so clang-tidy/clang builds
+     * still parse; gcc keeps the AMX runtime probe. */
+    const char *amx_str = "";
+#if defined(__GNUC__) && !defined(__clang__)
+    if (__builtin_cpu_supports("amx-int8")) amx_str = " amx-int8";
+#endif
     fprintf(f, "  runtime cpu:      sse2%s%s%s%s%s%s%s%s\n",
             __builtin_cpu_supports("avx")        ? " avx"          : "",
             __builtin_cpu_supports("avx2")       ? " avx2"         : "",
@@ -155,7 +162,7 @@ void qwen_caps_report(void *out) {
             __builtin_cpu_supports("avx512bw")   ? " avx512bw"     : "",
             __builtin_cpu_supports("avx512vnni") ? " avx512vnni"   : "",
             __builtin_cpu_supports("avx512bf16") ? " avx512bf16"   : "",
-            __builtin_cpu_supports("amx-int8")   ? " amx-int8"     : "");
+            amx_str);
     fprintf(f, "  lever (x86):      %s\n",
             __builtin_cpu_supports("avx512vnni") ? "VNNI int8 dot (native) — int8/int4 + batching is the throughput play"
           : __builtin_cpu_supports("avx2")       ? "AVX2 only (no VNNI) — int8 via widen+FMA; bandwidth-bound, batching helps"
