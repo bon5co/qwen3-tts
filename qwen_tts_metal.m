@@ -467,6 +467,27 @@ static const char *QWEN_METAL_SRC =
 "    constant uint &inter [[buffer(2)]], constant uint &B [[buffer(3)]], uint e [[thread_position_in_grid]]) {\n"
 "    if (e >= B*inter) return; uint b=e/inter, j=e%inter;\n"
 "    device const float *ib = in + (ulong)b*2*inter; float g=ib[2*j], u=ib[2*j+1]; out[(ulong)b*inter+j] = g/(1.0f+exp(-g))*u;\n"
+"}\n"
+/* MMA batched matvec (opt-in QWEN_METAL_BATCH_MMA): simdgroup_float8x8, [B][cols] X -> [B][rows] Y.
+ * Compute-bound (512 MAC/instr) → higher throughput at larger B; NOT bit-identical to the float4 mv_b
+ * (different fp order) so the batch diverges from single-stream (valid but different audio). */
+"kernel void mma_b_bf16(device const ushort *W [[buffer(0)]],\n"
+"    device const float *X [[buffer(1)]], device float *Y [[buffer(2)]],\n"
+"    constant uint &cols [[buffer(3)]], constant uint &rows [[buffer(4)]], constant uint &B [[buffer(5)]],\n"
+"    uint2 tgid [[threadgroup_position_in_grid]], uint tid [[thread_index_in_simdgroup]]) {\n"
+"    threadgroup float Ws[64]; threadgroup float Xs[64]; threadgroup float Ys[64];\n"
+"    uint row0 = tgid.x*8, col0 = tgid.y*8;\n"
+"    simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float,8,8>(0.0f);\n"
+"    for (uint k0=0;k0<cols;k0+=8) {\n"
+"        for (uint i=tid;i<64;i+=32){ uint r=i>>3,k=i&7; uint gr=row0+r; Ws[i]=(gr<rows)?as_type<float>(uint(W[(ulong)gr*cols+k0+k])<<16):0.0f; }\n"
+"        for (uint i=tid;i<64;i+=32){ uint k=i>>3,b=i&7; uint gb=col0+b; Xs[i]=(gb<B)?X[(ulong)gb*cols+k0+k]:0.0f; }\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"        simdgroup_float8x8 wm,xm; simdgroup_load(wm,Ws,8); simdgroup_load(xm,Xs,8);\n"
+"        simdgroup_multiply_accumulate(acc,wm,xm,acc);\n"
+"        threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    }\n"
+"    simdgroup_store(acc,Ys,8);\n"
+"    for (uint i=tid;i<64;i+=32){ uint r=i>>3,b=i&7; uint gr=row0+r,gb=col0+b; if(gr<rows&&gb<B) Y[(ulong)gb*rows+gr]=Ys[i]; }\n"
 "}\n";
 
 /* ---- context: device, queue, pipelines, resident weight cache, IO pool --- */
@@ -487,6 +508,7 @@ typedef struct {
     /* batched-step pipelines (throughput epic) */
     void *pso_mvb_bf16, *pso_mvb_int8, *pso_mvb_q4, *pso_rmsf_b, *pso_rmsph_b;
     void *pso_ropeneox_b, *pso_trunc_b, *pso_kvstore_b, *pso_attnb, *pso_swiglu_ilb;
+    void *pso_mmab_bf16;   /* opt-in MMA batched matvec (QWEN_METAL_BATCH_MMA) */
     /* resident weight cache (by pointer) */
     wcache_ent *wc; int wc_n, wc_cap;
     /* reusable IO buffers (grow on demand) */
@@ -562,8 +584,10 @@ void *qwen_metal_init(void) {
         c->pso_kvstore_b = make_pso(dev, lib, "kv_store_b");
         c->pso_attnb = make_pso(dev, lib, "attn_b");
         c->pso_swiglu_ilb = make_pso(dev, lib, "swiglu_il_b");
+        c->pso_mmab_bf16 = make_pso(dev, lib, "mma_b_bf16");
         if (!c->pso_mvb_bf16 || !c->pso_mvb_int8 || !c->pso_mvb_q4 || !c->pso_rmsf_b || !c->pso_rmsph_b ||
-            !c->pso_ropeneox_b || !c->pso_trunc_b || !c->pso_kvstore_b || !c->pso_attnb || !c->pso_swiglu_ilb) {
+            !c->pso_ropeneox_b || !c->pso_trunc_b || !c->pso_kvstore_b || !c->pso_attnb || !c->pso_swiglu_ilb ||
+            !c->pso_mmab_bf16) {
             qwen_metal_free(c); return NULL;
         }
         if (!c->pso_matvec_bf16 || !c->pso_matmat_bf16 || !c->pso_matvec_int8 ||
@@ -1695,6 +1719,15 @@ static void enc_mvb(id<MTLComputeCommandEncoder> e, qwen_metal_talker_batch_t *s
                     id<MTLBuffer> xb, id<MTLBuffer> yb, int rows, int cols, int bar) {
     qwen_metal_ctx *c=s->mc; uint32_t cc=(uint32_t)cols, rr=(uint32_t)rows, BB=(uint32_t)s->B;
     MTLSize tg=MTLSizeMake(((NSUInteger)rows+7)/8,1,1), tp=MTLSizeMake(8*32,1,1);
+    static int mma=-1; if(mma<0) mma=getenv("QWEN_METAL_BATCH_MMA")?1:0;
+    if (mma && wbf) {   /* opt-in MMA: bf16 only, simdgroup_float8x8 (compute-bound, not bit-identical) */
+        [e setComputePipelineState:MTB(c->pso_mmab_bf16)];
+        [e setBuffer:weight_buf(c,wbf,(size_t)rows*cols*sizeof(uint16_t)) offset:0 atIndex:0];
+        [e setBuffer:xb offset:0 atIndex:1]; [e setBuffer:yb offset:0 atIndex:2];
+        [e setBytes:&cc length:4 atIndex:3]; [e setBytes:&rr length:4 atIndex:4]; [e setBytes:&BB length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(((NSUInteger)rows+7)/8, ((NSUInteger)s->B+7)/8, 1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+        if(bar) enc_bar(e); return;
+    }
     if (wq4) {
         [e setComputePipelineState:MTB(c->pso_mvb_q4)];
         [e setBuffer:weight_buf(c,wq4,(size_t)rows*(cols/32)*sizeof(q4_0_block_t)) offset:0 atIndex:0];
