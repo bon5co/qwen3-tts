@@ -230,26 +230,26 @@ Chinese** `--instruct` on top is optional but **recommended** — it drives the 
 
 | Language | Voice | Emotion | Text | Listen |
 |----------|-------|---------|------|--------|
-| Italian | ryan (preset) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_sad.wav) |
-| Italian | ryan (preset) | 😄 joy | *Non ci posso credere, è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_joy.wav) |
-| Italian | ryan (preset) | 🤢 disgust | *Ma che roba è questa? Fa davvero schifo, non riesco neanche a guardarla.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_disgust.wav) |
-| Italian | ryan (preset) | 😲 surprise | *Cosa?! Non me lo aspettavo per niente, è incredibile!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_surprise.wav) |
-| Italian | galatea (cloned voice) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_sad.wav) |
-| Italian | galatea (cloned voice) | 😠 anger | *Come ti permetti di parlarmi così? Questo non lo accetto!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_anger.wav) |
-| English | ryan (preset) | 😢 sad | *I've lost everything I had, and now I don't know what to do anymore.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_en_sad.wav) |
-| English | ryan (preset) | 😠 anger | *How dare you talk to me like that? I will not accept this!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_en_anger.wav) |
-| English | ryan (preset) | 😨 fear | *There's someone in the house, I heard footsteps... I'm so scared, I don't know what to do.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_en_fear.wav) |
-| German | vivian | 😠 anger | *Also, lass mich dir in Ruhe erklären, wie die Dinge wirklich stehen.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/de_vivian_anger.wav) |
-| French | vivian | 😢 sad | *Bon, laisse-moi t'expliquer calmement comment les choses se passent.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_sad.wav) |
-| French | vivian | 😲 surprise | *Quoi ? Je ne m'y attendais pas du tout, c'est incroyable.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_surprise.wav) |
-| Spanish | vivian | 😄 joy | *Bueno, déjame explicarte con calma cómo están realmente las cosas.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy.wav) |
-| Spanish | vivian | 🤢 disgust | *¿Pero qué es esto? Es asqueroso, ni siquiera puedo mirarlo.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_disgust.wav) |
-| Portuguese | ryan | 😄 joy | *Não acredito, é a melhor notícia da minha vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/pt_ryan_joy.wav) |
-| Chinese | vivian | 😄 joy | *我简直不敢相信，这是我一生中最好的消息，我太高兴了！* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/zh_vivian_joy.wav) |
-| Russian | ryan | 😠 anger | *Как ты смеешь так со мной разговаривать? Это неприемлемо!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ru_ryan_anger.wav) |
-| Japanese | ono_anna | 😢 sad | *私が持っていたものを全て失って、もうどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_sad.wav) |
-| Japanese | ono_anna | 😨 fear | *家に誰かいる、足音が聞こえた……怖くてどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ja_ono_anna_fear.wav) |
-| Korean | sohee | 😠 anger | *네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ko_sohee_anger.wav) |
+| Italian | ryan (preset) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_sad.wav) |
+| Italian | ryan (preset) | 😄 joy | *Non ci posso credere, è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_joy.wav) |
+| Italian | ryan (preset) | 🤢 disgust | *Ma che roba è questa? Fa davvero schifo, non riesco neanche a guardarla.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_disgust.wav) |
+| Italian | ryan (preset) | 😲 surprise | *Cosa?! Non me lo aspettavo per niente, è incredibile!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_surprise.wav) |
+| Italian | galatea (cloned voice) | 😢 sad | *Ho perso tutto quello che avevo, e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_sad.wav) |
+| Italian | galatea (cloned voice) | 😠 anger | *Come ti permetti di parlarmi così? Questo non lo accetto!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_anger.wav) |
+| English | ryan (preset) | 😢 sad | *I've lost everything I had, and now I don't know what to do anymore.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_sad.wav) |
+| English | ryan (preset) | 😠 anger | *How dare you talk to me like that? I will not accept this!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_anger.wav) |
+| English | ryan (preset) | 😨 fear | *There's someone in the house, I heard footsteps... I'm so scared, I don't know what to do.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_fear.wav) |
+| German | vivian | 😠 anger | *Also, lass mich dir in Ruhe erklären, wie die Dinge wirklich stehen.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/de_vivian_anger.wav) |
+| French | vivian | 😢 sad | *Bon, laisse-moi t'expliquer calmement comment les choses se passent.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_sad.wav) |
+| French | vivian | 😲 surprise | *Quoi ? Je ne m'y attendais pas du tout, c'est incroyable.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_surprise.wav) |
+| Spanish | vivian | 😄 joy | *Bueno, déjame explicarte con calma cómo están realmente las cosas.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_joy.wav) |
+| Spanish | vivian | 🤢 disgust | *¿Pero qué es esto? Es asqueroso, ni siquiera puedo mirarlo.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_disgust.wav) |
+| Portuguese | ryan | 😄 joy | *Não acredito, é a melhor notícia da minha vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/pt_ryan_joy.wav) |
+| Chinese | vivian | 😄 joy | *我简直不敢相信，这是我一生中最好的消息，我太高兴了！* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/zh_vivian_joy.wav) |
+| Russian | ryan | 😠 anger | *Как ты смеешь так со мной разговаривать? Это неприемлемо!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ru_ryan_anger.wav) |
+| Japanese | ono_anna | 😢 sad | *私が持っていたものを全て失って、もうどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ja_ono_anna_sad.wav) |
+| Japanese | ono_anna | 😨 fear | *家に誰かいる、足音が聞こえた……怖くてどうすればいいのか分からない。* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ja_ono_anna_fear.wav) |
+| Korean | sohee | 😠 anger | *네가 어떻게 나한테 그렇게 말할 수 있어? 이건 절대 받아들일 수 없어!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ko_sohee_anger.wav) |
 
 - **Emotions:** `sad · joy · anger · fear · disgust · surprise` (synonyms like `happy`/`angry` work too).
 - **The recipe:** a **preset voice** → pure **STEER** (the steering vector @ w12, clean in every language); a
@@ -276,12 +276,12 @@ unstable** across some languages/voices (work in progress) — the clearest resu
 
 | Language | Voice | Emotion + tag | Text | Listen |
 |----------|-------|---------------|------|--------|
-| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_joy_laugh.wav) |
-| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_it_sad_sigh.wav) |
-| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/ryan_en_joy_laugh.wav) |
-| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
-| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/es_vivian_joy_laugh.wav) |
-| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/feat/paraling-auto-tag/samples/emotion_examples/galatea_it_joy_laugh.wav) |
+| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_joy_laugh.wav) |
+| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_sad_sigh.wav) |
+| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_joy_laugh.wav) |
+| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
+| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_joy_laugh.wav) |
+| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_joy_laugh.wav) |
 
 #### Tuning the `--instruct` (strength & speed)
 
@@ -305,14 +305,8 @@ matters for **cloned voices** and preset+instruct — preset pure-emotion needs 
 > the slots — `Tempo:+40%` even comes out *slower*. Plain vivid prose wins. Full findings + a ready per-emotion
 > `strong`/`very-strong` instruct library → [docs/emotion-instruct-control.md](docs/emotion-instruct-control.md).
 
-**Get the assets** (needed once, for the `.expr` fine-tunes — the steering vectors already ship in this repo):
-
-```bash
-bash download_assets.sh            # fetch the .expr packs into presets/expr/ (sha256-verified)
-bash download_assets.sh --verify   # re-check integrity of what you already have
-```
-They are hosted on Hugging Face → [**gabrione/qwen3-tts-italian-expr**](https://huggingface.co/gabrione/qwen3-tts-italian-expr)
-(one repo, folders by purpose). The full set ≈ 1.4 GB; Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
+**Assets:** `bash download_assets.sh` (introduced in the setup callout above) fetches the `.expr` packs;
+`--verify` re-checks integrity. Full set ≈ 1.4 GB; Italian-only emotion needs just `italian_csp_topk6.expr` (203 MB).
 
 <details>
 <summary><b>Under the hood</b> — what each file is, and the manual override flags (advanced)</summary>
