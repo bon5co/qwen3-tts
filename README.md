@@ -456,20 +456,23 @@ Optional `--backend metal|cuda` runs the **whole fused pipeline resident on the 
 activations on device, one command buffer / step). The CPU path stays the default — GPU is purely additive.
 Full numbers: [Metal / Apple Silicon](docs/hardware-testing.md) · [CUDA / NVIDIA](docs/cuda-performance.md).
 
-**Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`:
+**Apple Metal** — `make metal CC=clang`, then `QWEN_METAL_FUSED_TALKER=1 ./qwen_tts --backend metal`.
+**Single-stream latency** (one request — CLI, or a warm `--serve` server; the two match):
 
-| Device | 0.6B RTF | 1.7B RTF | Streaming TTFA |
+| Device | 0.6B RTF | 1.7B RTF | Streaming TTFA (single client) |
 |---|---|---|---|
 | **Apple M1** 8-core (dev box) | ~0.60 (int4) | — | — |
 | **Apple M2 Pro** 16-core GPU | **0.36–0.39** | **0.48–0.53** | **314 ms** / 517 ms |
 
-Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon (bandwidth-rich →
-int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
+RTF = processing_time ÷ audio_duration (**< 1.0 = faster than real time**); TTFA = time to first audio for a
+single `--stream` client. Metal beats the native M2 CPU path ~1.5–2×; **int8 is the sweet spot** on Apple Silicon
+(bandwidth-rich → int4's nibble-unpack doesn't pay). Resident decode is bit-identical to the CPU path.
+*(Multi-user concurrency → the batching table below.)*
 
 **NVIDIA CUDA** — `make cuda` (resident fused + cuBLAS pointwise convs + CUDA graphs), 1.7B, on a mainstream
-**~270 GB/s GPU (RTX 4060-class)**:
+**~270 GB/s GPU (RTX 4060-class)**. **Single-stream latency** (one request):
 
-| Config | RTF |
+| Config | RTF (single stream) |
 |---|---|
 | Resident fused (`--quant-mixed`: int4 Talker + int8 CP) | **0.44** |
 
