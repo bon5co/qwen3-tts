@@ -164,6 +164,11 @@ fired — confirmed via `--caps`).
 | **1.7B** | **Metal** | 0.79 | 0.53 | **0.50** ⭐ |
 | 1.7B | CPU (M2) | 1.33 | 0.79 | 1.47–1.85 |
 
+**Server mode** (Metal fused, 0.6B int8, `--serve`): **sequential steady-state RTF ~0.37** (no overhead vs
+CLI); **streaming TTFA = 269 ms to first audio** (chunk = 10 frames), stream RTF 0.36. ⚠️ **Concurrent
+requests stall** on the plain server (single Metal device-state + accept-loop blocks during synth) →
+multi-user throughput needs the batched Metal step (see below), not wired yet.
+
 **Findings:** (1) **Metal M2 beats native CPU M2 ~1.5–2×** everywhere. (2) Best = **0.6B Metal int8 = 0.39**
 (M1 floor was 0.60 → **1.54×**); **1.7B now sub-realtime** (0.50). (3) On M2 **int8 > int4 for Metal**
 (bandwidth-rich → nibble-unpack of int4 not worth it; int8 is the M-series GPU sweet spot). **int4 on
