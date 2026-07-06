@@ -143,8 +143,10 @@ public-domain readers (Italian, Spanish, English, French) so the demos/tests run
 voices to listen to and reuse:
 ```bash
 bash download_voices.sh    # fetch galatea(IT)/quijote(ES)/ohenry(EN)/hugo(FR) into voices/ (sha256-verified)
-./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_graft.qvoice --icl-only -l Italian --emotion sad --text "…" -o out.wav
+./qwen_tts -d qwen3-tts-1.7b --load-voice voices/galatea_graft.qvoice --icl-only -l Italian \
+    --text "Buongiorno, questa è la mia voce clonata." -o out.wav
 ```
+> 🎭 Want these clones to **emote** (`--emotion`)? See the **Emotion & expressivity** section below — it needs `bash download_assets.sh` first.
 Hosted on Hugging Face → [**gabrione/qwen3-tts-voices**](https://huggingface.co/gabrione/qwen3-tts-voices) (CC0, LibriVox attribution).
 
 ### Custom Voices — small, portable, and *emotable* `.qvoice`
@@ -200,6 +202,10 @@ tiniest & cleanest) · **heavy WDELTA** (`--target-cv`, ~0.8–3 GB, bit-identic
 > The steering vectors already ship in this repo. **`--emotion` then works on the 9 presets AND on your own
 > cloned voices.** No clone yet? Grab ready-made **CC0 graft voices** with `bash download_voices.sh` →
 > [**gabrione/qwen3-tts-voices**](https://huggingface.co/gabrione/qwen3-tts-voices) and emote them straight away.
+>
+> 🎧 **Hear it in one command** (after the two downloads): **`make emotion-demo`** renders a batch of emotion
+> clips — every language × emotion, on presets *and* the galatea clone — so you can judge the current quality by
+> ear. **`make emotion-para-demo`** adds the alpha `[laugh]`/`[sigh]`.
 
 Emotion is **one flag**. Pick an emotion with `--emotion` and the engine auto-composes the validated
 **COMBINE** stack for you — the per-language fine-tune (`.expr`) **plus** the steering vector for that
