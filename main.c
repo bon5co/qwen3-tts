@@ -392,9 +392,10 @@ typedef qwen_cspan_t cspan_t;
  * is replaced by a validated ONOMATOPOEIA *inside* the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — NEVER a separate "splice" span (which mixed voices). The
  * mapping is universal across voices AND languages (ear-validated on ryan EN/IT, vivian IT, galatea clone):
- *   [laugh] → 哈哈哈 (CN 3-char)   [sigh] → ahh (Latin)
- * and seed 7 makes BOTH fire (哈哈哈 s7 laughs / s42 hyperventilates; ahh s7 = clean sigh). SHORT form only
- * (哈哈哈 not longer; long over-laughs into a pant); no event-instruct (goes metallic). See the doc for WIN/KO. */
+ *   [laugh] → 哈哈哈 (CN 3-char)   [sigh] → 唉 / ahh (per voice)   [yawn] → 哈啊 (preset s7 / clone s42)
+ * and seed 7 makes laugh fire (哈哈哈 s7 laughs / s42 hyperventilates). SHORT form only (哈哈哈 not longer;
+ * long over-laughs into a pant); no event-instruct (goes metallic). [yawn] added 2026-07-07 via the E1
+ * discovery harness. See the doc for the full WIN/KO trail + the ryan-only/parked events. */
 /* para_pick / para_inline_substitute / is_para_event_tag moved to qwen_tts_compose.c
  * (shared with the server). Use qwen_compose_para_substitute / qwen_compose_is_para_event_tag. */
 
@@ -1634,7 +1635,9 @@ int main(int argc, char **argv) {
     char *para_sub_text = NULL;
     if (text && !no_compose) {
         int did = 0, para_seed = 7;
-        int para_voice = (!load_voice && speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0;
+        /* voice_class for para_pick: 2 = clone (--load-voice), 1 = vivian preset, 0 = ryan/other preset.
+         * (clone-vs-preset matters for [yawn]: 哈啊 clone s42 / preset s7.) */
+        int para_voice = load_voice ? 2 : ((speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0);
         para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
         if (para_sub_text && did) {
             text = para_sub_text;

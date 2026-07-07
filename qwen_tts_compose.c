@@ -51,14 +51,20 @@ static const cmacro_t COMPOSE_MACROS[] = {
 /* ── Inline paralinguistic EVENTS via a validated onomatopoeia (the shipped [laugh]/[sigh]) ──
  * The tag becomes an onomatopoeia INSIDE the sentence, so the event is produced in the active
  * voice's own timbre within ONE generation — never a separate "splice" span. Mapping is
- * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian). */
+ * universal across voices/languages; sigh differs per voice (唉 s42 ryan/clone, ahh s7 vivian).
+ * [yawn] 哈啊 is vocal + cross-voice (preset s7 / clone s42). [moan]/[throat] stay ryan-only (unshipped,
+ * see docs/para-experiments.md 2026-07-07); cry is decoder-ceiling-blocked (needs FT). */
 static void para_pick(const char *tag, int voice_class, const char **onom, int *seed) {
+    /* voice_class: 0 = ryan / other preset · 1 = vivian · 2 = clone (--load-voice). */
     *onom = NULL; *seed = 7;
     if (!strcasecmp(tag, "laugh") || !strcasecmp(tag, "laughs")) {
         *onom = "\xe5\x93\x88\xe5\x93\x88\xe5\x93\x88"; *seed = 7;              /* 哈哈哈 — all voices */
     } else if (!strcasecmp(tag, "sigh") || !strcasecmp(tag, "sighs")) {
         if (voice_class == 1) { *onom = "ahh"; *seed = 7; }                    /* vivian */
         else                  { *onom = "\xe5\x94\x89"; *seed = 42; }          /* 唉 — ryan/clone */
+    } else if (!strcasecmp(tag, "yawn") || !strcasecmp(tag, "yawns")) {
+        *onom = "\xe5\x93\x88\xe5\x95\x8a";                                    /* 哈啊 — vocal, cross-voice (ear T3/2026-07-07) */
+        *seed = (voice_class == 2) ? 42 : 7;                                   /* clone s42 · preset s7 */
     }
 }
 

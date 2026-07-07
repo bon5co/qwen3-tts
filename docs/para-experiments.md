@@ -135,6 +135,12 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[laugh]`** | `哈哈哈` (CN, 3-char) | **7** | universal — ryan EN/IT, vivian, galatea clone |
 | **`[sigh]`** — ryan/clone | `唉` (CN) | **42** | ryan/clone |
 | **`[sigh]`** — vivian | `ahh` (Latin) | **7** | vivian only (over-does `唉`) |
+| **`[yawn]`** — preset | `哈啊` (CN) | **7** | ryan / vivian / other presets |
+| **`[yawn]`** — clone | `哈啊` (CN) | **42** | `--load-voice` clones |
+
+`[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
+`voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
+trigger); cry unsolved (needs FT).
 
 Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
 steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
