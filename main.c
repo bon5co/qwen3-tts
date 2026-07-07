@@ -1634,15 +1634,15 @@ int main(int argc, char **argv) {
      * Pin the para-validated seed 7 (both 哈哈哈 and ahh fire at 7) and T1.1 when the user gave no --seed/-T. */
     char *para_sub_text = NULL;
     if (text && !no_compose) {
-        int did = 0, para_seed = 7;
+        int did = 0, para_seed = 7; float para_temp = 1.1f;
         /* voice_class for para_pick: 2 = clone (--load-voice), 1 = vivian preset, 0 = ryan/other preset.
          * (clone-vs-preset matters for [yawn]: 哈啊 clone s42 / preset s7.) */
         int para_voice = load_voice ? 2 : ((speaker_name && !strcasecmp(speaker_name, "vivian")) ? 1 : 0);
-        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed);
+        para_sub_text = qwen_compose_para_substitute(text, para_voice, &did, &para_seed, &para_temp);
         if (para_sub_text && did) {
             text = para_sub_text;
             if (seed < 0) seed = para_seed;      /* pin the validated per-tag seed (laugh 7 / sigh 42) */
-            if (!temp_set) { temperature = 1.1f; temp_set = 1; }
+            if (!temp_set) { temperature = para_temp; temp_set = 1; }   /* per-tag T (1.1 default, [scoff] 1.0) */
             if (!silent) fprintf(stderr, "Paralinguistics: inline [tag]->onomatopoeia (seed %d, T%.1f): \"%s\"\n",
                                  seed, (double)temperature, text);
         } else { free(para_sub_text); para_sub_text = NULL; }

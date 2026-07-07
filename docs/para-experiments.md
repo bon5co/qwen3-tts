@@ -139,6 +139,7 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[yawn]`** — clone | `哈啊` (CN) | **42** | `--load-voice` clones |
 | **`[wow]`** | `哇` (CN) | **7** | universal — "wow!" interjection (pair with `--emotion surprise`) |
 | **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle (pair with `--emotion joy`) |
+| **`[scoff]`** | `切` (CN) | **7** | disdain/scoff · **T1.0** (per-tag; 1.1 over-drives pitch) · pair with `--emotion disgust` |
 
 `[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
@@ -177,6 +178,17 @@ Recurring lesson: several wins are ear-good but **too forceful/metallic** (咯�
 over-drives them; a milder emotion / no-emotion take may clean them up (a strength knob for para). The clean
 TOPs (哇/噢/呼/嘿嘿) don't need it. Next: cross-voice the TOPs → wire into para_pick (like `[yawn]`); strength-
 tune the metallic ones.
+
+### Strength-tune of the metallic wins (2026-07-07) — the lever is TEMPERATURE, not removing emotion
+Verified (non-silent) the onomatopoeia WAS in the prompt; the "no-emo" versions still under-perform because
+**the para needs the emotion to FIRE** (no-emo → the model reads the sentence flat). So the strength lever is
+a MIDDLE temperature, not dropping the emotion:
+- **`[scoff]` 切 → T1.0 + disgust = WIN** (T1.1 over-drove the pitch; no-emo did nothing; T0.9 too weak). SHIPPED
+  with a per-tag temperature (para_pick now returns temp; `[scoff]`=1.0, others=1.1).
+- **唔 (groan): DROPPED** — my carrier mismatch (swept with the gasp/surprise carrier "Wait… is that you?",
+  wrong context for a groan). The real groan trigger is `哼` s42 (T3). Don't re-chase 唔.
+- **咯咯 (cackle): DROPPED** — laughs too long/won't stop at any T. Not a clean cackle.
+
 
 Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
 steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
