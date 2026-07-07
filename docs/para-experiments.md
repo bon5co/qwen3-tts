@@ -137,6 +137,8 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 | **`[sigh]`** — vivian | `ahh` (Latin) | **7** | vivian only (over-does `唉`) |
 | **`[yawn]`** — preset | `哈啊` (CN) | **7** | ryan / vivian / other presets |
 | **`[yawn]`** — clone | `哈啊` (CN) | **42** | `--load-voice` clones |
+| **`[wow]`** | `哇` (CN) | **7** | universal — "wow!" interjection (pair with `--emotion surprise`) |
+| **`[giggle]`** | `嘿嘿` (CN) | **42** | universal — sly giggle (pair with `--emotion joy`) |
 
 `[yawn]` added 2026-07-07 (discovered + ear-validated via the E1 harness; wired w/ a preset-vs-clone
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized

@@ -65,6 +65,10 @@ static void para_pick(const char *tag, int voice_class, const char **onom, int *
     } else if (!strcasecmp(tag, "yawn") || !strcasecmp(tag, "yawns")) {
         *onom = "\xe5\x93\x88\xe5\x95\x8a";                                    /* 哈啊 — vocal, cross-voice (ear T3/2026-07-07) */
         *seed = (voice_class == 2) ? 42 : 7;                                   /* clone s42 · preset s7 */
+    } else if (!strcasecmp(tag, "wow")) {
+        *onom = "\xe5\x93\x87"; *seed = 7;                                     /* 哇 — "wow!" interjection, universal (ear 2026-07-07) */
+    } else if (!strcasecmp(tag, "giggle") || !strcasecmp(tag, "giggles")) {
+        *onom = "\xe5\x98\xbf\xe5\x98\xbf"; *seed = 42;                        /* 嘿嘿 — sly giggle, universal (ear 2026-07-07) */
     }
 }
 
