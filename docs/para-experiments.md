@@ -155,6 +155,27 @@ trigger); cry unsolved (needs FT).
   not shippable. Clone 嗯/哈啊 → hum/pant. moan does NOT generalize; ryan-only at best. PARK (research later).
 - **[throat] generic:** ❌ KO — CNN14 (has "Throat clearing") P=0 on 咳/呵/嗯哼. Articulatory ceiling. PARK / FT.
 
+### Broad exploration net (2026-07-07, ryan, semi-autonomous CLAP/CNN14 screen → ear) — NEW WINS
+Wide onomatopoeia net across playful/disdain/surprise/exhale buckets; screener clustered, ear judged.
+Audio: `samples/tests/2026-07-07_para_broad_explore/WINS/`. **New candidate tags (ryan-validated, cross-voice
++ naming pending):**
+| proposed tag | onom | seed | ear verdict |
+|---|---|---|---|
+| **`[wow]`** | `哇` | 7 | ✅✅ **TOP** — perfect "wow!" (2.4s, crisp — the short interjection laugh couldn't do) |
+| **`[oh]`** | `噢` | 7 | ✅✅ **TOP** — perfect "oh!" (2.6s) |
+| **`[phew]`** (relief) | `呼` | 7 | ✅✅ **TOP** — relief sigh, distinct from sad `[sigh]` (7.0s) |
+| **`[giggle]`** (sly) | `嘿嘿` | 42 | ✅✅ **TOP** — sly/knowing chuckle (4.8s) |
+| **`[hey]`** (recognition) | `咦` | 7 | ✅ WIN — "hey, it's really you?" (2.7s), not a plain huh |
+| **`[huff]`** (tired) | `嗤` | 7 | ✅ WIN — "uff uff" 2× exertion/tiredness pant |
+| **`[scoff]`** (disdain) | `切` | 7 | ✅ WIN but **too strong** (emo raises pitch) — needs strength ↓ |
+| — | `咯咯` | 7 | 🟡 cackle but METALLIC — reduce force |
+| — | `唔` | 7 | 🟡 groan attempt, metallic/forced — reduce force |
+| — | `嘻嘻` | 7 | ❌ KO — forced "eh eh eh" pant |
+Recurring lesson: several wins are ear-good but **too forceful/metallic** (咯咯/唔/切) — the emotion push
+over-drives them; a milder emotion / no-emotion take may clean them up (a strength knob for para). The clean
+TOPs (哇/噢/呼/嘿嘿) don't need it. Next: cross-voice the TOPs → wire into para_pick (like `[yawn]`); strength-
+tune the metallic ones.
+
 Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
 steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
 ryan/clone/other. Nits: mild metallic tail on ryan laugh (later). `haha`@T1.0=alt laugh (ryan-EN only),
