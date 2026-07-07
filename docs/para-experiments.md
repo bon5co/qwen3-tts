@@ -265,6 +265,17 @@ trigger discovery for vivian/clone (find their yawn/throat onom, as `ahh` was fo
 ryan-gated; (c) park as ryan candidates. Audio: `samples/tests/2026-07-07_{yawn_xvoice,groan_throat_xvoice}/`.
 CLAP uncalibrated for these events → ear should confirm the vivian-laughs / clone-hums reads before finalizing.
 
+### Step-2 iteration (2026-07-07, ryan IT) — gasp alt-triggers KO, CRY hunt #2 KO (3rd fail)
+- **gasp `倒吸` / `嘶` (sharp-inhale candidates):** all MISS/DRIFT (→yawn/hum, P≤0.10). No new gasp win.
+  `啊` stays the gasp trigger (ear-validated in T3-val; CLAP just can't score gasp — a screener gap, not a
+  trigger failure). gasp = DONE via `啊`.
+- **CRY hunt #2 `呜呜呜` / `啊呜` / `呜哇` / `buaa` × {42,2024}:** **all P(cry)=0.00, drift to yawn/sigh** — same
+  failure as hunt #1. Transcripts show breathy "Ah... Ah..." (yawn/sigh-like), never crying; some triggers
+  read/garbled (`buaa`→"Boa"). **3rd automated failure across many triggers/seeds → CRY via inline
+  onomatopoeia is EXHAUSTED.** Cry is the decoder-ceiling event; a real cry needs FT (like the pros) — park
+  it. (Cross-cutting note: nearly every breathy TTS vocalization clusters as "yawn"/"sigh" acoustically —
+  cry's low-arousal sob just isn't in the model's inline reach.)
+
 ---
 
 ## Status legend
