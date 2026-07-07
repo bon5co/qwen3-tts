@@ -233,6 +233,28 @@ Cry needs its own sweep — it's the hardest (acoustically ≈ laugh/yawn, and l
 
 ---
 
+## 2026-07-07 — first AUTOMATED discovery pass (harness E1: `tools/para/para_sweep.sh` + CLAP judge)
+Method change: generated a trigger×seed×lang grid and **auto-screened with CLAP** (`para_judge.py`, τ0.20),
+so the ear only judged the shortlist (4 clips out of 24) instead of every clip. Voice: ryan, 1.7B, T1.1.
+The CLAP screener is calibrated only for laugh/sigh → for new events its probs are RELATIVE shortlisting
+signal; ear is decisive (verdicts below are the USER's ear, 2026-07-07).
+
+| tag | trigger | voice · lang · seed · emo | CLAP | EAR verdict |
+|---|---|---|---|---|
+| **`[yawn]`** (tired) | `哈啊` | ryan · EN · **s7** · (no emo) | 0.36 WIN | ✅ **TOP** — sbadiglio di stanchezza. Nit: the following speech comes out *slightly faster* (minor). Re-confirms the shipped preset seed. |
+| **`[yawn:pleasure]`** (NEW variant) | `哈啊` | ryan · EN · **s42** · (no emo) | 0.29 WIN | ✅ **WIN** — a *pleasure/godimento* yawn (satisfied stretch), distinct from the tired `[yawn]`. Named `[yawn:pleasure]` (T4 variant); veto the name if you prefer `[moan]`-family. |
+| **`[throat]` / tsk** (NEW trigger) | `嗯嗯` | ryan · IT · **s42** · disgust | 0.20 (labeled groan) | ✅ **TOP** — a "tsk-tsk" throat-clear (pulirsi la voce/gola). Serendipity: swept as *groan*, landed as **throat-clear** (per the PRINCIPLE, keep it). New trigger — the shipped groan stays `哼` s42. |
+| groan | `嗯嗯` | ryan · EN · s42 · disgust | 0.24 WIN | ❌ separates the two "gr-gr" too much — not a clean groan. |
+| gasp | `啊` | ryan · EN/IT · s7/42/2024 | all DRIFT/MISS | ❌ this pass — `啊` derailed to groan/yawn/laugh (note: `啊` DID win as gasp in the T3 runs above at the per-class seed; this carrier/lang combo didn't). |
+| cry | `呜呜` | ryan · EN/IT · s7/42/2024 | P(cry)=0.00, →yawn | ❌ consistent with hunt #1: `呜呜` performs yawn/sigh-ish, never a cry. |
+
+⇒ **3 saves (user-validated):** `[yawn]`=`哈啊` s7 (tired, re-confirmed) · `[yawn:pleasure]`=`哈啊` s42 (NEW) ·
+`[throat]`=`嗯嗯` s42 IT (NEW, tsk throat-clear). Audio in `samples/tests/2026-07-07_{yawn,groan}_discovery/`.
+**Pending:** cross-voice (vivian/clone) seed check before wiring into `para_pick`; then decide `[yawn:pleasure]`
+final name + whether `[throat]` needs its own preset/clone seed. Harness proved the discovery loop works.
+
+---
+
 ## Status legend
 ✅ WIN (promote to the `[tag]` map) · 🟡 interesting/partial (keep, needs a pick) · ❌ KO (do not re-run) · ↪ produced a different event.
 
