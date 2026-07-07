@@ -33,7 +33,7 @@ OUTDIR=${OUTDIR:-samples/tests/${DATE}_${TAG}_${NAME}}
 # default emotion per event (empty -> --emotion omitted; "none" also omits)
 if [ -z "$EMO" ]; then case "$TAG" in
   sigh) EMO=sad;; laugh) EMO=joy;; cry) EMO=sad;; gasp) EMO=surprise;;
-  groan) EMO=disgust;; yawn) EMO=none;; *) EMO=none;; esac; fi
+  groan) EMO=disgust;; yawn) EMO=none;; moan) EMO=joy;; throat) EMO=none;; *) EMO=none;; esac; fi
 
 # carrier per (tag,lang): %s is where the onomatopoeia goes (comma-delimited inline).
 # New-event carriers are emotionally primed so the model has context for the vocalization.
@@ -51,6 +51,10 @@ carrier() { # $1=tag $2=lang
     yawn:*)        echo "It's so late, %s I can barely keep my eyes open.";;
     groan:Italian) echo "Oh no, %s di nuovo no, che disastro.";;
     groan:*)       echo "Oh no, %s not again, this is awful.";;
+    moan:Italian)  echo "Mmm, %s è davvero delizioso, che bontà.";;
+    moan:*)        echo "Mmm, %s this tastes absolutely delicious.";;
+    throat:Italian) echo "Dunque, %s posso avere la vostra attenzione, prego.";;
+    throat:*)      echo "Ahem, %s may I have your attention, please.";;
     *:Italian)     echo "E poi, %s, la storia è andata proprio così.";;
     *)             echo "And then, %s, the story went exactly like that.";;
   esac

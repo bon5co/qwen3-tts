@@ -68,7 +68,7 @@ CLAP_PROMPTS = {
 CLAP_NEUTRAL = "a person speaking normally"
 
 # ---- Per-tag best backend, set by the E1.2 calibration (2026-07-07). Used when --tagger both. ----
-TAG_BACKEND = {"sigh": "cnn14", "laugh": "clap"}
+TAG_BACKEND = {"sigh": "cnn14", "laugh": "clap", "throat": "cnn14", "cough": "cnn14", "sneeze": "cnn14"}
 DEFAULT_BACKEND = "clap"   # for events AudioSet misses; sigh is the proven cnn14 exception
 
 
