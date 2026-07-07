@@ -142,6 +142,19 @@ validated seed, and generates ONCE. The user NEVER types Chinese. (`para_pick`/`
 `voice_class` split). `[moan]`/`[throat]` stay ryan-only (unshipped, under research for a generalized
 trigger); cry unsolved (needs FT).
 
+### T4 laugh variants + moan/throat generic (2026-07-07, ear verdicts) — laugh ladder needs re-tune
+- **T4 laugh (ryan EN, 哈×N) — ⚠️ named variants NOT cleanly achievable, PARKED.** Ear across a full re-hunt
+  (哈/哈哈/哈哈哈哈/哈哈哈哈哈 × seeds {7,42,100,256,777,2024} + T0.8): **哈哈 s7 (2.4s) too long for a "short"**
+  (model always renders a FULL laugh ~2.4s floor; single 哈 paradoxically gives 5-7s or derails; T0.8 → longer
+  not shorter); **哈哈哈哈哈 s7 (11.7s) laughs well but too long**; **哈哈哈哈 s256 (7.7s) METALLIC/fails** (CLAP
+  0.81 = false positive, precision 0.75). PATTERN: clean laughs are all **seed 7 and scale LONG with onom
+  length**; shortening (other seed / fewer chars→derail or more chars@non-7→metallic) breaks them. ⇒ no clean
+  crisp-short nor right-sized-long. Only the MEDIUM `哈哈哈` s7 (shipped `[laugh]`) is solid. Named `[laugh:short|
+  long]` would need DSP (`--rate`, but it's global) or FT → **PARK T4, keep the single shipped `[laugh]`.**
+- **[moan] generic:** ❌ **vivian `嗯` s256 = METALLIC** (starts as a moan, then laughs, then metallic mumble) —
+  not shippable. Clone 嗯/哈啊 → hum/pant. moan does NOT generalize; ryan-only at best. PARK (research later).
+- **[throat] generic:** ❌ KO — CNN14 (has "Throat clearing") P=0 on 咳/呵/嗯哼. Articulatory ceiling. PARK / FT.
+
 Method: inline substitution, ONE `--emotion` generation @ T1.1, comma-delimited, no event-instruct, no
 steering-span. Seed pinned per-tag (laugh 7 / sigh 42) when the user gave no `--seed`. voice_class = vivian vs
 ryan/clone/other. Nits: mild metallic tail on ryan laugh (later). `haha`@T1.0=alt laugh (ryan-EN only),
