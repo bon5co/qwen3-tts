@@ -63,7 +63,7 @@ Every one of these produced audio. None of them produced *reliable, selectable, 
 The shipped system is two hooks used together:
 
 1. **Activation steering.** A tiny, speaker-and-language-agnostic direction added to the residual stream at layers 21–25 at inference time. It nudges "emotion" without touching timbre. The vectors are a few KB and committed to the repo.
-2. **CSP fine-tune (`.expr`).** A small weight-delta band (a few layers, LoRA-style) trained on real emotional speech — the **Emozionalmente** Italian emotion corpus (CC-BY 4.0; Catania, Wilke & Garzotto, PoliMi, IEEE TASLP 2025). Romance languages transfer from the Italian pack; other languages get their own small pack.
+2. **CSP fine-tune (`.expr`).** A small weight-delta band (a few layers, LoRA-style) trained on real emotional speech — the **[Emozionalmente](https://doi.org/10.1109/TASLPRO.2025.3540662)** corpus, a crowdsourced Italian emotional-speech dataset (CC-BY 4.0) by *Fabio Catania, Jordan W. Wilke & Franca Garzotto* (Politecnico di Milano), in *IEEE TASLP* 2025. It's the real emotional prosody a clone lacks — the steering vector points at "sad," the fine-tune teaches what sad *sounds like*. The `.expr` packs are fetched on demand from Hugging Face ([gabrione/qwen3-tts-italian-expr](https://huggingface.co/gabrione/qwen3-tts-italian-expr), via `download_assets.sh`). Romance languages transfer from the Italian pack; other languages get their own small pack.
 
 The one rule:
 
