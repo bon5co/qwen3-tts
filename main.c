@@ -412,31 +412,11 @@ typedef qwen_cspan_t cspan_t;
  * Plus the PRIMARY levers (memory): a default English instruct + temp 1.1(preset)/1.3(clone), set early.
  * Cross-language (§8.6): for FAR languages (ZH/JA/KO/RU) the IT expr is added as a stabilizer even on
  * STEER cells. Manual --expr/--ml-steer override. 0.6B keeps the legacy .vec path. */
-typedef struct { const char *name; const char *tok; } emo_name_t;
-static const emo_name_t EMOTION_NAMES[] = {
-    { "sad", "sad" }, { "sadness", "sad" },
-    { "joy", "joy" }, { "happy", "joy" }, { "joyful", "joy" },
-    { "anger", "ang" }, { "angry", "ang" }, { "rage", "ang" },
-    { "fear", "fear" }, { "afraid", "fear" },
-    { "disgust", "disgust" }, { "disgusted", "disgust" },
-    { "surprise", "surprise" }, { "surprised", "surprise" },
-    /* Plutchik dyads — 2-primary blends, ear-validated 2026-07-08 (ryan EN+IT). The steer vector
-     * ryan_<tok>.qlsteer is a 50/50 sum of the two primaries (nostalgia 40/60 joy/sad). */
-    { "contempt", "contempt" }, { "scorn", "contempt" },
-    { "awe", "awe" }, { "wonder", "awe" },
-    { "nostalgia", "nostalgia" }, { "wistful", "nostalgia" },
-    { "disapproval", "disapproval" },
-    { "remorse", "remorse" }, { "regret", "remorse" },
-    { "outrage", "outrage" },
-    { "despair", "despair" },
-    { NULL, NULL }
-};
-/* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion. */
+/* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion.
+ * Single source of truth = qwen_tts_emotion.c (the name/dyad table), shared with the compose
+ * per-span path and the server. */
 static const char *emotion_tok(const char *spec) {
-    if (!spec) return NULL;
-    for (int i = 0; EMOTION_NAMES[i].name; i++)
-        if (strcasecmp(spec, EMOTION_NAMES[i].name) == 0) return EMOTION_NAMES[i].tok;
-    return NULL;
+    return qwen_emotion_name_to_tok(spec);
 }
 /* The shippable per-(voice×emotion) recipe (plan §8.3). use_expr/use_steer pick the cell's MODE. */
 typedef struct { const char *voice; const char *tok; int use_expr; float expr_w; int use_steer; float steer_w; } emo_cell_t;
