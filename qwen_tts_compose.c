@@ -223,7 +223,7 @@ int qwen_compose_parse(const char *input, qwen_cspan_t **out, int *out_n) {
                         if (!handled) {
                             if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) {
                                 MK_FLUSH(); cur_mood[0] = 0; handled = 1;
-                            } else if (qwen_emotion_lookup(t)) {
+                            } else if (qwen_emotion_name_to_tok(t)) {   /* new steer emotion (incl. dyads) */
                                 MK_FLUSH(); snprintf(cur_mood, sizeof(cur_mood), "%s", t); handled = 1;
                             }
                         }
@@ -265,7 +265,7 @@ int qwen_compose_has_markup(const char *text) {
         if (strcasecmp(t, "neutral") == 0 || strcasecmp(t, "none") == 0 || strcasecmp(t, "normal") == 0) return 1;
         if (qwen_compose_is_para_event_tag(t)) return 1;
         for (int m = 0; COMPOSE_MACROS[m].tag; m++) if (strcasecmp(t, COMPOSE_MACROS[m].tag) == 0) return 1;
-        if (qwen_emotion_lookup(t)) return 1;
+        if (qwen_emotion_name_to_tok(t)) return 1;
     }
     return 0;
 }
@@ -291,14 +291,23 @@ int qwen_compose_has_para_event(const char *text) {
  * seam logic in the caller. Forces a cold prefill so the previous span can't leak in. */
 static int synth_one_span(qwen_tts_ctx_t *ctx, const qwen_cspan_t *sp, const char *language,
                           int idx, int silent, float **out, int *out_n) {
+    (void)language;
     const char *mood = sp->mood[0] ? sp->mood : NULL;
     float vol = 1.0f, rate = 1.0f;
-    int   sw_set = sp->steer_weight >= 0.0f;                 /* macro -> explicit (0 = no steer) */
-    float sw     = sw_set ? sp->steer_weight : 1.0f;
-    if (qwen_tts_apply_emotion(ctx, mood, NULL, language, sw, sw_set, 0.0f, 0, 1.0f, 0, 1.0f, 0,
-                               &vol, &rate, silent) != 0) return -1;
-    if (sp->rate   > 0.0f) rate = sp->rate;                  /* macro filler overrides recipe rate */
-    if (sp->volume > 0.0f) vol  = sp->volume;                /* and volume */
+
+    /* Per-span emotion = the new qlsteer STEER (1.7B). Save the global ml_steer, install this
+     * span's emotion for the synth, restore after — so a span with NO mood keeps whatever global
+     * steer was set (e.g. a global --emotion), and a per-span [emotion] switches just this span. */
+    float *saved_ml = ctx->ml_steer;
+    int  s_L = ctx->ml_steer_layers, s_D = ctx->ml_steer_dim, s_l0 = ctx->ml_steer_l0, s_l1 = ctx->ml_steer_l1;
+    float s_w = ctx->ml_steer_weight;
+    int installed = 0;
+    if (mood && ctx->config.hidden_size >= 2048) {
+        const char *tok = qwen_emotion_name_to_tok(mood);
+        if (tok && qwen_emotion_steer_install(ctx, tok, 12.0f, 21, 25, silent) == 0) installed = 1;
+    }
+    if (sp->rate   > 0.0f) rate = sp->rate;                  /* macro filler DSP overrides */
+    if (sp->volume > 0.0f) vol  = sp->volume;
     if (!silent) fprintf(stderr, "Span %d: [%s] \"%s\"\n", idx, mood ? mood : "neutral", sp->text);
 
     /* Each span is an INDEPENDENT synthesis: force a cold prefill so the previous span's
@@ -307,6 +316,12 @@ static int synth_one_span(qwen_tts_ctx_t *ctx, const qwen_cspan_t *sp, const cha
 
     float *audio = NULL; int n = 0;
     int grc = qwen_tts_generate(ctx, sp->text, &audio, &n);
+
+    if (installed) {   /* restore the global steer, free this span's buffer */
+        free(ctx->ml_steer);
+        ctx->ml_steer = saved_ml; ctx->ml_steer_layers = s_L; ctx->ml_steer_dim = s_D;
+        ctx->ml_steer_l0 = s_l0; ctx->ml_steer_l1 = s_l1; ctx->ml_steer_weight = s_w;
+    }
     if (grc != 0 || !audio || n <= 0) {
         fprintf(stderr, "Compose: synthesis failed for span %d\n", idx);
         free(audio); return -1;

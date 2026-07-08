@@ -412,22 +412,11 @@ typedef qwen_cspan_t cspan_t;
  * Plus the PRIMARY levers (memory): a default English instruct + temp 1.1(preset)/1.3(clone), set early.
  * Cross-language (§8.6): for FAR languages (ZH/JA/KO/RU) the IT expr is added as a stabilizer even on
  * STEER cells. Manual --expr/--ml-steer override. 0.6B keeps the legacy .vec path. */
-typedef struct { const char *name; const char *tok; } emo_name_t;
-static const emo_name_t EMOTION_NAMES[] = {
-    { "sad", "sad" }, { "sadness", "sad" },
-    { "joy", "joy" }, { "happy", "joy" }, { "joyful", "joy" },
-    { "anger", "ang" }, { "angry", "ang" }, { "rage", "ang" },
-    { "fear", "fear" }, { "afraid", "fear" },
-    { "disgust", "disgust" }, { "disgusted", "disgust" },
-    { "surprise", "surprise" }, { "surprised", "surprise" },
-    { NULL, NULL }
-};
-/* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion. */
+/* Canonical filename token for an --emotion spec, or NULL if it isn't a routed emotion.
+ * Single source of truth = qwen_tts_emotion.c (the name/dyad table), shared with the compose
+ * per-span path and the server. */
 static const char *emotion_tok(const char *spec) {
-    if (!spec) return NULL;
-    for (int i = 0; EMOTION_NAMES[i].name; i++)
-        if (strcasecmp(spec, EMOTION_NAMES[i].name) == 0) return EMOTION_NAMES[i].tok;
-    return NULL;
+    return qwen_emotion_name_to_tok(spec);
 }
 /* The shippable per-(voice×emotion) recipe (plan §8.3). use_expr/use_steer pick the cell's MODE. */
 typedef struct { const char *voice; const char *tok; int use_expr; float expr_w; int use_steer; float steer_w; } emo_cell_t;
@@ -1211,10 +1200,11 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "  --int4                     Q4_0 quantized Talker (1.7B only, smallest memory)\n");
                 fprintf(stderr, "  --quant-mixed              int4 Talker + int8 CP (best CUDA quant: q4 Talker win, no CP degradation)\n");
                 fprintf(stderr, "  --roughness <0..1>         Texture/roughness knob (q2-down blend on Code Predictor)\n");
-                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B): sad/joy/anger/fear/disgust/surprise. PRESET voice =\n");
-                fprintf(stderr, "                             STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
-                fprintf(stderr, "                             Use the NATIVE preset per language (JA ono_anna, KO sohee, ZH vivian, EN/Romance ryan).\n");
-                fprintf(stderr, "                             Optional --instruct/--expr/--ml-steer override. Other moods (excited/proud/...) = legacy palette.\n");
+                fprintf(stderr, "  --emotion <spec>           Emotion in ONE flag (1.7B). Primaries: sad/joy/anger/fear/disgust/surprise.\n");
+                fprintf(stderr, "                             Dyads: contempt/awe/nostalgia/disapproval/remorse/outrage/despair (blended steer).\n");
+                fprintf(stderr, "                             PRESET = STEER ryan_<emo> @ w12 (clean, every language); CLONE = COMBINE (lang .expr + steer).\n");
+                fprintf(stderr, "                             Also inline: write [emotion] tags in --text to switch emotion per sentence (one gen).\n");
+                fprintf(stderr, "                             NATIVE preset per language (JA ono_anna, KO sohee, ZH vivian, EN/Romance ryan). --instruct/-T override.\n");
                 fprintf(stderr, "  --volume <f>               Output gain (1.0=unchanged, e.g. 1.1 louder, 0.9 softer)\n");
                 fprintf(stderr, "  --rate <f>                 Speaking rate, pitch-preserving (1.0=unchanged, >1 faster, <1 slower)\n");
                 fprintf(stderr, "  --compose <spec>           Inline markup synthesis (also works inside --text):\n");

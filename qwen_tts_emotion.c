@@ -24,51 +24,82 @@
 #include <string.h>
 #include <stdint.h>
 
-static const qwen_emotion_recipe_t MANIFEST[] = {
-    /* name        vec_spec    weight rough  vol   rate   description */
-    { "joy",       "excited",  2.6f,  0.00f, 1.10f, 1.10f, "bright, energetic (excited pushed + faster + louder)" },
-    { "happy",     "happy",    1.6f,  0.00f, 1.00f, 1.00f, "mild upbeat (gentle; use 'joy' for strong brightness)" },
-    { "excited",   "excited",  2.2f,  0.00f, 1.00f, 1.00f, "lively, animated" },
-    { "eager",     "eager",    2.0f,  0.00f, 1.00f, 1.00f, "keen, forward-leaning" },
-    { "proud",     "proud",    2.0f,  0.00f, 1.00f, 1.00f, "confident, self-assured" },
-    { "news",      "proud",    2.0f,  0.00f, 1.00f, 1.00f, "authoritative news-anchor delivery" },
-    { "dramatic",  "dramatic", 2.0f,  0.00f, 1.00f, 1.00f, "theatrical, weighty" },
-    { "calm",      "calm",     1.6f,  0.00f, 0.95f, 0.96f, "relaxed, unhurried (slightly slower/softer)" },
-    /* down-moods: the sadness comes from PROSODY (slow + soft), steering is LOW —
-     * high weight pushes the IT direction off-manifold into a 'Chinese tone' basin
-     * (ear-validated 2026-06-07: sad sweet spot = weight ~1.1 + rate 0.80 + vol 0.86;
-     * the gloomy direction goes off-manifold even at 1.0, so it stays lower). */
-    { "sad",       "sad",      1.1f,  0.00f, 0.86f, 1.08f, "downcast (steering + quiet, lightly compressed so words don't drag)" },
-    { "gloomy",    "gloomy",   0.5f,  0.00f, 0.88f, 0.82f, "somber, low (mostly prosody; gloomy dir is off-manifold-prone on IT)" },
-    { "annoyed",   "angry",    2.6f,  0.32f, 1.05f, 1.05f, "irritated/short-tempered (angry + grit + brisk)" },
-    { "stern",     "angry",    2.6f,  0.28f, 1.05f, 1.00f, "firm, authoritative reprimand" },
-    { "angry",     "angry",    2.6f,  0.40f, 1.05f, 1.05f, "forceful/heated (full furious rage is out of model reach)" },
-    { NULL, NULL, 0.0f, 0.0f, 0.0f, 0.0f, NULL }
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The qlsteer STEER emotion system (the ONLY emotion path on 1.7B) — shared by the
+ * CLI --emotion router, the per-span inline [emotion] compose path, and the server.
+ * ──────────────────────────────────────────────────────────────────────────── */
+typedef struct { const char *name, *tok; } emo_name_t;
+static const emo_name_t EMOTION_NAMES[] = {
+    { "sad", "sad" }, { "sadness", "sad" },
+    { "joy", "joy" }, { "happy", "joy" }, { "joyful", "joy" },
+    { "anger", "ang" }, { "angry", "ang" }, { "rage", "ang" },
+    { "fear", "fear" }, { "afraid", "fear" },
+    { "disgust", "disgust" }, { "disgusted", "disgust" },
+    { "surprise", "surprise" }, { "surprised", "surprise" },
+    /* Plutchik dyads — 2-primary blends, ear-validated 2026-07-08 (ryan EN+IT). */
+    { "contempt", "contempt" }, { "scorn", "contempt" },
+    { "awe", "awe" }, { "wonder", "awe" },
+    { "nostalgia", "nostalgia" }, { "wistful", "nostalgia" },
+    { "disapproval", "disapproval" },
+    { "remorse", "remorse" }, { "regret", "remorse" },
+    { "outrage", "outrage" },
+    { "despair", "despair" },
+    { NULL, NULL }
+};
+/* Distinct canonical tokens, in a sensible display order (primaries then dyads). */
+static const char *const EMOTION_STEER_TOKS[] = {
+    "sad", "joy", "ang", "fear", "disgust", "surprise",
+    "contempt", "awe", "nostalgia", "disapproval", "remorse", "outrage", "despair", NULL
 };
 
-const qwen_emotion_recipe_t *qwen_emotion_lookup(const char *name) {
+const char *qwen_emotion_name_to_tok(const char *name) {
     if (!name) return NULL;
-    for (int i = 0; MANIFEST[i].name; i++)
-        if (strcasecmp(name, MANIFEST[i].name) == 0) return &MANIFEST[i];
+    for (int i = 0; EMOTION_NAMES[i].name; i++)
+        if (strcasecmp(name, EMOTION_NAMES[i].name) == 0) return EMOTION_NAMES[i].tok;
     return NULL;
 }
 
-const qwen_emotion_recipe_t *qwen_emotion_table(int *count) {
-    if (count) {
-        int n = 0;
-        while (MANIFEST[n].name) n++;
-        *count = n;
-    }
-    return MANIFEST;
+const char *const *qwen_emotion_steer_names(int *count) {
+    if (count) { int n = 0; while (EMOTION_STEER_TOKS[n]) n++; *count = n; }
+    return EMOTION_STEER_TOKS;
 }
 
-/* ── Emotion application (shared by CLI + server) ──────────────────────────
- * Moved out of main.c so both the CLI and the HTTP server apply the SAME
- * ear-validated recipe. Loads the steering vector for (emotion, language) into
- * ctx->cp_steer_vec/dim/weight + sets ctx->cp_roughness, and returns the
- * effective volume/rate (the recipe value unless a *_set override is passed). */
+int qwen_emotion_steer_install(qwen_tts_ctx_t *ctx, const char *tok, float weight, int l0, int l1, int silent) {
+    if (!ctx || !tok) return -1;
+    char path[256];
+    snprintf(path, sizeof(path), "presets/steer/emotion/ryan_%s.qlsteer", tok);
+    FILE *f = fopen(path, "rb");
+    if (!f) { if (!silent) fprintf(stderr, "Emotion: steer vector '%s' not found\n", path); return -1; }
+    uint32_t magic = 0; int32_t L = 0, D = 0;
+    int want_L = ctx->config.num_layers + 1, want_D = ctx->config.hidden_size;
+    if (fread(&magic, 4, 1, f) != 1 || fread(&L, 4, 1, f) != 1 || fread(&D, 4, 1, f) != 1 ||
+        magic != 0x54534C51u /* 'QLST' */ || L != want_L || D != want_D) {
+        if (!silent) fprintf(stderr, "Emotion: '%s' shape %dx%d != %dx%d (skipped)\n", path, L, D, want_L, want_D);
+        fclose(f); return -1;
+    }
+    size_t n = (size_t)L * D;
+    float *buf = (float *)malloc(n * sizeof(float));
+    if (!buf || fread(buf, sizeof(float), n, f) != n) { free(buf); fclose(f); return -1; }
+    fclose(f);
+    /* Install WITHOUT freeing a previous ml_steer — caller owns save/restore. */
+    ctx->ml_steer = buf; ctx->ml_steer_layers = L; ctx->ml_steer_dim = D;
+    ctx->ml_steer_weight = weight;
+    ctx->ml_steer_l0 = l0 < 0 ? 0 : l0;
+    ctx->ml_steer_l1 = l1 >= L ? L - 1 : l1;
+    if (!silent) fprintf(stderr, "Emotion steer: %s (L%d-%d, weight %.1f)\n",
+                         path, ctx->ml_steer_l0, ctx->ml_steer_l1, weight);
+    return 0;
+}
 
-/* Load a .vec steer file (QSTV magic + int32 dim + dim*float32), accumulate scaled. */
+/* The legacy .vec emotion MOOD palette (joy=excited, proud, calm, annoyed, …) is RETIRED
+ * (2026-07-08, user verdict: the old CP-steer .vec emotions were weak). Named emotions now
+ * ALWAYS route to the new qlsteer STEER above (primaries + dyads). The generic --roughness
+ * texture knob and the raw --steer-vector power-user vector are kept below (not "emotions"). */
+
+/* ── Emotion application (shared by CLI + server) — new steer on 1.7B, else knobs ── */
+
+/* Load a .vec steer file (QSTV magic + int32 dim + dim*float32), accumulate scaled.
+ * Only used now by the raw --steer-vector power-user path. */
 static int load_steer_vec_accum(const char *path, float scale, float **acc, int expect_dim) {
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "Error: cannot open steer vector '%s'\n", path); return -1; }
@@ -92,96 +123,48 @@ static int load_steer_vec_accum(const char *path, float scale, float **acc, int 
 }
 
 /* Resolve an emotion preset name to its .vec path (first hit wins), language-aware. */
-static int resolve_emotion_path(const char *name, const char *language, char *out, size_t outsz) {
-    const char *bases[] = { getenv("QWEN_EMOTION_DIR"), "presets/emotions", "voices/emotions" };
-    const char *it_subs[] = { "it_centered", "it", NULL };
-    const char *none[]    = { NULL };
-    const char **subs = none;
-    if (language && strcasecmp(language, "Italian") == 0) subs = it_subs;
-    for (size_t i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
-        if (!bases[i] || !*bases[i]) continue;
-        for (int s = 0; subs[s]; s++) {
-            snprintf(out, outsz, "%s/%s/%s.vec", bases[i], subs[s], name);
-            FILE *f = fopen(out, "rb");
-            if (f) { fclose(f); return 0; }
-        }
-        snprintf(out, outsz, "%s/%s.vec", bases[i], name);
-        FILE *f = fopen(out, "rb");
-        if (f) { fclose(f); return 0; }
-    }
-    return -1;
-}
-
 int qwen_tts_apply_emotion(qwen_tts_ctx_t *ctx,
         const char *emotion_spec, const char *steer_vector_path, const char *language,
         float sw, int sw_set, float ro, int ro_set,
         float vo, int vo_set, float ra, int ra_set,
         float *out_volume, float *out_rate, int silent) {
+    (void)language; (void)sw_set;
     int cp_h = ctx->config.cp_hidden_size;
-    float eff_steer_weight = sw, eff_roughness = ro, eff_volume = vo, eff_rate = ra;
-    const char *vec_spec = emotion_spec;
-    const qwen_emotion_recipe_t *recipe = NULL;
+    float eff_roughness = ro; (void)ro_set;
 
+    /* Clear any prior steer (both CP-legacy and the Talker ml_steer) so emotion never leaks across
+     * calls/requests. */
     if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
     ctx->cp_roughness = 0.0f;
 
-    if (emotion_spec && !strchr(emotion_spec, ',') && !strchr(emotion_spec, ':'))
-        recipe = qwen_emotion_lookup(emotion_spec);
-    if (recipe) {
-        vec_spec = recipe->vec_spec;
-        if (!sw_set) eff_steer_weight = recipe->steer_weight;
-        if (!ro_set) eff_roughness    = recipe->roughness;
-        if (!vo_set) eff_volume       = recipe->volume;
-        if (!ra_set) eff_rate         = recipe->rate;
-        if (!silent)
-            fprintf(stderr, "Emotion '%s' -> %s\n  (vec=%s weight=%.2f roughness=%.2f volume=%.2f rate=%.2f)\n",
-                    emotion_spec, recipe->desc, vec_spec ? vec_spec : "(none)",
-                    eff_steer_weight, eff_roughness, eff_volume, eff_rate);
+    /* ── The ONLY emotion path: the new qlsteer STEER (primaries + Plutchik dyads), 1.7B. ──
+     * A named emotion ALWAYS routes here (the legacy .vec mood palette is retired). On 0.6B the
+     * install fails on shape and emotion is a no-op (emotion is a 1.7B feature). */
+    if (emotion_spec && emotion_spec[0] && ctx->config.hidden_size >= 2048) {
+        if (ctx->ml_steer) { free(ctx->ml_steer); ctx->ml_steer = NULL; ctx->ml_steer_layers = 0; }
+        const char *tok = qwen_emotion_name_to_tok(emotion_spec);
+        if (tok) qwen_emotion_steer_install(ctx, tok, 12.0f, 21, 25, silent);      /* best-effort */
+        else if (!silent) fprintf(stderr, "Note: '%s' is not a known emotion (ignored)\n", emotion_spec);
+        if (out_volume) *out_volume = vo_set ? vo : 1.0f;
+        if (out_rate)   *out_rate   = ra_set ? ra : 1.0f;
+        return 0;
     }
 
+    /* ── Generic knobs (NOT emotions): --roughness texture + raw --steer-vector control vector. ── */
     if (eff_roughness > 0.0f) {
         if (eff_roughness > 1.0f) eff_roughness = 1.0f;
         ctx->cp_roughness = eff_roughness;
-        if (!silent && !recipe) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
+        if (!silent) fprintf(stderr, "Roughness: %.2f (q2-down blend on Code Predictor)\n", eff_roughness);
     }
-
-    if (vec_spec || steer_vector_path) {
+    if (steer_vector_path) {
         float *steer_acc = NULL;
-        if (vec_spec) {
-            char *spec = strdup(vec_spec);
-            for (char *tok = strtok(spec, ","); tok; tok = strtok(NULL, ",")) {
-                float scale = 1.0f;
-                char *colon = strchr(tok, ':');
-                if (colon) { *colon = '\0'; scale = (float)atof(colon + 1); }
-                char path[1024];
-                if (resolve_emotion_path(tok, language, path, sizeof(path)) != 0) {
-                    if (recipe) {
-                        if (!silent) fprintf(stderr, "Note: mood '%s' has no '%s' vector for this language; "
-                                                     "applying roughness/volume/rate only.\n", emotion_spec, tok);
-                    } else {
-                        fprintf(stderr, "Error: unknown emotion preset '%s' "
-                            "(looked in $QWEN_EMOTION_DIR, presets/emotions/[<lang>/], voices/emotions/)\n", tok);
-                        free(spec); free(steer_acc); return -1;
-                    }
-                } else if (load_steer_vec_accum(path, scale, &steer_acc, cp_h) != 0) {
-                    free(spec); free(steer_acc); return -1;
-                } else if (!silent && !recipe) {
-                    fprintf(stderr, "Emotion: %s x%.2f (%s)\n", tok, scale, path);
-                }
-            }
-            free(spec);
-        }
-        if (steer_vector_path && load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) {
-            free(steer_acc); return -1;
-        }
+        if (load_steer_vec_accum(steer_vector_path, 1.0f, &steer_acc, cp_h) != 0) { free(steer_acc); return -1; }
         if (steer_acc) {
-            ctx->cp_steer_vec = steer_acc;
-            ctx->cp_steer_dim = cp_h;
-            ctx->cp_steer_weight = eff_steer_weight;
-            if (!silent) fprintf(stderr, "Steering: active (dim=%d, weight=%.2f)\n", cp_h, eff_steer_weight);
+            ctx->cp_steer_vec = steer_acc; ctx->cp_steer_dim = cp_h; ctx->cp_steer_weight = sw;
+            if (!silent) fprintf(stderr, "Steering: custom vector (dim=%d, weight=%.2f)\n", cp_h, sw);
         }
     }
-    if (out_volume) *out_volume = eff_volume;
-    if (out_rate)   *out_rate   = eff_rate;
+    if (out_volume) *out_volume = vo_set ? vo : 1.0f;
+    if (out_rate)   *out_rate   = ra_set ? ra : 1.0f;
     return 0;
 }

@@ -303,9 +303,11 @@ static void reset_request_state(qwen_tts_ctx_t *ctx) {
     ctx->instruct = NULL;
 
     /* Clear any emotion steering from a prior request (must not leak between requests).
-     * qwen_tts_apply_emotion also clears it, but a request with NO emotion needs this. */
+     * qwen_tts_apply_emotion also clears it, but a request with NO emotion needs this.
+     * The new emotion path is the Talker ml_steer (qlsteer) — clear it too. */
     if (ctx->cp_steer_vec) { free(ctx->cp_steer_vec); ctx->cp_steer_vec = NULL; ctx->cp_steer_dim = 0; }
     ctx->cp_roughness = 0.0f;
+    if (ctx->ml_steer) { free(ctx->ml_steer); ctx->ml_steer = NULL; ctx->ml_steer_layers = 0; }
 
     /* Fresh seed per request (time-based) */
     struct timeval tv;
