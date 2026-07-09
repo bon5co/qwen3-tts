@@ -2095,18 +2095,26 @@ static void q4_0_mv_task(size_t tid, size_t nt, void *vc) {
     q4_0_matvec_inner(c->y + r0, c->x, c->W + (size_t)r0 * c->blocks_per_row,
                       c->cols, r1 - r0);
 }
+#if defined(__ARM_FEATURE_DOTPROD)
+enum { Q4_QX_MAX = 8192 };
+/* Shared one-time QWEN_NO_SDOT cache (audit #10 race-free). 1 = force the legacy
+ * f32-dequant q4 path (the A/B bench + quant-ladder gate); shared by qwen_matvec_q4_0
+ * and the fused qwen_matvec_q4_0_qkv so single-stream stays self-consistent. */
+static int q4_sdot_disabled(void) {
+    static atomic_int off = -1;
+    int v = atomic_load_explicit(&off, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("QWEN_NO_SDOT"); v = (e && e[0] == '1'); atomic_store_explicit(&off, v, memory_order_relaxed); }
+    return v;
+}
+#endif
+
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
 #if defined(__ARM_FEATURE_DOTPROD)
     /* SDOT-native path (plan_v4 B1): quantize the shared activation to int8 once,
-     * then int8×int8 dot per nibble-block. QWEN_NO_SDOT=1 forces the legacy
-     * f32-dequant path (the A/B bench + quant-ladder gate). cols beyond the cap
-     * (rare; only very large matrices) falls through to the f32 path. */
-    enum { Q4_QX_MAX = 8192 };
-    static atomic_int q4sdot_off = -1;
-    int off = atomic_load_explicit(&q4sdot_off, memory_order_relaxed);
-    if (off < 0) { const char *e = getenv("QWEN_NO_SDOT"); off = (e && e[0] == '1'); atomic_store_explicit(&q4sdot_off, off, memory_order_relaxed); }
-    if (!off && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
+     * then int8×int8 dot per nibble-block. cols beyond the cap (rare; only very
+     * large matrices) falls through to the f32 path. */
+    if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
         int8_t qx_buf[Q4_QX_MAX];
         float sx = quantize_act_int8(qx_buf, x, cols);
         int nt = g_n_threads;
@@ -2164,10 +2172,62 @@ static void q4_0_qkv_task(size_t tid, size_t nt, void *vc) {
         }
     }
 }
+#if defined(__ARM_FEATURE_DOTPROD)
+/* SDOT fused-QKV (plan_v4 B1 + #7): quantize the shared activation to int8 ONCE,
+ * then SDOT for Q/K/V. Keeps single-stream int4 QKV consistent with the standalone
+ * q4 matvec (and with the batched path). Partitions the [Q|K|V] rows like the
+ * f32 twin so it picks up the same threading. */
+typedef struct {
+    float *q, *k, *v;
+    const q4_0_block_t *Wq, *Wk, *Wv;
+    const int8_t *qx; float sx;
+    int in_dim, q_dim, kv_dim;
+} q4_0_qkv_sdot_ctx;
+static void q4_0_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_0_qkv_sdot_ctx *c = (q4_0_qkv_sdot_ctx *)vc;
+    int total = c->q_dim + 2 * c->kv_dim;
+    int nb = c->in_dim / Q4_0_BLOCK_SIZE;
+    int r0 = (int)(tid * (size_t)total / nt);
+    int r1 = (int)((tid + 1) * (size_t)total / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int end = r1 < c->q_dim ? r1 : c->q_dim;
+            q4_0_matvec_sdot(c->q + r, c->qx, c->sx, c->Wq + (size_t)r * nb, c->in_dim, end - r);
+            r = end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            q4_0_matvec_sdot(c->k + local, c->qx, c->sx, c->Wk + (size_t)local * nb, c->in_dim, (end - c->q_dim) - local);
+            r = end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            q4_0_matvec_sdot(c->v + local, c->qx, c->sx, c->Wv + (size_t)local * nb, c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
+#endif
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (!q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
+        int8_t qx_buf[Q4_QX_MAX];
+        float sx = quantize_act_int8(qx_buf, x, in_dim);
+        int nt = g_n_threads;
+        if (nt > 1) {
+            q4_0_qkv_sdot_ctx c = { q, k, v, Wq, Wk, Wv, qx_buf, sx, in_dim, q_dim, kv_dim };
+            qwen_parallel((size_t)nt, q4_0_qkv_sdot_task, &c);
+            return;
+        }
+        q4_0_matvec_sdot(q, qx_buf, sx, Wq, in_dim, q_dim);
+        q4_0_matvec_sdot(k, qx_buf, sx, Wk, in_dim, kv_dim);
+        q4_0_matvec_sdot(v, qx_buf, sx, Wv, in_dim, kv_dim);
+        return;
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1) {
         q4_0_qkv_ctx c = { q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim,
