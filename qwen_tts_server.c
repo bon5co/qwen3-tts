@@ -409,8 +409,8 @@ static char *parse_tts_request(qwen_tts_ctx_t *ctx, const char *body,
     float req_rate = (float)json_extract_number(body, "rate", 1.0);
     char *emotion = json_extract_string(body, "emotion");
     if (emotion && emotion[0]) {
-        qwen_tts_apply_emotion(ctx, emotion, NULL, language,
-                               1.0f, 0, 0.0f, 0, req_vol, vol_present, req_rate, rate_present,
+        qwen_tts_apply_emotion(ctx, emotion, language,
+                               0.0f, 0, req_vol, vol_present, req_rate, rate_present,
                                &eff_vol, &eff_rate, 0);
     } else {
         eff_vol  = vol_present  ? req_vol  : 1.0f;
