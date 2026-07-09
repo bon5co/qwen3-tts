@@ -457,18 +457,18 @@ EMO_FT_TEXT  = Che bella notizia, sono davvero felicissimo oggi!
 test-emotion-ft: $(TARGET)
 	@echo "=== Emotion fine-tune (.expr graft) smoke — CSP Italian on 1.7B ==="
 	@mkdir -p $(TEST_DIR)
-	@test -f $(EXPR_FT) || { echo "  SKIP: $(EXPR_FT) not present (local-only emotion FT pack)"; exit 0; }
-	@test -d $(MODEL_LARGE) || { echo "  SKIP: $(MODEL_LARGE) not present"; exit 0; }
-	@# (1) PRESET ryan + emotion FT pack + EN instruct
-	@./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -s ryan -l Italian \
+	@# One shell block so a SKIP truly skips the whole target: in make each @-line is a
+	@# separate shell, so `exit 0` on its own line only ends that line — the render below
+	@# would still run (missing --expr pack) and FAIL. Keep the guards + body together.
+	@if [ ! -f $(EXPR_FT) ]; then echo "  SKIP: $(EXPR_FT) not present (local-only emotion FT pack)"; exit 0; fi; \
+	 if [ ! -d $(MODEL_LARGE) ]; then echo "  SKIP: $(MODEL_LARGE) not present"; exit 0; fi; \
+	 ./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -s ryan -l Italian \
 		--expr $(EXPR_FT) --instruct "$(EMO_FT_INSTR)" \
-		--text "$(EMO_FT_TEXT)" -o $(TEST_DIR)/ft_ryan.wav 2>$(TEST_DIR)/ft_ryan.log
-	@grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_ryan.log || { echo "FAIL: .expr pack not applied (preset)"; cat $(TEST_DIR)/ft_ryan.log; exit 1; }
-	@test -s $(TEST_DIR)/ft_ryan.wav || { echo "FAIL: preset+FT produced no audio"; exit 1; }
-	@echo "  PASS: emotion FT pack applied on preset ryan -> audio"
-	@# (2) CLONE graft (--icl-only keeps CV weights so the FT pack restores cleanly). Uses the CC0 reference
-	@#     voice galatea_graft.qvoice — get it with `bash download_voices.sh` (else this case SKIPs cleanly).
-	@if [ -f voices/galatea_graft.qvoice ]; then \
+		--text "$(EMO_FT_TEXT)" -o $(TEST_DIR)/ft_ryan.wav 2>$(TEST_DIR)/ft_ryan.log; \
+	 grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_ryan.log || { echo "FAIL: .expr pack not applied (preset)"; cat $(TEST_DIR)/ft_ryan.log; exit 1; }; \
+	 test -s $(TEST_DIR)/ft_ryan.wav || { echo "FAIL: preset+FT produced no audio"; exit 1; }; \
+	 echo "  PASS: emotion FT pack applied on preset ryan -> audio"; \
+	 if [ -f voices/galatea_graft.qvoice ]; then \
 		./$(TARGET) -d $(MODEL_LARGE) -j1 -T 1.1 --seed 42 -l Italian \
 			--load-voice voices/galatea_graft.qvoice --icl-only \
 			--expr $(EXPR_FT) --instruct "$(EMO_FT_INSTR)" \
@@ -476,8 +476,8 @@ test-emotion-ft: $(TARGET)
 		grep -qiE "Expressivity: applied [1-9][0-9]*/" $(TEST_DIR)/ft_clone.log || { echo "FAIL: .expr pack not applied (clone graft)"; cat $(TEST_DIR)/ft_clone.log; exit 1; }; \
 		test -s $(TEST_DIR)/ft_clone.wav || { echo "FAIL: clone+FT produced no audio"; exit 1; }; \
 		echo "  PASS: emotion FT pack applied on galatea --icl-only graft -> audio"; \
-	else echo "  SKIP: voices/galatea_graft.qvoice not present (run: bash download_voices.sh)"; fi
-	@echo "PASS: emotion fine-tune (.expr) smoke"
+	 else echo "  SKIP: voices/galatea_graft.qvoice not present (run: bash download_voices.sh)"; fi; \
+	 echo "PASS: emotion fine-tune (.expr) smoke"
 	@echo ""
 
 # Emotion DEMO for new users: render the validated `--emotion` recipe across emotions, LANGUAGES and a
