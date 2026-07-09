@@ -660,6 +660,31 @@ int qwen_talker_step(qwen_tts_ctx_t *ctx, float *embed, float *hidden_out) {
  * Prefill (multi-token)
  * ======================================================================== */
 
+/* plan_v4 D1: prefill projection straight off bf16 weights, no per-layer
+ * bf16->f32 conversion. Y[seq][out] = Xn[seq][in] @ W_bf16^T via qwen_matmat_bf16
+ * (weight streamed once per <=16-col tile, bf16 = half the DRAM of the f32 convert).
+ * matmat wants X as [in][B] and Y as [out][B], B<=16 (the fixed-B fast path caps at
+ * 16), so tile seq into <=16 chunks and transpose in/out — cheap O(seq*dim) vs the
+ * O(seq*dim*dim) gemm. Env-gated (QWEN_PREFILL_MATMAT=1) so we can A/B vs BLAS: on
+ * M1 Accelerate sgemm rides the AMX coprocessor, so this only wins where BLAS is
+ * weak/absent (the #else scalar path, Linux OpenBLAS) or when the convert dominates. */
+static void prefill_proj_matmat(float *Y, const uint16_t *W, const float *Xn,
+                                int seq, int in_dim, int out_dim,
+                                float *xT, float *yT) {
+    for (int s0 = 0; s0 < seq; s0 += 16) {
+        int B = seq - s0; if (B > 16) B = 16;
+        for (int b = 0; b < B; b++) {
+            const float *xr = Xn + (int64_t)(s0 + b) * in_dim;
+            for (int k = 0; k < in_dim; k++) xT[(int64_t)k * B + b] = xr[k];
+        }
+        qwen_matmat_bf16(yT, W, xT, out_dim, in_dim, B);   /* yT[out][B] */
+        for (int b = 0; b < B; b++) {
+            float *yr = Y + (int64_t)(s0 + b) * out_dim;
+            for (int o = 0; o < out_dim; o++) yr[o] = yT[(int64_t)o * B + b];
+        }
+    }
+}
+
 int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     qwen_tts_config_t *c = &ctx->config;
     int h = c->hidden_size;
@@ -667,6 +692,39 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     int kv_dim = c->num_kv_heads * c->head_dim;
     int inter = c->intermediate_size;
     float eps = c->rms_norm_eps;
+
+    /* plan_v4 D1: route the prefill projections through qwen_matmat_bf16 (direct
+     * bf16 weights, no per-layer f32 conversion). MEASURED on M1: Accelerate's
+     * sgemm rides the AMX matrix coprocessor and beats NEON matmat ~4.7× for the
+     * prefill gemm, so with USE_BLAS this LOSES (kept off by default). Without BLAS
+     * it replaces the naive scalar triple-loop (a large win) AND drops the f32
+     * convert, so it's the default there. QWEN_PREFILL_MATMAT=1/0 forces either way
+     * (e.g. to bench a weak-BLAS Linux box where matmat may win). */
+    static __thread int mm_env = -1;
+    if (mm_env < 0) {
+        const char *e = getenv("QWEN_PREFILL_MATMAT");
+        if (e) mm_env = (e[0] == '1');
+#ifdef USE_BLAS
+        else mm_env = 0;   /* AMX/BLAS sgemm wins on M1; keep it */
+#else
+        else mm_env = 1;   /* no BLAS: matmat_bf16 >> scalar, and skips the convert */
+#endif
+    }
+    int use_matmat = mm_env;
+    static __thread float *pp_xT = NULL, *pp_yT = NULL;
+    static __thread int pp_cap = 0;
+    if (use_matmat) {
+        int need_in = (h > inter ? h : inter);       /* max projection input dim */
+        int need_out = 2 * inter;                     /* max projection output dim */
+        int cap = (need_in > need_out ? need_in : need_out) * 16;
+        if (cap > pp_cap) {
+            float *nx = (float *)realloc(pp_xT, (size_t)need_in * 16 * sizeof(float));
+            float *ny = (float *)realloc(pp_yT, (size_t)need_out * 16 * sizeof(float));
+            if (nx) pp_xT = nx;
+            if (ny) pp_yT = ny;
+            if (!pp_xT || !pp_yT) { use_matmat = 0; } else { pp_cap = cap; }
+        }
+    }
 
     if (!ctx->silent) fprintf(stderr, "  Prefill: %d tokens, hidden=%d\n", seq_len, h);
 
@@ -730,18 +788,26 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
     for (int layer = 0; layer < c->num_layers; layer++) {
         qwen_talker_layer_t *l = &ctx->layers[layer];
 
-        /* Convert bf16 weights to f32 for this layer */
-        bf16_to_f32_matrix(wq_f32, l->wq_bf16, (int64_t)q_dim * h);
-        bf16_to_f32_matrix(wk_f32, l->wk_bf16, (int64_t)kv_dim * h);
-        bf16_to_f32_matrix(wv_f32, l->wv_bf16, (int64_t)kv_dim * h);
-        bf16_to_f32_matrix(wo_f32, l->wo_bf16, (int64_t)h * q_dim);
-        bf16_to_f32_matrix(gate_up_f32, l->gate_up_fused_bf16, (int64_t)2 * inter * h);
-        bf16_to_f32_matrix(down_f32, l->down_bf16, (int64_t)h * inter);
+        /* Convert bf16 weights to f32 for this layer (skipped in D1 matmat mode,
+         * which reads the bf16 weights directly). */
+        if (!use_matmat) {
+            bf16_to_f32_matrix(wq_f32, l->wq_bf16, (int64_t)q_dim * h);
+            bf16_to_f32_matrix(wk_f32, l->wk_bf16, (int64_t)kv_dim * h);
+            bf16_to_f32_matrix(wv_f32, l->wv_bf16, (int64_t)kv_dim * h);
+            bf16_to_f32_matrix(wo_f32, l->wo_bf16, (int64_t)h * q_dim);
+            bf16_to_f32_matrix(gate_up_f32, l->gate_up_fused_bf16, (int64_t)2 * inter * h);
+            bf16_to_f32_matrix(down_f32, l->down_bf16, (int64_t)h * inter);
+        }
 
         /* 1. Input RMSNorm for all positions */
         qwen_rms_norm(pref_x_norm, residual, l->input_norm, seq_len, h, eps);
 
         /* 2. QKV projections */
+        if (use_matmat) {
+            prefill_proj_matmat(pref_q, l->wq_bf16, pref_x_norm, seq_len, h, q_dim,  pp_xT, pp_yT);
+            prefill_proj_matmat(pref_k, l->wk_bf16, pref_x_norm, seq_len, h, kv_dim, pp_xT, pp_yT);
+            prefill_proj_matmat(pref_v, l->wv_bf16, pref_x_norm, seq_len, h, kv_dim, pp_xT, pp_yT);
+        } else {
 #ifdef USE_BLAS
         /* x_norm[seq_len, h] × W^T[h, out_dim] = out[seq_len, out_dim] */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -779,6 +845,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 #endif
+        }
 
         /* 3. Q/K RMSNorm per-head */
         qwen_rms_norm_per_head(pref_q, l->q_norm, seq_len, c->num_heads, c->head_dim, eps);
@@ -805,6 +872,11 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
                               c->head_dim, scale, 0);
 
         /* 7. Output projection + residual */
+        if (use_matmat) {
+            prefill_proj_matmat(pref_proj, l->wo_bf16, pref_attn_out, seq_len, q_dim, h, pp_xT, pp_yT);
+            for (int64_t i = 0; i < (int64_t)seq_len * h; i++)
+                residual[i] += pref_proj[i];
+        } else {
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     seq_len, h, q_dim, 1.0f,
@@ -823,11 +895,15 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 #endif
+        }
 
         /* 8. Post-attention RMSNorm */
         qwen_rms_norm(pref_x_norm, residual, l->post_attn_norm, seq_len, h, eps);
 
         /* 9. SwiGLU FFN (fused gate+up: interleaved [g0,u0,g1,u1,...]) */
+        if (use_matmat) {
+            prefill_proj_matmat(pref_gate, l->gate_up_fused_bf16, pref_x_norm, seq_len, h, 2 * inter, pp_xT, pp_yT);
+        } else {
 #ifdef USE_BLAS
         /* Single sgemm: output is [seq_len, 2*inter] interleaved */
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
@@ -845,6 +921,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 #endif
+        }
 
         /* SiLU(gate) * up on interleaved pairs, compact to stride=inter.
          * Uses batch vvexpf on macOS for faster exp. */
@@ -858,6 +935,11 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
         }
 
         /* Down projection + residual (compacted: lda=inter) */
+        if (use_matmat) {
+            prefill_proj_matmat(pref_proj, l->down_bf16, pref_gate, seq_len, inter, h, pp_xT, pp_yT);
+            for (int64_t i = 0; i < (int64_t)seq_len * h; i++)
+                residual[i] += pref_proj[i];
+        } else {
 #ifdef USE_BLAS
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     seq_len, h, inter, 1.0f,
@@ -876,6 +958,7 @@ int qwen_talker_prefill(qwen_tts_ctx_t *ctx, float *input_embeds, int seq_len) {
             }
         }
 #endif
+        }
 
         if (ctx->debug) {
             fprintf(stderr, "  Layer %d/%d done", layer + 1, c->num_layers);
