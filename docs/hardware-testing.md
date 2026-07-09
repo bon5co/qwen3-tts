@@ -257,10 +257,32 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 | _M2/M4_ | batch | | | | | native matmul twin candidate |
 | _Zen4 (AVX-512+VNNI)_ | single | | | | | VNNI int8 |
 | _Zen4_ | batch | | | | | int4+batch expected sweet spot |
-| _Zen5 Turin_ | single | | | | | |
-| _Zen5 Turin_ | batch | | | | | throughput target |
+| **Zen5 Turin** (EPYC 9555P, 4vCPU) | single | 2.39 | **2.12** | 2.75 | int8 1.05s / int4 1.41s | 2026-07-09; **int4-VNNI (C7) LOSES to int8** — opposite of M1 |
+| _Zen5 Turin_ | batch | | | | | throughput target (batched-server stall bug found, see §5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |
+
+### §5.note — EPYC 9555P Zen5 run (2026-07-09) — what DIFFERS from M1
+Real AVX-512-VNNI box (Scaleway STANDARD3-X4C-16G, `avx512_vnni`+`avx512_bf16`). Findings that
+diverge from the M1 dev box — record these so we don't assume M1 behavior carries over:
+1. **C7 q4-VNNI is CORRECT but NOT faster.** `--self-test` PASS on real VNNI (numeric correctness proven —
+   the thing M1 can't check). But single-stream int4-VNNI **RTF 2.76 vs int8 2.01 at -j1 (same 44 frames)
+   = ~37% SLOWER** — the *opposite* of M1, where int4-SDOT beats int8. Even the legacy f32-dequant q4 (2.31)
+   beats int4-VNNI. Cause: the v1 kernel is correctness-first (per-block 2× `_mm512_reduce`, 32-wide block
+   zero-extended into a 512-bit `dpbusd` = half the lane width wasted) → compute overhead eats the
+   half-the-bytes bandwidth win. The plan_v4 C7 throughput TODOs (2-blocks-per-512b full-width, drop the
+   per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
+2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
+   port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.
+3. **Batched server stalls on a sub-batch request:** 1 request to a `--batch-size 4` server took **262s**
+   (waits to fill the batch / no partial-batch flush / long admission) — and pegged the 4 vCPUs enough to
+   make sshd unresponsive. A `--batch-size N` server must flush partial batches on an admission timeout;
+   file as an engine bug. (Throughput row above still TBD — needs `serve_batch_bench.sh` with N==batch-size
+   concurrent so the batch fills; the ad-hoc 1-req test is invalid.)
+4. **int4 audio trajectory diverges from M1 (benign):** `--int4 --emotion joy` over-drove into a 108-frame
+   ramble on x86 (vs a clean 36-frame render on M1, same seed/text) — greedy-argmax flips on the different
+   x86 fp path. Not a C7 bug (self-test clean); use quant-mixed (int8 CP stabilizes) or bf16 for emotion on
+   x86-int4. Plain int4/int8/quant-mixed audio = ear-clean.
 
 ---
 
