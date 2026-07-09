@@ -1855,16 +1855,22 @@ int qwen_argmax_matvec_int8(const float *x, const int8_t *W, const float *scale,
 
 /* Argmax over a Q4_0 matvec (CP lm_head with --int4). Reuses the optimized
  * (multi-threaded, SIMD) q4_0 matvec into a small scratch buffer, then argmaxes.
- * The scratch malloc (codebook_size floats, ~8KB) is negligible vs the matvec. */
+ * The scratch is a per-thread grow-on-demand buffer (plan_v4 #8): the CP calls
+ * this 15×/frame, so a fresh malloc/free each time is pure churn. __thread keeps
+ * it race-free under concurrent server synthesis (mirrors sampling.c's buffers). */
 int qwen_argmax_matvec_q4_0(const float *x, const q4_0_block_t *W, int in_dim, int out_dim) {
-    float *y = (float *)malloc((size_t)out_dim * sizeof(float));
-    if (!y) return 0;
+    static __thread float *y = NULL;
+    static __thread int y_cap = 0;
+    if (out_dim > y_cap) {
+        float *ny = (float *)realloc(y, (size_t)out_dim * sizeof(float));
+        if (!ny) return 0;
+        y = ny; y_cap = out_dim;
+    }
     qwen_matvec_q4_0(y, W, x, out_dim, in_dim);
     int best = 0;
     float best_val = y[0];
     for (int o = 1; o < out_dim; o++)
         if (y[o] > best_val) { best_val = y[o]; best = o; }
-    free(y);
     return best;
 }
 
@@ -2006,6 +2012,79 @@ static void q4_0_matvec_inner(float *y, const float *x, const q4_0_block_t *W,
     }
 }
 
+#if defined(__ARM_FEATURE_DOTPROD)
+/* SDOT-native q4_0 matvec (the "int4 viable on ARM" kernel, plan_v4 B1 / perf #3).
+ * The legacy q4_0_matvec_inner dequants every nibble to f32 and FMAs against an
+ * f32 activation — on M1 that nibble-unpack dominates (int4 loses to int8 despite
+ * half the bytes). Here we do the llama.cpp q4_0×q8_0 trick instead: quantize the
+ * SHARED activation x to int8 once (per-vector scale sx, done by the caller), then
+ * per block unpack the 32 nibbles into int8 *value order* [w0,w1,...,w31] and dot
+ * them against the int8 activation with vdotq_s32 (4 int8×int8 MACs/instr, no
+ * per-weight f32 convert). q4_0 has a PER-BLOCK scale, so each block's int32 dot is
+ * scaled and summed in f32 (unlike int8's single per-row scale). 2-row fused to
+ * amortize the qx loads, mirroring int8_matvec_sdot. */
+static void q4_0_matvec_sdot(float *y, const int8_t *qx, float sx,
+                             const q4_0_block_t *W, int cols, int out_dim) {
+    int nb = cols / Q4_0_BLOCK_SIZE;   /* blocks per row */
+    const uint8x16_t mask = vdupq_n_u8(0x0F);
+    const int8x16_t bias = vdupq_n_s8(8);
+    int o = 0;
+    for (; o + 1 < out_dim; o += 2) {
+        const q4_0_block_t *r0 = W + (size_t)o * nb;
+        const q4_0_block_t *r1 = W + (size_t)(o + 1) * nb;
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const int8_t *xb = qx + b * Q4_0_BLOCK_SIZE;
+            int8x16_t x0 = vld1q_s8(xb);
+            int8x16_t x1 = vld1q_s8(xb + 16);
+            /* row 0 */
+            uint8x16_t raw0 = vld1q_u8(r0[b].qs);
+            uint8x16x2_t z0 = vzipq_u8(vandq_u8(raw0, mask), vshrq_n_u8(raw0, 4));
+            int8x16_t w0a = vsubq_s8(vreinterpretq_s8_u8(z0.val[0]), bias);
+            int8x16_t w0b = vsubq_s8(vreinterpretq_s8_u8(z0.val[1]), bias);
+            int32x4_t acc0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0a, x0), w0b, x1);
+            sum0 += r0[b].scale * (float)vaddvq_s32(acc0);
+            /* row 1 */
+            uint8x16_t raw1 = vld1q_u8(r1[b].qs);
+            uint8x16x2_t z1 = vzipq_u8(vandq_u8(raw1, mask), vshrq_n_u8(raw1, 4));
+            int8x16_t w1a = vsubq_s8(vreinterpretq_s8_u8(z1.val[0]), bias);
+            int8x16_t w1b = vsubq_s8(vreinterpretq_s8_u8(z1.val[1]), bias);
+            int32x4_t acc1 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w1a, x0), w1b, x1);
+            sum1 += r1[b].scale * (float)vaddvq_s32(acc1);
+        }
+        y[o]     = sum0 * sx;
+        y[o + 1] = sum1 * sx;
+    }
+    if (o < out_dim) {
+        const q4_0_block_t *r0 = W + (size_t)o * nb;
+        float sum0 = 0.0f;
+        for (int b = 0; b < nb; b++) {
+            const int8_t *xb = qx + b * Q4_0_BLOCK_SIZE;
+            int8x16_t x0 = vld1q_s8(xb);
+            int8x16_t x1 = vld1q_s8(xb + 16);
+            uint8x16_t raw0 = vld1q_u8(r0[b].qs);
+            uint8x16x2_t z0 = vzipq_u8(vandq_u8(raw0, mask), vshrq_n_u8(raw0, 4));
+            int8x16_t w0a = vsubq_s8(vreinterpretq_s8_u8(z0.val[0]), bias);
+            int8x16_t w0b = vsubq_s8(vreinterpretq_s8_u8(z0.val[1]), bias);
+            int32x4_t acc0 = vdotq_s32(vdotq_s32(vdupq_n_s32(0), w0a, x0), w0b, x1);
+            sum0 += r0[b].scale * (float)vaddvq_s32(acc0);
+        }
+        y[o] = sum0 * sx;
+    }
+}
+
+typedef struct {
+    float *y; const int8_t *qx; float sx; const q4_0_block_t *W; int rows, cols;
+} q4_0_sdot_ctx;
+static void q4_0_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_0_sdot_ctx *c = (q4_0_sdot_ctx *)vc;
+    int r0 = (int)(tid * (size_t)c->rows / nt);
+    int r1 = (int)((tid + 1) * (size_t)c->rows / nt);
+    q4_0_matvec_sdot(c->y + r0, c->qx, c->sx,
+                     c->W + (size_t)r0 * (c->cols / Q4_0_BLOCK_SIZE), c->cols, r1 - r0);
+}
+#endif /* __ARM_FEATURE_DOTPROD */
+
 typedef struct {
     float *y; const q4_0_block_t *W; const float *x; int rows, cols, blocks_per_row;
 } q4_0_mv_ctx;
@@ -2016,8 +2095,38 @@ static void q4_0_mv_task(size_t tid, size_t nt, void *vc) {
     q4_0_matvec_inner(c->y + r0, c->x, c->W + (size_t)r0 * c->blocks_per_row,
                       c->cols, r1 - r0);
 }
+#if defined(__ARM_FEATURE_DOTPROD)
+enum { Q4_QX_MAX = 8192 };
+/* Shared one-time QWEN_NO_SDOT cache (audit #10 race-free). 1 = force the legacy
+ * f32-dequant q4 path (the A/B bench + quant-ladder gate); shared by qwen_matvec_q4_0
+ * and the fused qwen_matvec_q4_0_qkv so single-stream stays self-consistent. */
+static int q4_sdot_disabled(void) {
+    static atomic_int off = -1;
+    int v = atomic_load_explicit(&off, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("QWEN_NO_SDOT"); v = (e && e[0] == '1'); atomic_store_explicit(&off, v, memory_order_relaxed); }
+    return v;
+}
+#endif
+
 void qwen_matvec_q4_0(float *y, const q4_0_block_t *W, const float *x,
                        int rows, int cols) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    /* SDOT-native path (plan_v4 B1): quantize the shared activation to int8 once,
+     * then int8×int8 dot per nibble-block. cols beyond the cap (rare; only very
+     * large matrices) falls through to the f32 path. */
+    if (!q4_sdot_disabled() && cols <= Q4_QX_MAX && cols % Q4_0_BLOCK_SIZE == 0) {
+        int8_t qx_buf[Q4_QX_MAX];
+        float sx = quantize_act_int8(qx_buf, x, cols);
+        int nt = g_n_threads;
+        if (nt > 1 && rows >= 256) {
+            q4_0_sdot_ctx c = { y, qx_buf, sx, W, rows, cols };
+            qwen_parallel((size_t)nt, q4_0_sdot_task, &c);
+            return;
+        }
+        q4_0_matvec_sdot(y, qx_buf, sx, W, cols, rows);
+        return;
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1 && rows >= 256) {
         q4_0_mv_ctx c = { y, W, x, rows, cols, cols / Q4_0_BLOCK_SIZE };
@@ -2063,10 +2172,62 @@ static void q4_0_qkv_task(size_t tid, size_t nt, void *vc) {
         }
     }
 }
+#if defined(__ARM_FEATURE_DOTPROD)
+/* SDOT fused-QKV (plan_v4 B1 + #7): quantize the shared activation to int8 ONCE,
+ * then SDOT for Q/K/V. Keeps single-stream int4 QKV consistent with the standalone
+ * q4 matvec (and with the batched path). Partitions the [Q|K|V] rows like the
+ * f32 twin so it picks up the same threading. */
+typedef struct {
+    float *q, *k, *v;
+    const q4_0_block_t *Wq, *Wk, *Wv;
+    const int8_t *qx; float sx;
+    int in_dim, q_dim, kv_dim;
+} q4_0_qkv_sdot_ctx;
+static void q4_0_qkv_sdot_task(size_t tid, size_t nt, void *vc) {
+    q4_0_qkv_sdot_ctx *c = (q4_0_qkv_sdot_ctx *)vc;
+    int total = c->q_dim + 2 * c->kv_dim;
+    int nb = c->in_dim / Q4_0_BLOCK_SIZE;
+    int r0 = (int)(tid * (size_t)total / nt);
+    int r1 = (int)((tid + 1) * (size_t)total / nt);
+    for (int r = r0; r < r1; ) {
+        if (r < c->q_dim) {
+            int end = r1 < c->q_dim ? r1 : c->q_dim;
+            q4_0_matvec_sdot(c->q + r, c->qx, c->sx, c->Wq + (size_t)r * nb, c->in_dim, end - r);
+            r = end;
+        } else if (r < c->q_dim + c->kv_dim) {
+            int local = r - c->q_dim;
+            int end = r1 < c->q_dim + c->kv_dim ? r1 : c->q_dim + c->kv_dim;
+            q4_0_matvec_sdot(c->k + local, c->qx, c->sx, c->Wk + (size_t)local * nb, c->in_dim, (end - c->q_dim) - local);
+            r = end;
+        } else {
+            int local = r - c->q_dim - c->kv_dim;
+            int local_end = r1 - c->q_dim - c->kv_dim;
+            q4_0_matvec_sdot(c->v + local, c->qx, c->sx, c->Wv + (size_t)local * nb, c->in_dim, local_end - local);
+            r = r1;
+        }
+    }
+}
+#endif
 void qwen_matvec_q4_0_qkv(float *q, float *k, float *v,
                             const q4_0_block_t *Wq, const q4_0_block_t *Wk,
                             const q4_0_block_t *Wv,
                             const float *x, int in_dim, int q_dim, int kv_dim) {
+#if defined(__ARM_FEATURE_DOTPROD)
+    if (!q4_sdot_disabled() && in_dim <= Q4_QX_MAX && in_dim % Q4_0_BLOCK_SIZE == 0) {
+        int8_t qx_buf[Q4_QX_MAX];
+        float sx = quantize_act_int8(qx_buf, x, in_dim);
+        int nt = g_n_threads;
+        if (nt > 1) {
+            q4_0_qkv_sdot_ctx c = { q, k, v, Wq, Wk, Wv, qx_buf, sx, in_dim, q_dim, kv_dim };
+            qwen_parallel((size_t)nt, q4_0_qkv_sdot_task, &c);
+            return;
+        }
+        q4_0_matvec_sdot(q, qx_buf, sx, Wq, in_dim, q_dim);
+        q4_0_matvec_sdot(k, qx_buf, sx, Wk, in_dim, kv_dim);
+        q4_0_matvec_sdot(v, qx_buf, sx, Wv, in_dim, kv_dim);
+        return;
+    }
+#endif
     int nt = g_n_threads;
     if (nt > 1) {
         q4_0_qkv_ctx c = { q, k, v, Wq, Wk, Wv, x, in_dim, q_dim, kv_dim,
@@ -3040,7 +3201,10 @@ int qwen_kernel_selftest(void *out) {
         }
 
         /* ---- q4_0 batched matmat: Y[rows,B] vs B independent q4_0 matvecs ----
-         * Same dequant + f32 accumulation as the matvec -> only fp-order drift. */
+         * matmat_q4_0 keeps the activation f32 (nibble-dequant -> f32 FMA), while
+         * the dispatched matvec_q4_0 now uses the SDOT path (activation quantized
+         * to int8, plan_v4 B1). So they differ by the same activation-quant tolerance
+         * the int8 twin needs (was 1e-3 fp-order back when both kept f32 act). */
         if (cols % Q4_0_BLOCK_SIZE == 0) {
             const int B = 8;
             int nb = cols / Q4_0_BLOCK_SIZE;
@@ -3064,7 +3228,7 @@ int qwen_kernel_selftest(void *out) {
                     }
                 }
                 double l2rel = l2d > 0 ? sqrt(l2n / l2d) : 0.0;
-                int ok = l2rel < 1e-3;
+                int ok = l2rel < 3e-2;
                 fprintf(f, "  [%4dx%4d] matmat_q4_0(B=%d) vs B*matvec_q4_0: L2_rel=%.2e  %s\n",
                         rows, cols, B, l2rel, ok ? "PASS" : "FAIL");
                 if (!ok) failures++;
