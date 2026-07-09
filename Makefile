@@ -415,27 +415,30 @@ test-errors: $(TARGET)
 	@echo ""
 
 test-emotion: $(TARGET)
-	@echo "=== Expressivity / emotion-manifest smoke test ==="
+	@echo "=== Expressivity / emotion (STEER) smoke test ==="
 	@mkdir -p $(TEST_DIR)
-	@# Manifest mood resolves to a full recipe and writes audio
+	@# Emotion is a 1.7B qlsteer-STEER feature (the legacy .vec mood-palette manifest was
+	@# retired 2026-07-08); the recipe weight (w12) is authoritative. 0.6B emotion is
+	@# parked-neutral. Source of truth: docs/emotion-THE-recipe.md + resolve_emotion_recipe.
+	@if [ -d $(MODEL_LARGE) ]; then \
+	   ./$(TARGET) -d $(MODEL_LARGE) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy \
+	     --text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_joy.wav 2>$(TEST_DIR)/em_joy.log; \
+	   grep -qi "Emotion 'joy': mode=STEER" $(TEST_DIR)/em_joy.log || { echo "FAIL: --emotion joy did not resolve to STEER"; cat $(TEST_DIR)/em_joy.log; exit 1; }; \
+	   grep -qi "ryan_joy.qlsteer" $(TEST_DIR)/em_joy.log || { echo "FAIL: joy steer vector not loaded"; cat $(TEST_DIR)/em_joy.log; exit 1; }; \
+	   test -s $(TEST_DIR)/em_joy.wav || { echo "FAIL: joy produced no audio"; exit 1; }; \
+	   echo "  PASS: --emotion joy -> STEER ryan_joy.qlsteer + audio"; \
+	   ./$(TARGET) -d $(MODEL_LARGE) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion sad \
+	     --text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_sad.wav 2>$(TEST_DIR)/em_sad.log; \
+	   grep -qi "Emotion 'sad': mode=STEER" $(TEST_DIR)/em_sad.log || { echo "FAIL: --emotion sad did not resolve to STEER"; cat $(TEST_DIR)/em_sad.log; exit 1; }; \
+	   grep -qi "ryan_sad.qlsteer" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad steer vector not loaded"; cat $(TEST_DIR)/em_sad.log; exit 1; }; \
+	   echo "  PASS: --emotion sad -> STEER ryan_sad.qlsteer"; \
+	 else echo "  SKIP: 1.7B model absent (emotion is a 1.7B STEER feature)"; fi
+	@# 0.6B emotion is parked-neutral: --emotion must not crash, just produces audio.
 	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy \
-		--text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_joy.wav 2>$(TEST_DIR)/em_joy.log
-	@grep -qi "Emotion 'joy'" $(TEST_DIR)/em_joy.log || { echo "FAIL: --emotion joy did not resolve via manifest"; cat $(TEST_DIR)/em_joy.log; exit 1; }
-	@grep -qiE "Rate: 1\.1|Volume: 1\.1" $(TEST_DIR)/em_joy.log || { echo "FAIL: joy recipe rate/volume not applied"; cat $(TEST_DIR)/em_joy.log; exit 1; }
-	@test -s $(TEST_DIR)/em_joy.wav || { echo "FAIL: joy produced no audio"; exit 1; }
-	@echo "  PASS: --emotion joy -> manifest recipe + rate/volume applied"
-	@# Down-mood lengthens audio (rate < 1)
-	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion sad \
-		--text "La riunione inizia domani mattina." -o $(TEST_DIR)/em_sad.wav 2>$(TEST_DIR)/em_sad.log
-	@grep -qi "Volume: 0.86" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe (vol 0.86) not applied"; cat $(TEST_DIR)/em_sad.log; exit 1; }
-	@grep -qi "Steering: active" $(TEST_DIR)/em_sad.log || { echo "FAIL: sad recipe steering not applied"; cat $(TEST_DIR)/em_sad.log; exit 1; }
-	@echo "  PASS: --emotion sad -> recipe (steering + quiet) applied"
-	@# Explicit knob overrides the baked recipe value
-	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --emotion joy --steer-weight 1.0 \
-		--text "Ciao." -o $(TEST_DIR)/em_ovr.wav 2>$(TEST_DIR)/em_ovr.log
-	@grep -qi "weight=1.00" $(TEST_DIR)/em_ovr.log || { echo "FAIL: explicit --steer-weight did not override recipe"; cat $(TEST_DIR)/em_ovr.log; exit 1; }
-	@echo "  PASS: explicit --steer-weight overrides recipe"
-	@# Standalone --volume/--rate without --emotion
+		--text "Ciao." -o $(TEST_DIR)/em_06b.wav 2>/dev/null; \
+	 test -s $(TEST_DIR)/em_06b.wav || { echo "FAIL: 0.6B --emotion produced no audio"; exit 1; }
+	@echo "  PASS: 0.6B --emotion parked-neutral (no crash, audio written)"
+	@# Standalone --volume/--rate DSP (model-agnostic, no --emotion)
 	@./$(TARGET) -d $(MODEL_SMALL) -j1 -T 0 --seed 42 -s ryan -l Italian --volume 1.2 --rate 0.9 \
 		--text "Ciao." -o $(TEST_DIR)/em_vr.wav 2>$(TEST_DIR)/em_vr.log
 	@grep -qi "Volume: 1.20" $(TEST_DIR)/em_vr.log && grep -qi "Rate: 0.90" $(TEST_DIR)/em_vr.log || { echo "FAIL: standalone --volume/--rate not applied"; cat $(TEST_DIR)/em_vr.log; exit 1; }
