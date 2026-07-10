@@ -601,7 +601,11 @@ v2, per l'A/B on-box senza rebuild.
   emula dpbusd/unpack/inserti64x4/hsum bit-per-bit vs riferimento → ~1e-5 su 2/3/4/5 blocchi e out=37. Il
   mapping delle metà (quale metà è il blocco b) è ciò che quel test fissa. E il `--self-test` q4 esistente
   esercita la v3 via `qwen_matvec_q4_0`, quindi il gate scatta da solo sulla box.
-- **Velocità: ipotesi.** Da misurare: `--self-test` + RTF v3 vs `QWEN_Q4_VNNI_V3=0` (v2) vs int8, su Zen4/SPR.
+- **Correttezza su AVX-512 reale: CONFERMATA (2026-07-10, EPYC 9555P Zen5).** `--self-test` con v3 di
+  default PASS (`matmat_q4_0` L2_rel ~1e-7); v2 (`QWEN_Q4_VNNI_V3=0`) PASS. La verifica scalare-emulata da
+  M1 reggeva. ⚠️ Nota: `make blas` di default compila **AVX2 portabile** — serve `SIMD=avx512vnni` per
+  esercitare v2/v3, altrimenti si testa il fallback AVX2.
+- **Velocità: in misura** (RTF A/B v3 vs v2 vs int8, `-j1` e `-j4`, in corso sull'EPYC).
 
 → **Piano box x86:** `make check-isa` (già verde) → sulla box `make bench-matrix` + `--self-test` +
 A/B v3/v2/int8 + snake AVX2 on/off, **tutte le mod insieme**. Poi si decide se int4 batte int8 su x86 (oggi no).
