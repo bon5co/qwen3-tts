@@ -105,6 +105,7 @@ void qwen_init_threads(void) {
     g_n_threads = ncpus < 4 ? ncpus : 4;
     qwen_ftz_on();  /* main thread: flush denormals (int8 activations) */
     qwen_threadpool_start(g_n_threads);  /* spawn the off-Mac persistent pool */
+    qwen_blas_set_threads(g_n_threads);  /* else BLAS grabs all ncpus (see below) */
 }
 
 /* Report ACTUAL compiled capabilities (mirrors the kernels' own #ifdef guards).
