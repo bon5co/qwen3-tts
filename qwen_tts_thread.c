@@ -187,11 +187,40 @@ static struct {
     pthread_cond_t wake;       /* workers wait for a new job */
     pthread_cond_t complete;   /* main waits for job completion */
     qwen_job_t *job;
-    unsigned long generation;  /* bumped per dispatch; workers compare to detect new work */
-    int completed;             /* workers that finished the current job */
+    _Atomic unsigned long generation; /* bumped per dispatch; spun on lock-free, so atomic */
+    _Atomic int completed;     /* workers that finished the current job; main spins on it */
+    int sleeping;              /* workers parked on `wake` — guarded by mtx */
+    int main_sleeping;         /* main parked on `complete` — guarded by mtx */
     int stop;
 } P;
 static int g_inited = 0;
+
+/* Spin budget: how many generation re-reads a worker (or the main thread's
+ * completion wait) does before parking on the condvar. The POSIX pool used to
+ * pay a futex round-trip per dispatch (~7300/frame, per PR #17). Spinning first
+ * skips the syscall when the next job lands within a few µs — which it does at
+ * every frame boundary. QWEN_POOL_SPIN overrides; 0 = never spin (park at once).
+ * Lower it when synthesis overlaps other CPU-heavy work so idle spin does not
+ * steal those cores. */
+#define QWEN_POOL_SPIN_DEFAULT 4096
+static int qwen_pool_spin(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("QWEN_POOL_SPIN");
+        v = e ? atoi(e) : QWEN_POOL_SPIN_DEFAULT;
+        if (v < 0) v = 0;
+    }
+    return v;
+}
+static inline void qwen_cpu_relax(void) {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __asm__ __volatile__("pause" ::: "memory");
+#else
+    __asm__ __volatile__("" ::: "memory");
+#endif
+}
 
 static void run_chunks(qwen_job_t *job) {
     size_t i;
@@ -199,24 +228,53 @@ static void run_chunks(qwen_job_t *job) {
         job->fn(i, job->nt, job->ctx);
 }
 
+/* Correctness note (lost-wakeup avoidance). generation is bumped by the
+ * dispatcher UNDER P.mtx, and a worker's decision to park re-checks generation
+ * UNDER P.mtx after incrementing `sleeping`. So the two orderings are:
+ *   - worker parks first: dispatcher then sees sleeping>0 and broadcasts.
+ *   - dispatcher bumps first: the worker's under-lock re-check sees the new
+ *     generation and does NOT park.
+ * There is no Dekker/store-buffer race because `sleeping` is only ever read and
+ * written under the mutex; the lock-free path is ONLY the spin, which reads the
+ * atomic generation and never decides to sleep. Same structure guards the
+ * completion side with `main_sleeping`/`completed`. */
 static void *worker_main(void *arg) {
     (void)arg;
     qwen_ftz_on();             /* per-thread FTZ (int8 denormals) — set once */
-    pthread_mutex_lock(&P.mtx);
-    unsigned long seen = P.generation;
+    unsigned long seen = atomic_load_explicit(&P.generation, memory_order_acquire);
     for (;;) {
-        while (!P.stop && P.generation == seen)
-            pthread_cond_wait(&P.wake, &P.mtx);
+        /* Spin on the atomic generation before paying the futex. */
+        int budget = qwen_pool_spin();
+        while (budget-- > 0 &&
+               atomic_load_explicit(&P.generation, memory_order_acquire) == seen &&
+               !P.stop)
+            qwen_cpu_relax();
+
+        if (atomic_load_explicit(&P.generation, memory_order_acquire) == seen) {
+            /* Still nothing: park. Re-check generation under the lock (see note). */
+            pthread_mutex_lock(&P.mtx);
+            P.sleeping++;
+            while (!P.stop &&
+                   atomic_load_explicit(&P.generation, memory_order_relaxed) == seen)
+                pthread_cond_wait(&P.wake, &P.mtx);
+            P.sleeping--;
+            pthread_mutex_unlock(&P.mtx);
+        }
         if (P.stop) break;
-        seen = P.generation;
+
+        seen = atomic_load_explicit(&P.generation, memory_order_acquire);
         qwen_job_t *job = P.job;
-        pthread_mutex_unlock(&P.mtx);
         if (job) run_chunks(job);
-        pthread_mutex_lock(&P.mtx);
-        if (++P.completed == P.nworkers)
-            pthread_cond_signal(&P.complete);
+
+        /* Completion: publish lock-free (main spins on it); only pay the futex
+         * to wake main if it has actually parked. */
+        if (atomic_fetch_add_explicit(&P.completed, 1, memory_order_acq_rel) + 1
+                == P.nworkers) {
+            pthread_mutex_lock(&P.mtx);
+            if (P.main_sleeping) pthread_cond_signal(&P.complete);
+            pthread_mutex_unlock(&P.mtx);
+        }
     }
-    pthread_mutex_unlock(&P.mtx);
     return NULL;
 }
 
@@ -224,6 +282,9 @@ void qwen_threadpool_stop(void) {
     if (!g_inited || !P.threads) return;
     pthread_mutex_lock(&P.mtx);
     P.stop = 1;
+    /* Bump generation too: a worker spinning (not parked) must fall through its
+     * spin and observe stop, not spin forever waiting for a job that won't come. */
+    atomic_fetch_add_explicit(&P.generation, 1, memory_order_release);
     pthread_cond_broadcast(&P.wake);
     pthread_mutex_unlock(&P.mtx);
     for (int i = 0; i < P.nworkers; i++)
@@ -241,7 +302,10 @@ void qwen_threadpool_start(int n_threads) {
         pthread_mutex_init(&P.mtx, NULL);
         pthread_cond_init(&P.wake, NULL);
         pthread_cond_init(&P.complete, NULL);
-        P.generation = 0;
+        atomic_store(&P.generation, 0);
+        atomic_store(&P.completed, 0);
+        P.sleeping = 0;
+        P.main_sleeping = 0;
         g_inited = 1;
     }
     if (want == P.nworkers) return;
@@ -273,20 +337,33 @@ void qwen_parallel(size_t nt, qwen_task_fn fn, void *ctx) {
     /* Serialize the whole submit→run→wait against the single job slot (see submit_mtx
      * comment): two concurrent submitters would otherwise corrupt job/completed/generation. */
     pthread_mutex_lock(&P.submit_mtx);
-    pthread_mutex_lock(&P.mtx);
+
     P.job = &job;
-    P.completed = 0;
-    P.generation++;
-    pthread_cond_broadcast(&P.wake);
+    atomic_store_explicit(&P.completed, 0, memory_order_relaxed);
+    /* Publish the job UNDER mtx so a worker that is about to park (and re-checks
+     * generation under mtx) cannot miss it. Only broadcast if someone is parked;
+     * spinning workers pick the new generation up lock-free. */
+    pthread_mutex_lock(&P.mtx);
+    atomic_fetch_add_explicit(&P.generation, 1, memory_order_release);
+    if (P.sleeping > 0) pthread_cond_broadcast(&P.wake);
     pthread_mutex_unlock(&P.mtx);
 
     run_chunks(&job);              /* main participates */
 
-    pthread_mutex_lock(&P.mtx);
-    while (P.completed != P.nworkers)
-        pthread_cond_wait(&P.complete, &P.mtx);
+    /* Wait for the workers: spin on the atomic count, then park. */
+    int budget = qwen_pool_spin();
+    while (budget-- > 0 &&
+           atomic_load_explicit(&P.completed, memory_order_acquire) != P.nworkers)
+        qwen_cpu_relax();
+    if (atomic_load_explicit(&P.completed, memory_order_acquire) != P.nworkers) {
+        pthread_mutex_lock(&P.mtx);
+        P.main_sleeping = 1;
+        while (atomic_load_explicit(&P.completed, memory_order_relaxed) != P.nworkers)
+            pthread_cond_wait(&P.complete, &P.mtx);
+        P.main_sleeping = 0;
+        pthread_mutex_unlock(&P.mtx);
+    }
     P.job = NULL;
-    pthread_mutex_unlock(&P.mtx);
     pthread_mutex_unlock(&P.submit_mtx);
 }
 
