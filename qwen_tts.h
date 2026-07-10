@@ -358,6 +358,19 @@ typedef struct {
     float *vq_pad;
     int vq_pad_valid;
 
+    /* Exact streaming conv-decoder state (PR #17 sub-change C, ported): per-conv
+     * input tails (the pad_left columns; zero-init == the causal zero padding the
+     * one-shot decode sees at t=0) and per-ConvTranspose overlap-add carries (the
+     * kernel-stride untrimmed output columns). With these the chunked decode
+     * consumes only the NEW frames and still equals the one-shot output, replacing
+     * the windowed conv_rf re-decode. Allocated lazily, per streaming slot. */
+    float *cs_cn_dw_tail[2];   /* ConvNeXt dwconv tails      [1024 x 6]        */
+    float *cs_init_tail;       /* initial conv tail          [1024 x 6]        */
+    float *cs_up_carry[4];     /* upsample convT carries     [out_ch x (k-s)]  */
+    float *cs_res_tail[4][3];  /* res-block conv1 tails      [ch x 6*dil]      */
+    float *cs_final_tail;      /* final conv tail            [96 x 6]          */
+    int    cs_alloc;           /* 1 once the above are allocated */
+
     /* Tracking */
     int frames_decoded;    /* total codec frames processed */
     int samples_produced;  /* total audio samples produced */
