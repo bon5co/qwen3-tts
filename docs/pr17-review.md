@@ -577,6 +577,35 @@ che è dove stava il 21% dello scheduler — non nel wake handoff che lo spin ot
 indirettamente, perché ci ha fatto profilare — la leva BLAS. Lo spin era la sua diagnosi giusta con la cura
 sbagliata: il costo che vedeva (§5.1) era reale, ma si abbatte tarando i thread, non spinnando.
 
+## 5.13 Lavoro x86 (derivato, scritto qui, DA MISURARE sulla box)
+
+Tre pezzi x86, tutti cross-compilati puliti (`make check-isa`) e — dove eseguibili — verificati
+numericamente; nessuno misurato per velocità (M1 non è x86).
+
+**a) snake AVX2 (`5d06584`) — buco reale, il gemello x86 della NEON.** Il ramo `__AVX2__` della snake
+chiamava `sinf()` scalare per lane, esattamente come la NEON prima di noi; la PR fixò solo NEON. Aggiunto
+`qwen_vsin2_avx2` (8 lane, stessa poly/guard/toggle). Eseguito **sotto Rosetta** (che emula AVX2): errore
+max vs libm 4.5e-4 sul range esteso. Guadagno atteso: come la snake NEON (~metà del decoder-snake).
+
+**b) AVX-512 su attention/rms_norm — NON fatto, e perché.** Indagato: l'attention usa **online softmax**
+(una `expf` scalare per posizione-chiave, non per elemento) e il suo lavoro vettorizzabile (dot QK, accumulo
+AV) è **già AVX2**; `rms_norm` è **memory-bound**. Allargarli a 512 bit = complessità per guadagno ~0, che
+la regola kernel del progetto vieta. Scartato con motivo, non per pigrizia.
+
+**c) q4-VNNI v3, throughput-packing (`bb8273f`) — il VERO collo x86.** La v2 era compute-bound (−37% vs
+int8 su EPYC): 32 int8 in un dpbusd da 512 bit (metà datapath sprecata) + un `_mm512_reduce_add` cross-lane
+per blocco sul percorso critico. La v3 impacchetta **2 blocchi per op** (larghezza piena) e **srotola 4
+righe** con catene di accumulo indipendenti che nascondono la latenza del reduce. `QWEN_Q4_VNNI_V3=0` →
+v2, per l'A/B on-box senza rebuild.
+- **Correttezza:** Rosetta non emula AVX-512 (`SIGILL`), quindi verificato l'**algoritmo** in C scalare che
+  emula dpbusd/unpack/inserti64x4/hsum bit-per-bit vs riferimento → ~1e-5 su 2/3/4/5 blocchi e out=37. Il
+  mapping delle metà (quale metà è il blocco b) è ciò che quel test fissa. E il `--self-test` q4 esistente
+  esercita la v3 via `qwen_matvec_q4_0`, quindi il gate scatta da solo sulla box.
+- **Velocità: ipotesi.** Da misurare: `--self-test` + RTF v3 vs `QWEN_Q4_VNNI_V3=0` (v2) vs int8, su Zen4/SPR.
+
+→ **Piano box x86:** `make check-isa` (già verde) → sulla box `make bench-matrix` + `--self-test` +
+A/B v3/v2/int8 + snake AVX2 on/off, **tutte le mod insieme**. Poi si decide se int4 batte int8 su x86 (oggi no).
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
