@@ -370,6 +370,10 @@ typedef struct {
     float *cs_res_tail[4][3];  /* res-block conv1 tails      [ch x 6*dil]      */
     float *cs_final_tail;      /* final conv tail            [96 x 6]          */
     int    cs_alloc;           /* 1 once the above are allocated */
+    int    cs_warm;            /* 0 until the first chunk has run: while the tails
+                                * are still all-zero, prepending them is identical
+                                * to the causal zero-pad conv1d already does, so we
+                                * skip that work (it cost ~8% TTFA on N1). */
 
     /* Tracking */
     int frames_decoded;    /* total codec frames processed */

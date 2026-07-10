@@ -1561,12 +1561,46 @@ static int conv_decoder_forward(qwen_tts_ctx_t *ctx,
  * only approximated the boundary; it is kept behind QWEN_SD_WINDOWED=1.
  * ======================================================================== */
 
+/* Save the last tail_cols columns of [tail | chunk] back into tail. When the
+ * chunk is shorter than the tail the window straddles both, so shift. */
+static void cs_save_tail(float *tail, const float *in, int in_ch, int len, int tail_cols) {
+    if (len >= tail_cols) {
+        for (int ic = 0; ic < in_ch; ic++)
+            memcpy(tail + (int64_t)ic * tail_cols, in + (int64_t)ic * len + (len - tail_cols),
+                   (size_t)tail_cols * sizeof(float));
+    } else {
+        int keep = tail_cols - len;   /* columns of the old tail that survive */
+        for (int ic = 0; ic < in_ch; ic++) {
+            float *t = tail + (int64_t)ic * tail_cols;
+            memmove(t, t + len, (size_t)keep * sizeof(float));
+            memcpy(t + keep, in + (int64_t)ic * len, (size_t)len * sizeof(float));
+        }
+    }
+}
+
 /* Stateful causal conv1d on one chunk: prepend the saved tail, convolve, emit
- * [out_ch x len], update the tail. Returns a freshly allocated output. */
+ * [out_ch x len], update the tail. Returns a freshly allocated output.
+ *
+ * `warm` = 0 on the very first chunk of a stream, when the tail is still all
+ * zeros. An all-zero prepended tail is *exactly* the causal zero padding that
+ * causal_conv1d already applies on its own, so we skip building `ext` and
+ * convolve the chunk directly: same output, none of the work. That work was not
+ * free -- at chunk=2 the res-block conv1 (dilation 9) has tail_cols=54 against
+ * len=64, i.e. ~1.8x the convolution, all of it thrown away. It is what made
+ * TTFA regress ~8% on Neoverse-N1 when the exact path landed. */
 static float *cs_conv1d(const float *in, int in_ch, int out_ch, int len,
                         int kernel, int dilation,
-                        const float *w, const float *b, float *tail) {
+                        const float *w, const float *b, float *tail, int warm) {
     int tail_cols = (kernel - 1) * dilation;
+
+    if (!warm) {
+        float *out = (float *)aligned_calloc((int64_t)out_ch * len, sizeof(float));
+        if (!out) return NULL;
+        causal_conv1d(out, in, w, b, in_ch, out_ch, len, kernel, dilation);
+        cs_save_tail(tail, in, in_ch, len, tail_cols);
+        return out;
+    }
+
     int ext_len = tail_cols + len;
     float *ext = (float *)aligned_malloc((int64_t)in_ch * ext_len * sizeof(float));
     if (!ext) return NULL;
@@ -1719,7 +1753,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
     if (!sd->initial_conv_weight) { free(signal); return -1; }
     float *ic_out = cs_conv1d(signal, cur_ch, 1536, cur_len, 7, 1,
                               sd->initial_conv_weight, sd->initial_conv_bias,
-                              st->cs_init_tail);
+                              st->cs_init_tail, st->cs_warm);
     free(signal);
     if (!ic_out) return -1;
     signal = ic_out; cur_ch = 1536;
@@ -1758,7 +1792,7 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
 
             float *c1_out = cs_conv1d(signal, cur_ch, cur_ch, cur_len, 7, dil,
                                       ub->res_blocks[r].conv1_weight, ub->res_blocks[r].conv1_bias,
-                                      st->cs_res_tail[b][r]);
+                                      st->cs_res_tail[b][r], st->cs_warm);
             free(signal);
             if (!c1_out) { free(res); return -1; }
             signal = c1_out;
@@ -1819,6 +1853,8 @@ static int conv_decoder_forward_streaming(qwen_tts_ctx_t *ctx, qwen_sd_stream_st
         if (audio[i] < -1.0f) audio[i] = -1.0f;
         if (audio[i] > 1.0f) audio[i] = 1.0f;
     }
+
+    st->cs_warm = 1;   /* tails now hold real context; later chunks must prepend them */
 
     *audio_out = audio;
     *n_samples_out = cur_len;
