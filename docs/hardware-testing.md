@@ -253,13 +253,50 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 |---|---|---|---|---|---|---|
 | M1 8-core (ref) | single | 1.48 | 0.89 | ~1.3 | — | dev box |
 | M1 8-core (ref) | batch | **0.78** | 0.82 | slower | — | bf16+batch = 1.74× |
+| **M1 8-core** (post-PR#17, 0.6B) | single file `-j4` | — | 0.69 | **0.52** | — | 2026-07-10; conv-exact + float32x4-q4-acc; int4 fastest on M1 (unchanged) |
+| **Neoverse-N1** (Ampere Altra Max, 4c, 0.6B) | single stream24 `-j4` | — | — | **1.49** | ~910 ms | 2026-07-10 post-PR#17; `main` was 1.98 → **−25%** (conv-exact + snake-thread + BLAS-lever) |
+| _Neoverse-N1_ | + `QWEN_SD_INT8=1` (opt-in) | — | — | **1.28** | ~950 ms | conv int8 decoder (−18%); noise ~−65 dBFS, ear-OK on emotion/clone |
+| _Neoverse-N1_ | single file int4 `-j4` | — | 1.58 | **1.49** | — | after the decoder work int4 ≈ int8 e2e (collo spostato dal Talker) |
 | _M2/M4_ | single | | | | | bf16+i8mm should lift int8/int4 |
 | _M2/M4_ | batch | | | | | native matmul twin candidate |
 | _Zen4 (AVX-512+VNNI)_ | single | | | | | VNNI int8 |
 | _Zen4_ | batch | | | | | int4+batch expected sweet spot |
-| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09; **int8-VNNI is the x86 winner — int4 trails (nibble unpack), opposite of M1** |
+| **Zen5 Turin** (EPYC 9555P, 4vCPU, 1.7B) | single -j4 | 2.27 | **2.03** | 2.41 | int8 1.08s / int4 1.25s / bf16 1.68s | 2026-07-09 (v2 q4-VNNI); int8 won, int4 trailed |
+| **Zen5 Turin** (EPYC 9555P, 0.6B, ms/frame) | q4-VNNI **v3** vs v2 vs int8 | — | Tlk 25.3 / CP 69.6 | **Tlk 22.9 / CP 63.5** | — | 2026-07-10 **q4-VNNI v3: the q4 KERNEL now beats v2 (−9%) and int8 per-frame** — the v2 compute-bound finding is fixed. (Wall RTF int8 still leads 0.93 vs int4 1.01: int4/int8 fork trajectory, 95 vs 147 frames, so wall isn't cross-quant comparable — the per-frame kernel is.) `SIMD=avx512vnni`, `QWEN_Q4_VNNI_V3=0`→v2. Compare ms/frame not RTF (int4/int8 fork trajectory: 95 vs 147 frames) |
 | _Zen5 Turin_ | batch (matmat, B=8) | 11.9× | **3.0×** | 1.6× | — | kernel-level batching speedup (int8/q4 now VNNI, `--matmat-bench`); e2e server-batching = WIP (§5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
+
+**⭐ Full RTF+TTFA — EPYC 9555P Zen5, 4 vCPU, `-j4`, `SIMD=avx512vnni` (2026-07-10, post-PR#17, min of 3):**
+
+| model | config | RTF | TTFA |
+|---|---|---|---|
+| 0.6B | file **int8** | **0.95** | 1073 ms |
+| 0.6B | file int4 (v3) | 1.01 | 1142 ms |
+| 0.6B | stream int4 (chunk24) | 0.99 | **575 ms** |
+| 0.6B | file bf16 | 1.08 | 1219 ms |
+| 1.7B | file **int8** | **1.17** | 1705 ms |
+| 1.7B | file int4 (v3) | 1.30 | 1865 ms |
+| 1.7B | stream int4 (chunk24) | 1.28 | 1145 ms |
+| 1.7B | file bf16 | 1.44 | 2069 ms |
+
+Headline: **int8 is the x86 wall-clock winner** (0.6B sub-RT 0.95). q4-VNNI v3 made the int4 KERNEL faster
+per-frame than int8 (row above), but int4/int8 fork the greedy trajectory so wall RTF isn't cross-quant
+comparable.
+
+**⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
+
+| model | config | RTF | TTFA |
+|---|---|---|---|
+| 0.6B | file int8 | 1.60 | 1842 ms |
+| 0.6B | file int4 | 1.60 | 1883 ms |
+| 0.6B | stream int4 (chunk24) | **1.49** | 908 ms |
+| 0.6B | stream int4 + `QWEN_SD_INT8=1` | **1.28** | 932 ms |
+| 1.7B | file int8 | 2.04 | 3116 ms |
+| 1.7B | stream int4 + `QWEN_SD_INT8=1` | **1.80** | 1968 ms |
+
+Decoder-bound box: exact-streaming conv + threaded snake + int8 decoder conv land hardest here (`main`
+0.6B stream int4 1.98 → 1.49, −25%; +conv-int8 1.28). Opposite of x86, **int4 ≈ int8 e2e** after the
+decoder work (the bottleneck moved off the Talker).
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |
 
 ### §5.note — EPYC 9555P Zen5 run (2026-07-09) — what DIFFERS from M1

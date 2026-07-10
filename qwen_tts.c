@@ -1553,8 +1553,20 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
         if (e) trim_frames = atoi(e);
         if (trim_frames > 0) dt_state.trim_head_left = trim_frames * 1920;
     }
-    if (!dt_no_overlap)
+    if (!dt_no_overlap) {
         pthread_create(&dt_thread, NULL, decoder_thread_fn, &dt_state);
+        /* From here the decoder thread is the BLAS user, and it runs alongside
+         * our matvec pool. Prefill (above) had BLAS to itself and kept all -j
+         * threads; hand one back now. Measured on 4-core Neoverse-N1 (0.6B
+         * --int4 -j4): BLAS at 3 gives RTF 1.47 stream / 1.51 file against 1.54
+         * / 1.59 at 4, with TTFA untouched because prefill still ran wide.
+         * Dropping to 1 is a disaster (RTF 2.14): the decoder becomes the
+         * bottleneck. A strict `ours + BLAS == cores` split is wrong -- mild
+         * oversubscription wins, because our pool has serial stretches in which
+         * the cores must be free to go to the decoder. */
+        int nt = qwen_get_threads();
+        qwen_blas_set_threads(nt > 1 ? nt - 1 : 1);
+    }
 
     for (int frame = 0; frame < max_frames; frame++) {
         /* Codec head: logits = codec_head @ last_hidden */
@@ -1715,6 +1727,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
              * Mirror the normal-exit cleanup (cf. the codec_frames==0 path below). */
             dt_finish(&dt_state);
             if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
+            qwen_blas_set_threads(qwen_get_threads());   /* decoder gone: BLAS may spread again */
             qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
             return -1;
         }
@@ -1748,6 +1761,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
     if (ctx->codec_frames == 0) {
         dt_finish(&dt_state);
         if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
+        qwen_blas_set_threads(qwen_get_threads());
         qwen_sd_stream_free(&ctx->sd_stream); dt_free(&dt_state);
         *out_samples = NULL; *out_n_samples = 0;
         return 0;
@@ -1759,6 +1773,7 @@ int qwen_tts_generate(qwen_tts_ctx_t *ctx, const char *text, float **out_samples
 
     dt_finish(&dt_state);
     if (dt_no_overlap) decoder_thread_fn(&dt_state); else pthread_join(dt_thread, NULL);
+    qwen_blas_set_threads(qwen_get_threads());
     qwen_sd_stream_free(&ctx->sd_stream);
 
     double dt_decode_ms = dt_state.decode_ms;

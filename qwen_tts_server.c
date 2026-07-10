@@ -522,7 +522,16 @@ static void handle_tts_stream(qwen_tts_ctx_t *ctx, int fd, const char *body) {
     /* Set up streaming (emotion steering is already set on ctx; volume applied per chunk) */
     stream_http_state_t state = { .fd = fd, .total_samples = 0, .volume = volume };
     ctx->stream = 1;
-    ctx->stream_chunk_frames = 10;
+    /* Per-request chunk size (idea from PR #17). The default stays 10 frames
+     * (0.8s): with the exact stateful conv decoder a chunk boundary no longer
+     * costs a context re-decode, so a bigger chunk buys throughput only by
+     * amortizing BLAS/dispatch — while coarsening mid-stream latency. Clients
+     * that want throughput over smoothness can raise it. TTFA is set by the
+     * 2-frame first chunk either way. */
+    int chunk_frames = (int)json_extract_number(body, "chunk_frames", 10);
+    if (chunk_frames < 2)   chunk_frames = 2;
+    if (chunk_frames > 250) chunk_frames = 250;
+    ctx->stream_chunk_frames = chunk_frames;
     qwen_tts_set_audio_callback(ctx, stream_http_callback, &state);
 
     /* Send chunked response header */

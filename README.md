@@ -486,16 +486,19 @@ The full cross-hardware workflow (which boxes have which SIMD, where to rent, wh
 
 | Device | SIMD + threads | RAM | Best 0.6B RTF | Config |
 |---|---|---|---|---|
-| **Apple M1** 8-core | NEON + SDOT int8, GCD 4-thread | 16 GB | **~1.3 bf16 / sub-1.0 int8** | `--int8 -j4` |
+| **Apple M1** 8-core | NEON + SDOT int8/int4, GCD 4-thread | 16 GB | **0.52 int4 / 0.69 int8** | `--int4 -j4` |
+| **Neoverse-N1** (Ampere Altra Max, Scaleway) | NEON + SDOT, pthread 4-thread | 16 GB / 4 vCPU | **1.28** stream int4 + conv-int8 (**1.49** default) | `--int4 --stream` |
 | **Ryzen 7 6800H** (Zen3+, 16 MB L3, bare metal) | AVX2 + FMA, pthread 4-thread | 32 GB | **2.02** | `--int4 -j4` |
-| **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread | 16 GB / 4 vCPU | **1.64** | `--int8 -j1` |
+| **EPYC 9555P** (Zen5, AVX-512+VNNI, Scaleway VM) | AVX-512-VNNI, pthread 4-thread | 16 GB / 4 vCPU | **0.95** | `--int8 -j4` |
 
-Single-stream RTF is **memory/cache-bound** (the Code Predictor re-reads its weights 16×/frame):
-SIMD width and thread count matter less than fewer weight bytes (`--int8`/`--int4`) and a cache
-that fits the working set (Apple's SLC, an X3D chip's V-cache). On x86 the int8+VNNI kernel stack
-is a real **~1.85× win at equal core count** (EPYC 9555P: scalar-bf16 `-j1` 3.04 → VNNI-int8 `-j1`
-1.64); threading scales on bare metal but a multi-CCD VM limits it. Many-core servers are best for
-**throughput** (concurrent requests), not single-stream latency. Check yours: `./qwen_tts --caps`.
+Numbers refreshed 2026-07-10 after the PR#17 decoder work (exact streaming conv + threaded snake + BLAS
+phase-lever + optional int8 decoder conv). Single-stream RTF is **memory/cache-bound** (the Code Predictor
+re-reads its weights 16×/frame): SIMD width and thread count matter less than fewer weight bytes
+(`--int8`/`--int4`) and a cache that fits the working set (Apple's SLC, an X3D chip's V-cache). On
+cache-rich Apple Silicon **int4 is the fastest lever**; on x86 **int8+VNNI wins the wall clock** (int4 and
+int8 fork the greedy trajectory, so compare kernel ms/frame, not wall RTF — there the q4-VNNI v3
+throughput kernel now edges int8). Many-core servers are best for **throughput** (concurrent requests), not
+single-stream latency. Check yours: `./qwen_tts --caps`.
 
 **Concurrent serving — request batching (`--serve --batch-size N`).** For *N users at once*, the server
 can step their requests **together** through the model (vLLM-style): weights are read from memory **once**
@@ -509,7 +512,7 @@ total throughput on bandwidth-bound boxes. Measure it on your CPU with `make ben
 
 | Hardware | 0.6B RTF | Notes |
 |----------|----------|-------|
-| **This project (C, Apple M1 CPU, `--int8`)** | **0.80–0.90** | Pure C, no GPU — **faster than real-time** |
+| **This project (C, Apple M1 CPU, `--int4`)** | **0.52** | Pure C, no GPU — **2× faster than real-time** (post-PR#17 decoder work) |
 | This project (C, Apple M1 CPU, bf16) | 1.26–1.39 | Pure C, no GPU |
 | Python + PyTorch (Ryzen 9 7950X CPU) | 4.5–5.8 | Official Python, CPU-only |
 | NVIDIA RTX 3090 | 0.52–0.68 | Python + PyTorch + FlashAttention 2 |
