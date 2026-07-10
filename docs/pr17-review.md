@@ -613,11 +613,17 @@ v2, per l'A/B on-box senza rebuild.
   | int4 v2 | 25.1 | 70.0 |
   | int8 VNNI | 25.3 | 69.6 |
 
-  v3 è −9% vs v2 su Talker E CP, e **int4-v3 BATTE int8** (22.9 vs 25.3; 63.5 vs 69.6). Sulla STESSA box
-  dove la v2 era il 37% più lenta di int8 ([[project_x86_epyc_vnni_validation]]), il throughput-packing
-  (2 blocchi/512b + 4-row unroll) chiude il gap e lo supera. **Il TODO "int4 non è ancora un win x86" è
-  risolto.** ⚠️ Metrica: **ms/frame**, non RTF — int4 e int8 forkano la traiettoria greedy (95 vs 147
-  frame sullo stesso testo), quindi RTF=wall/durata non è comparabile fra quant; il ms/frame sì.
+  v3 è **−9% vs v2** su Talker E CP (traiettoria appaiata: v3 95 frame, v2 96 → confronto pulito), e il
+  **kernel int4-v3 batte quello int8 per-frame** (22.9 vs 25.3; 63.5 vs 69.6). Sulla STESSA box dove la v2
+  era il 37% più lenta di int8 ([[project_x86_epyc_vnni_validation]]), il throughput-packing (2 blocchi/512b
+  + 4-row unroll) risolve il collo compute della v2. **Il TODO "il kernel q4-VNNI è compute-bound" è chiuso.**
+
+  ⚠️ **Attenzione a NON sovra-affermare.** Questo è un fatto **sul kernel** (ms/frame). Al **wall RTF**
+  int8 resta davanti (0.93 vs int4 1.01 file), perché int4 e int8 forkano la traiettoria greedy (95 vs 147
+  frame sullo stesso testo → audio di lunghezza diversa) e RTF=wall/durata spalma i costi fissi (prefill,
+  drain) su meno audio per int4. Quindi: **il kernel int4-v3 è più veloce, ma "int4 batte int8 sul wall
+  RTF x86" NON è dimostrato** — dipende dalla lunghezza della traiettoria, rumore dipendente dal testo.
+  Headline x86 onesto: **int8 sub-realtime (RTF 0.93)**; l'int4-v3 ha reso il kernel q4 competitivo, non più zavorra.
 
 → **Piano box x86:** `make check-isa` (già verde) → sulla box `make bench-matrix` + `--self-test` +
 A/B v3/v2/int8 + snake AVX2 on/off, **tutte le mod insieme**. Poi si decide se int4 batte int8 su x86 (oggi no).
