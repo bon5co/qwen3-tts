@@ -417,6 +417,89 @@ leaks invariati (137 / 420096 B, come `main`). Audio: `samples/tests/2026-07-10_
   dipendente dal modo (file 2, stream 3). Serve una manopola per fase, non una costante.
 - **snake threading** e **spin-pool fixato** (publish seq_cst + fence, sopra `submit_mtx`): ~8% residuo.
 
+## 5.6 `chunk_frames`: il default 50 avrebbe **peggiorato M1 del 18%**
+
+Sweep sul codice finale, 0.6B `--int4 -j4`, min di 3. **Il TTFA è piatto** a ogni chunk (il ramp del primo
+chunk lo fissa a 2 frame): la granularità si paga solo in RTF.
+
+| chunk | RTF su **N1** | RTF su **M1** | audio/chunk |
+|---|---|---|---|
+| 2 | 2.11 | — | 0.2 s |
+| 7 | 1.68 | — | 0.6 s |
+| **10 (default)** | 1.60 | **0.56** | 0.8 s |
+| 24 | 1.51 | 0.57 | 1.9 s |
+| 50 (il loro default) | 1.49 | 0.61 | 4.0 s |
+| 150 | **1.44** | **0.66** | 12.0 s |
+
+**Direzioni opposte.** La causa, misurata su M1:
+
+| chunk | decoder totale | **drain dopo la generazione** | RTF |
+|---|---|---|---|
+| 10 | 2929 ms | **134 ms** | 0.56 |
+| 24 | 2569 ms | 398 ms | 0.58 |
+| 50 | 2823 ms | 856 ms | 0.66 |
+| 150 | 1867 ms | **1710 ms** | 0.69 |
+
+Il decoder *totale* scende sempre, anche su M1. Ma il **drain** — l'ultimo chunk, decodificato dopo che la
+generazione è finita, quindi senza nulla dietro cui nascondersi — esplode, e finisce tutto sul wall clock.
+
+> **Regola: il chunk ottimale dipende da chi è il collo di bottiglia.** Decoder-bound (N1, generazione lenta)
+> → chunk grandi vincono, riducono il lavoro totale. Generation-bound (M1, generazione veloce) → chunk grandi
+> perdono, il drain non si nasconde più.
+
+**Conseguenze:**
+1. **Default 10 confermato.** È l'ottimo su M1 e costa il 6% su N1. Il loro 50 sarebbe stato **−18% su Apple
+   Silicon**, la piattaforma principale del progetto. Avevano misurato su una macchina sola, e su quella
+   avevano ragione.
+2. **Il `chunk_frames` per-richiesta è la cosa giusta**: non esiste un numero buono per tutti, esiste una
+   manopola. "Prendi il parametro, rifiuta il default" (§1.1) si rivela corretto per una ragione che nessuna
+   delle due parti aveva previsto.
+3. ⚠️ **Da documentare per gli utenti del parametro:** sotto i ~7 frame la curva punisce (chunk 2 → RTF 2.11
+   su N1, contro 1.51 a chunk 24). Il parametro invita a scendere; il costo non è ovvio.
+
+## 5.7 Il fix del TTFA (`2142bc9`) — misurato, parziale
+
+A/B appaiato su N1 (stesso testo, coppie adiacenti ×3):
+- **chunk=2:** pre-fix 970/980/1008 → post-fix 949/943/955. Range **disgiunti**: −30 ms reali (−3%).
+- **chunk=24:** pre 982/991/945 → post 970/936/959. **Sovrapposti**: dentro il rumore.
+
+**Recupera ~30 ms dei ~74 ms persi.** Il resto è nelle allocazioni per-chunk (`cs_ensure_alloc` + una
+`aligned_malloc` per ogni conv, per ogni chunk) → resta il debito di §5.5. Non è "risolto": è **ridotto da
++8% a ~+3%**.
+
+## 5.8 `OPENBLAS_NUM_THREADS`: nessuno lo impostava, e l'ottimo è un compromesso RTF↔TTFA
+
+Il motore non chiamava mai `openblas_set_num_threads`: OpenBLAS prendeva il suo default (**un thread per
+core**), ignorando `-j`. Su un server 64-core con `-j4` erano **4 thread nostri contro 64 suoi**. Legato al
+budget di `-j` (`b1b0ab2` + `4f6302c`, weak symbol → no-op su Accelerate).
+
+Ma è **il pavimento, non la taratura**. Sweep su N1 (`-j4`, 4 core, 0.6B int4):
+
+| BLAS threads | RTF file | **TTFA file** | RTF stream |
+|---|---|---|---|
+| 2 | **1.48** | **2409 ms** | 1.52 |
+| 3 | 1.51 | 1966 ms | **1.47** |
+| 4 (= `-j`) | 1.59 | **1845 ms** | 1.54 |
+
+Abbassare i thread BLAS **migliora l'RTF e peggiora il TTFA del 30%**: il **prefill** è tutto BLAS e NON ha
+il decoder concorrente, quindi vuole tutti i core; la **generazione** ha il decoder concorrente, quindi ne
+vuole meno. → serve una manopola **per fase**, non per processo. E `OB=1` è disastroso (RTF 2.14): una
+partizione rigida `nostri + BLAS = core` sarebbe sbagliata — una lieve oversubscription vince, perché il
+nostro pool ha sezioni seriali in cui i core devono poter andare al decoder.
+
+## 5.9 Dopo il nostro lavoro, int4 NON batte più int8 su N1
+
+| | int8 | int4 |
+|---|---|---|
+| 0.6B file | 1.60 | 1.60 |
+| 1.7B file | **2.04** | 2.09 |
+
+La PR dichiarava int4 > int8 su N1, e **sul suo albero era vero**: lì il decoder era lentissimo e il Talker
+dominava. Ora che il decoder è sceso del 57%, **il collo si è spostato**: il vantaggio dell'int4 sul Talker
+non è più sul percorso critico, mentre il decoder è identico nei due casi.
+→ La regola "int4 batte int8 su ARM" ([[project_quant_ladder_findings]]) resta vera **per il Talker isolato**,
+non end-to-end. Ottimizzare una parte riordina la classifica di tutte le altre.
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
