@@ -556,6 +556,27 @@ Gate: one-shot bit-identico, chunked==one-shot (mel_corr 1.00000), `--self-test`
 TTFA senza regressione (A/B appaiato, §5.7). 18 commit. Aperto: spin-pool fixato (~3%), ramo `__AVX2__`
 della snake su x86, AVX-512 per attention/rms_norm su x86.
 
+## 5.12 Spin-pool (`c8ed80a`) — corretto, ma **nessun guadagno misurabile su N1**
+
+Rifatto senza il bug della PR: `sleeping` letto/scritto solo sotto mutex, `generation` bumpata sotto mutex,
+spin solo sulla lettura atomica (che non decide mai di dormire) → niente corsa store-buffer. `submit_mtx`
+tenuto. Dettagli in `qwen_tts_thread.c` e nel commit.
+
+Validato su N1 (pool POSIX reale) e su M1 (`-DQWEN_FORCE_PTHREAD`):
+- **Correttezza:** spin vs `QWEN_POOL_SPIN=0` **bit-identico**; **20/20** stream concorrenti (main + decoder
+  che sottomettono insieme) senza hang. Il lost-wakeup è chiuso.
+- **Guadagno:** stream 1.45 → 1.45, file 1.51 → 1.52. **Dentro il rumore.**
+
+**Perché non rende:** i ~7300 futex/frame pesano quando i thread si addormentano e risvegliano di continuo.
+Con `-j4` su 4 core il nostro pool è **quasi sempre runnable** — mancano i buchi di idle in cui lo spin
+ripaga. E la contesa vera (pool vs OpenBLAS, §5.1/§5.8) l'abbiamo già presa con la **leva BLAS per fase**,
+che è dove stava il 21% dello scheduler — non nel wake handoff che lo spin ottimizza.
+
+→ **Tenuto** (corretto, default 4096 innocuo, e su un server molto-core con più idle potrebbe rendere), ma
+**non è il guadagno che la PR prometteva.** Il valore della PR era altrove: conv esatto, conv int8, e —
+indirettamente, perché ci ha fatto profilare — la leva BLAS. Lo spin era la sua diagnosi giusta con la cura
+sbagliata: il costo che vedeva (§5.1) era reale, ma si abbatte tarando i thread, non spinnando.
+
 ## 6. Da dire all'autore (dopo §4 e §5)
 
 - Credito pieno: l'analisi è di qualità, i risultati negativi documentati, il conv esatto è il pezzo
