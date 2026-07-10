@@ -3482,39 +3482,34 @@ void qwen_gemm_int8(float *out, int out_ld,
 
 #endif /* __ARM_FEATURE_DOTPROD */
 
-#if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
-/* sin²(y), vectorized — the only form the snake needs.
- *
- * Reduce y by π (not 2π): u = y − n·π ∈ [−π/2, π/2], with n = round(y/π). That leaves
- * sin(u) = ±sin(y), and **squaring discards the sign**, so no quadrant bookkeeping.
+/* ------------------------------------------------------------------------
+ * Vectorized sin²(y) for the snake activation. The snake needs only sin², so:
+ * reduce y by π (not 2π): u = y − n·π ∈ [−π/2, π/2], n = round(y/π). That leaves
+ * sin(u) = ±sin(y), and SQUARING discards the sign — no quadrant bookkeeping.
  * π is split Cody-Waite (hi+lo) because n·π_float alone loses the low bits.
- * Odd Taylor series to u¹¹: the truncated term is u¹³/13! ≈ 1.2e-8 at |u|=π/2, well under
- * a float ULP. Idea from PR #17 (TrinityTF); the |y| guard below is ours.
+ * Odd Taylor series to u¹¹ (dropped term u¹³/13! ≈ 1.2e-8 at |u|=π/2, under a
+ * float ULP). Idea from PR #17 (TrinityTF); the |y| guard is ours.
  *
- * Above QWEN_SIN_POLY_MAX the 2-term reduction stops being exact enough (n grows, and the
- * π_lo residual is amplified), so the caller falls back to libm there. Snake's α·x stays
- * far below it in practice — this just refuses to be silently wrong if it ever doesn't. */
+ * Above QWEN_SIN_POLY_MAX the 2-term reduction loses too many bits (n grows, the
+ * π_lo residual is amplified), so the caller falls back to libm there. Snake's
+ * α·x stays far below it — the guard just refuses to be silently wrong if not.
+ *
+ * NEON and AVX2 twins: the __AVX2__ branch of the snake had the exact same
+ * scalar-sinf-per-lane problem the NEON branch did, and PR #17 only fixed NEON.
+ * ------------------------------------------------------------------------ */
+#if (defined(__ARM_NEON) || defined(__AVX2__)) && !(defined(__APPLE__) && defined(USE_BLAS))
 #define QWEN_SIN_POLY_MAX 8192.0f
-static inline float32x4_t qwen_vsin2q_f32(float32x4_t y) {
-    const float32x4_t inv_pi = vdupq_n_f32(0.31830988618379067f);
-    const float32x4_t pi_hi  = vdupq_n_f32(3.14159274101257324f);   /* float(π)      */
-    const float32x4_t pi_lo  = vdupq_n_f32(-8.74227800708368e-8f);  /* π − float(π)  */
-    float32x4_t n = vrndaq_f32(vmulq_f32(y, inv_pi));               /* round-to-nearest, ties away */
-    float32x4_t u = vfmsq_f32(y, n, pi_hi);
-    u = vfmaq_f32(u, n, pi_lo);
-    float32x4_t u2 = vmulq_f32(u, u);
-    /* Horner on u²: s = u·(1 − u²/6 + u⁴/120 − u⁶/5040 + u⁸/362880 − u¹⁰/39916800) */
-    float32x4_t p = vdupq_n_f32(-1.0f / 39916800.0f);
-    p = vfmaq_f32(vdupq_n_f32( 1.0f / 362880.0f), p, u2);
-    p = vfmaq_f32(vdupq_n_f32(-1.0f / 5040.0f),   p, u2);
-    p = vfmaq_f32(vdupq_n_f32( 1.0f / 120.0f),    p, u2);
-    p = vfmaq_f32(vdupq_n_f32(-1.0f / 6.0f),      p, u2);
-    p = vfmaq_f32(vdupq_n_f32( 1.0f),             p, u2);
-    float32x4_t s = vmulq_f32(u, p);
-    return vmulq_f32(s, s);
-}
-/* QWEN_NO_SIN_POLY=1 restores the per-lane libm sinf — the A/B switch for this kernel
- * (same shape as QWEN_NO_SDOT). Cached once; read outside the hot loop. */
+#define QWEN_SIN_C1  (-1.0f / 6.0f)
+#define QWEN_SIN_C2  ( 1.0f / 120.0f)
+#define QWEN_SIN_C3  (-1.0f / 5040.0f)
+#define QWEN_SIN_C4  ( 1.0f / 362880.0f)
+#define QWEN_SIN_C5  (-1.0f / 39916800.0f)
+#define QWEN_PI_HI   3.14159274101257324f    /* float(π)     */
+#define QWEN_PI_LO  (-8.74227800708368e-8f)  /* π − float(π) */
+#define QWEN_INV_PI  0.31830988618379067f
+
+/* QWEN_NO_SIN_POLY=1 restores the per-lane libm sinf — the A/B switch (like
+ * QWEN_NO_SDOT). Cached once; read outside the hot loop. */
 static int qwen_sin_poly_off(void) {
     static atomic_int off = -1;
     int v = atomic_load_explicit(&off, memory_order_relaxed);
@@ -3527,12 +3522,57 @@ static int qwen_sin_poly_off(void) {
 }
 #endif
 
+#if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
+static inline float32x4_t qwen_vsin2q_f32(float32x4_t y) {
+    const float32x4_t inv_pi = vdupq_n_f32(QWEN_INV_PI);
+    const float32x4_t pi_hi  = vdupq_n_f32(QWEN_PI_HI);
+    const float32x4_t pi_lo  = vdupq_n_f32(QWEN_PI_LO);
+    float32x4_t n = vrndaq_f32(vmulq_f32(y, inv_pi));               /* round-to-nearest, ties away */
+    float32x4_t u = vfmsq_f32(y, n, pi_hi);
+    u = vfmaq_f32(u, n, pi_lo);
+    float32x4_t u2 = vmulq_f32(u, u);
+    /* Horner on u²: s = u·(1 − u²/6 + u⁴/120 − u⁶/5040 + u⁸/362880 − u¹⁰/39916800) */
+    float32x4_t p = vdupq_n_f32(QWEN_SIN_C5);
+    p = vfmaq_f32(vdupq_n_f32(QWEN_SIN_C4), p, u2);
+    p = vfmaq_f32(vdupq_n_f32(QWEN_SIN_C3), p, u2);
+    p = vfmaq_f32(vdupq_n_f32(QWEN_SIN_C2), p, u2);
+    p = vfmaq_f32(vdupq_n_f32(QWEN_SIN_C1), p, u2);
+    p = vfmaq_f32(vdupq_n_f32(1.0f),        p, u2);
+    float32x4_t s = vmulq_f32(u, p);
+    return vmulq_f32(s, s);
+}
+#endif /* __ARM_NEON */
+
+#if defined(__AVX2__) && !(defined(__APPLE__) && defined(USE_BLAS))
+/* AVX2 twin of qwen_vsin2q_f32 (8 lanes). Same reduction and coefficients.
+ * _mm256_round_ps with NEAREST|NO_EXC == round-to-nearest-even; the ½-ULP
+ * difference from NEON's ties-away is immaterial after the u¹¹ series + square. */
+static inline __m256 qwen_vsin2_avx2(__m256 y) {
+    const __m256 inv_pi = _mm256_set1_ps(QWEN_INV_PI);
+    const __m256 pi_hi  = _mm256_set1_ps(QWEN_PI_HI);
+    const __m256 pi_lo  = _mm256_set1_ps(QWEN_PI_LO);
+    __m256 n = _mm256_round_ps(_mm256_mul_ps(y, inv_pi),
+                              _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    __m256 u = _mm256_fnmadd_ps(n, pi_hi, y);   /* y − n·pi_hi */
+    u = _mm256_fmadd_ps(n, pi_lo, u);           /* + n·pi_lo   */
+    __m256 u2 = _mm256_mul_ps(u, u);
+    __m256 p = _mm256_set1_ps(QWEN_SIN_C5);
+    p = _mm256_fmadd_ps(p, u2, _mm256_set1_ps(QWEN_SIN_C4));
+    p = _mm256_fmadd_ps(p, u2, _mm256_set1_ps(QWEN_SIN_C3));
+    p = _mm256_fmadd_ps(p, u2, _mm256_set1_ps(QWEN_SIN_C2));
+    p = _mm256_fmadd_ps(p, u2, _mm256_set1_ps(QWEN_SIN_C1));
+    p = _mm256_fmadd_ps(p, u2, _mm256_set1_ps(1.0f));
+    __m256 s = _mm256_mul_ps(u, p);
+    return _mm256_mul_ps(s, s);
+}
+#endif /* __AVX2__ */
+
 /* One channel row of the snake: y = x + (1/beta)*sin^2(alpha*x). Rows are fully
  * independent; the only thing that stood between us and threading them was a
  * dispatcher callable from the decoder thread -- which sd_pool_run is. */
 static void snake_row(float *data, int c, int length,
                       const float *log_alpha, const float *log_beta) {
-#if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
+#if (defined(__ARM_NEON) || defined(__AVX2__)) && !(defined(__APPLE__) && defined(USE_BLAS))
     const int sin_poly = !qwen_sin_poly_off();
 #endif
     {
@@ -3593,15 +3633,25 @@ static void snake_row(float *data, int c, int length,
             __m256 va = _mm256_set1_ps(a);
             __m256 vinv_b = _mm256_set1_ps(inv_b);
             int t = 0;
+            const __m256 sign_mask = _mm256_set1_ps(-0.0f);
+            const __m256 poly_max  = _mm256_set1_ps(QWEN_SIN_POLY_MAX);
             for (; t + 8 <= length; t += 8) {
                 __m256 x = _mm256_loadu_ps(row + t);
                 __m256 ax = _mm256_mul_ps(va, x);
-                /* Scalar sinf per lane (no AVX2 sin intrinsic), vectorize the rest */
-                float ax_s[8]; _mm256_storeu_ps(ax_s, ax);
-                float s_arr[8] = { sinf(ax_s[0]), sinf(ax_s[1]), sinf(ax_s[2]), sinf(ax_s[3]),
-                                   sinf(ax_s[4]), sinf(ax_s[5]), sinf(ax_s[6]), sinf(ax_s[7]) };
-                __m256 s = _mm256_loadu_ps(s_arr);
-                __m256 s2 = _mm256_mul_ps(s, s);
+                __m256 s2;
+                /* Poly path unless disabled or any lane is beyond the reduction's
+                 * safe range (then libm, like the NEON twin). movemask != 0 means
+                 * at least one lane exceeds the guard. */
+                __m256 over = _mm256_cmp_ps(_mm256_andnot_ps(sign_mask, ax), poly_max, _CMP_GT_OQ);
+                if (sin_poly && _mm256_movemask_ps(over) == 0) {
+                    s2 = qwen_vsin2_avx2(ax);
+                } else {
+                    float ax_s[8]; _mm256_storeu_ps(ax_s, ax);
+                    float s_arr[8] = { sinf(ax_s[0]), sinf(ax_s[1]), sinf(ax_s[2]), sinf(ax_s[3]),
+                                       sinf(ax_s[4]), sinf(ax_s[5]), sinf(ax_s[6]), sinf(ax_s[7]) };
+                    __m256 s = _mm256_loadu_ps(s_arr);
+                    s2 = _mm256_mul_ps(s, s);
+                }
                 x = _mm256_fmadd_ps(vinv_b, s2, x);
                 _mm256_storeu_ps(row + t, x);
             }
