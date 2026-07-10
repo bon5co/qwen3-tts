@@ -70,7 +70,7 @@ static int g_n_threads = 1;
 extern void openblas_set_num_threads(int) __attribute__((weak));
 #endif
 
-static void qwen_blas_set_threads(int n) {
+void qwen_blas_set_threads(int n) {
 #if defined(__GNUC__) && !defined(__APPLE__)
     if (getenv("OPENBLAS_NUM_THREADS")) return;   /* explicit user choice wins */
     if (openblas_set_num_threads) openblas_set_num_threads(n > 0 ? n : 1);
@@ -3124,6 +3124,102 @@ void qwen_int8_quant_rows(int8_t *dst, float *scales, const float *src,
     }
 }
 
+/* ---------------- decoder-side parallel dispatcher ----------------------
+ * Used by the int8 conv AND by the snake activation -- hence it must live
+ * outside the dotprod guard below.
+ * The decoder runs on its own thread while the generation thread is inside
+ * qwen_parallel. On macOS qwen_parallel is GCD (reentrant) so we just use it.
+ * On the POSIX pool it is NOT reentrant and, since d2b5df2, a second submitter
+ * blocks on submit_mtx -- calling it from the decoder would stall generation.
+ * So there we run a small pool of our own (PR #17's design), one job at a time.
+ * Workers park on a condvar for process life; bounded, not a leak.
+ * QWEN_SD_THREADS overrides the total thread count. */
+#define SD_POOL_MAX_WORKERS 8
+
+static pthread_mutex_t sdp_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  sdp_cv = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t  sdp_done_cv = PTHREAD_COND_INITIALIZER;
+static pthread_t sdp_threads[SD_POOL_MAX_WORKERS];
+static int sdp_nworkers = 0;
+static int sdp_started = 0;
+static unsigned sdp_gen = 0;
+static int sdp_pending = 0;
+static void (*sdp_fn)(void *) = NULL;
+static void *sdp_ctx = NULL;
+
+static void *sdp_worker_main(void *arg) {
+    (void)arg;
+    qwen_ftz_on();
+    unsigned seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&sdp_mu);
+        while (sdp_gen == seen)
+            pthread_cond_wait(&sdp_cv, &sdp_mu);
+        seen = sdp_gen;
+        void (*fn)(void *) = sdp_fn;
+        void *ctx = sdp_ctx;
+        pthread_mutex_unlock(&sdp_mu);
+        fn(ctx);
+        pthread_mutex_lock(&sdp_mu);
+        if (--sdp_pending == 0) pthread_cond_signal(&sdp_done_cv);
+        pthread_mutex_unlock(&sdp_mu);
+    }
+    return NULL;
+}
+
+static int sd_pool_threads(void) {
+    static int cfg = -1;
+    if (cfg < 0) { const char *e = getenv("QWEN_SD_THREADS"); cfg = e ? atoi(e) : 0; }
+    return cfg > 0 ? cfg : qwen_get_threads();
+}
+
+/* Adapter: the job fn claims work from an atomic counter inside ctx, so every
+ * thread runs the same fn and tid/nt are irrelevant. The pair travels in the
+ * ctx so the GCD path touches no global (it can run on any thread). */
+typedef struct { void (*fn)(void *); void *ctx; } sd_gcd_job_t;
+static void sd_gcd_task(size_t tid, size_t nt, void *vj) {
+    (void)tid; (void)nt;
+    sd_gcd_job_t *j = (sd_gcd_job_t *)vj;
+    j->fn(j->ctx);
+}
+
+/* Run fn(ctx) on the caller plus helpers. One job at a time: the decoder is
+ * single-threaded per synthesis, and the server decodes slots sequentially. */
+static void sd_pool_run(void (*fn)(void *), void *ctx) {
+    int nt = sd_pool_threads();
+    if (nt < 1) nt = 1;
+    if (nt == 1) { fn(ctx); return; }
+
+    if (qwen_parallel_is_reentrant()) {
+        sd_gcd_job_t j = { fn, ctx };   /* macOS/GCD: no private pool needed */
+        qwen_parallel((size_t)nt, sd_gcd_task, &j);
+        return;
+    }
+
+    int want = nt - 1;
+    if (want > SD_POOL_MAX_WORKERS) want = SD_POOL_MAX_WORKERS;
+    if (want < 0) want = 0;
+    pthread_mutex_lock(&sdp_mu);
+    if (!sdp_started) {
+        for (int i = 0; i < want; i++)
+            if (pthread_create(&sdp_threads[sdp_nworkers], NULL, sdp_worker_main, NULL) == 0)
+                sdp_nworkers++;
+        sdp_started = 1;
+    }
+    sdp_fn = fn; sdp_ctx = ctx;
+    sdp_pending = sdp_nworkers;
+    sdp_gen++;
+    pthread_cond_broadcast(&sdp_cv);
+    pthread_mutex_unlock(&sdp_mu);
+
+    fn(ctx);   /* caller participates */
+
+    pthread_mutex_lock(&sdp_mu);
+    while (sdp_pending > 0) pthread_cond_wait(&sdp_done_cv, &sdp_mu);
+    pthread_mutex_unlock(&sdp_mu);
+}
+
+
 #if defined(__ARM_FEATURE_DOTPROD)
 
 /* 2 rows x 4 cols register tile with per-block fp32 accumulation.
@@ -3221,99 +3317,6 @@ static void sd_gemm_panel(float *out, int out_ld, int M,
             for (int m = rb; m < rbe; m++)
                 sd_tile_1xN(out, out_ld, m, tcol0 + c, Wq, swb, bias, Xq, sab, c, nc - c, Kp, blk, nblk);
     }
-}
-
-/* ---------------- how the int8 conv gets its threads ---------------------
- * The decoder runs on its own thread while the generation thread is inside
- * qwen_parallel. On macOS qwen_parallel is GCD (reentrant) so we just use it.
- * On the POSIX pool it is NOT reentrant and, since d2b5df2, a second submitter
- * blocks on submit_mtx -- calling it from the decoder would stall generation.
- * So there we run a small pool of our own (PR #17's design), one job at a time.
- * Workers park on a condvar for process life; bounded, not a leak.
- * QWEN_SD_THREADS overrides the total thread count. */
-#define SD_POOL_MAX_WORKERS 8
-
-static pthread_mutex_t sdp_mu = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  sdp_cv = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t  sdp_done_cv = PTHREAD_COND_INITIALIZER;
-static pthread_t sdp_threads[SD_POOL_MAX_WORKERS];
-static int sdp_nworkers = 0;
-static int sdp_started = 0;
-static unsigned sdp_gen = 0;
-static int sdp_pending = 0;
-static void (*sdp_fn)(void *) = NULL;
-static void *sdp_ctx = NULL;
-
-static void *sdp_worker_main(void *arg) {
-    (void)arg;
-    qwen_ftz_on();
-    unsigned seen = 0;
-    for (;;) {
-        pthread_mutex_lock(&sdp_mu);
-        while (sdp_gen == seen)
-            pthread_cond_wait(&sdp_cv, &sdp_mu);
-        seen = sdp_gen;
-        void (*fn)(void *) = sdp_fn;
-        void *ctx = sdp_ctx;
-        pthread_mutex_unlock(&sdp_mu);
-        fn(ctx);
-        pthread_mutex_lock(&sdp_mu);
-        if (--sdp_pending == 0) pthread_cond_signal(&sdp_done_cv);
-        pthread_mutex_unlock(&sdp_mu);
-    }
-    return NULL;
-}
-
-static int sd_pool_threads(void) {
-    static int cfg = -1;
-    if (cfg < 0) { const char *e = getenv("QWEN_SD_THREADS"); cfg = e ? atoi(e) : 0; }
-    return cfg > 0 ? cfg : qwen_get_threads();
-}
-
-/* Adapter: the job fn claims panels from an atomic counter in ctx, so every
- * thread runs the same fn and the tid/nt are irrelevant. */
-static void sd_gcd_task(size_t tid, size_t nt, void *ctx) {
-    (void)tid; (void)nt;
-    sdp_fn(ctx);
-}
-
-/* Run fn(ctx) on the caller plus helpers. One job at a time: the decoder is
- * single-threaded per synthesis, and the server decodes slots sequentially. */
-static void sd_pool_run(void (*fn)(void *), void *ctx) {
-    int nt = sd_pool_threads();
-    if (nt < 1) nt = 1;
-    if (nt == 1) { fn(ctx); return; }
-
-    if (qwen_parallel_is_reentrant()) {
-        /* macOS/GCD: no private pool needed. sdp_fn is only read by sd_gcd_task
-         * within this call, and sd_pool_run is not called concurrently. */
-        sdp_fn = fn;
-        qwen_parallel((size_t)nt, sd_gcd_task, ctx);
-        sdp_fn = NULL;
-        return;
-    }
-
-    int want = nt - 1;
-    if (want > SD_POOL_MAX_WORKERS) want = SD_POOL_MAX_WORKERS;
-    if (want < 0) want = 0;
-    pthread_mutex_lock(&sdp_mu);
-    if (!sdp_started) {
-        for (int i = 0; i < want; i++)
-            if (pthread_create(&sdp_threads[sdp_nworkers], NULL, sdp_worker_main, NULL) == 0)
-                sdp_nworkers++;
-        sdp_started = 1;
-    }
-    sdp_fn = fn; sdp_ctx = ctx;
-    sdp_pending = sdp_nworkers;
-    sdp_gen++;
-    pthread_cond_broadcast(&sdp_cv);
-    pthread_mutex_unlock(&sdp_mu);
-
-    fn(ctx);   /* caller participates */
-
-    pthread_mutex_lock(&sdp_mu);
-    while (sdp_pending > 0) pthread_cond_wait(&sdp_done_cv, &sdp_mu);
-    pthread_mutex_unlock(&sdp_mu);
 }
 
 /* ---------------- threaded int8 conv1d (im2col per panel) -------------- */
@@ -3524,12 +3527,15 @@ static int qwen_sin_poly_off(void) {
 }
 #endif
 
-void qwen_snake_activation(float *data, int channels, int length,
-                            const float *log_alpha, const float *log_beta) {
+/* One channel row of the snake: y = x + (1/beta)*sin^2(alpha*x). Rows are fully
+ * independent; the only thing that stood between us and threading them was a
+ * dispatcher callable from the decoder thread -- which sd_pool_run is. */
+static void snake_row(float *data, int c, int length,
+                      const float *log_alpha, const float *log_beta) {
 #if defined(__ARM_NEON) && !(defined(__APPLE__) && defined(USE_BLAS))
     const int sin_poly = !qwen_sin_poly_off();
 #endif
-    for (int c = 0; c < channels; c++) {
+    {
         float a = expf(log_alpha[c]);
         float inv_b = expf(-log_beta[c]);
         float *row = data + (int64_t)c * length;
@@ -3611,6 +3617,44 @@ void qwen_snake_activation(float *data, int channels, int length,
         }
 #endif
     }
+}
+
+/* Threaded snake. Rows are claimed from an atomic counter, so a slow row cannot
+ * stall a whole thread's stripe. PR #17 measured the snake at 1209 ms on a 7.4 s
+ * clip: the polynomial sine took it to 341 ms, threading the rows took it to
+ * ~90 ms. Threading was the larger half, and this is that half.
+ *
+ * Below a work threshold we stay serial: the early ConvNeXt-stage snakes are
+ * small and the dispatch costs more than it saves. */
+typedef struct {
+    float *data; int channels, length;
+    const float *log_alpha, *log_beta;
+    _Atomic int next;
+} snake_job_t;
+
+static void snake_worker(void *vj) {
+    snake_job_t *j = (snake_job_t *)vj;
+    for (;;) {
+        int c = atomic_fetch_add(&j->next, 1);
+        if (c >= j->channels) break;
+        snake_row(j->data, c, j->length, j->log_alpha, j->log_beta);
+    }
+}
+
+#define QWEN_SNAKE_MIN_WORK 65536   /* elements; below this, dispatch dominates */
+
+void qwen_snake_activation(float *data, int channels, int length,
+                            const float *log_alpha, const float *log_beta) {
+    if ((int64_t)channels * length < QWEN_SNAKE_MIN_WORK || qwen_get_threads() <= 1) {
+        for (int c = 0; c < channels; c++)
+            snake_row(data, c, length, log_alpha, log_beta);
+        return;
+    }
+    snake_job_t job;
+    job.data = data; job.channels = channels; job.length = length;
+    job.log_alpha = log_alpha; job.log_beta = log_beta;
+    atomic_init(&job.next, 0);
+    sd_pool_run(snake_worker, &job);
 }
 
 /* ========================================================================

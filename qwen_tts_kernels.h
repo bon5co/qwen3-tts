@@ -36,6 +36,13 @@ static inline void *aligned_calloc(size_t count, size_t size) {
  * ======================================================================== */
 
 void qwen_set_threads(int n);
+
+/* Retarget the BLAS thread pool at a phase boundary. Prefill is BLAS-heavy and
+ * runs with no decoder thread beside it, so it wants every thread; generation
+ * runs concurrently with the decoder (which is the BLAS user there), so BLAS
+ * must step back or the two pools fight for the same cores. No-op unless linked
+ * against OpenBLAS, and always a no-op if the user set OPENBLAS_NUM_THREADS. */
+void qwen_blas_set_threads(int n);
 int qwen_get_threads(void);
 int qwen_get_num_cpus(void);
 void qwen_init_threads(void);
