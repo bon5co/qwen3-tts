@@ -265,6 +265,38 @@ to compare (chunked synthesis emits slightly more audio). For correctness across
 | **Zen5 Turin** (EPYC 9555P, 0.6B, ms/frame) | q4-VNNI **v3** vs v2 vs int8 | — | Tlk 25.3 / CP 69.6 | **Tlk 22.9 / CP 63.5** | — | 2026-07-10 **q4-VNNI v3: the q4 KERNEL now beats v2 (−9%) and int8 per-frame** — the v2 compute-bound finding is fixed. (Wall RTF int8 still leads 0.93 vs int4 1.01: int4/int8 fork trajectory, 95 vs 147 frames, so wall isn't cross-quant comparable — the per-frame kernel is.) `SIMD=avx512vnni`, `QWEN_Q4_VNNI_V3=0`→v2. Compare ms/frame not RTF (int4/int8 fork trajectory: 95 vs 147 frames) |
 | _Zen5 Turin_ | batch (matmat, B=8) | 11.9× | **3.0×** | 1.6× | — | kernel-level batching speedup (int8/q4 now VNNI, `--matmat-bench`); e2e server-batching = WIP (§5.note) |
 | _Sapphire (AMX)_ | batch | | | | | AMX int8 GEMM (future twin) |
+
+**⭐ Full RTF+TTFA — EPYC 9555P Zen5, 4 vCPU, `-j4`, `SIMD=avx512vnni` (2026-07-10, post-PR#17, min of 3):**
+
+| model | config | RTF | TTFA |
+|---|---|---|---|
+| 0.6B | file **int8** | **0.95** | 1073 ms |
+| 0.6B | file int4 (v3) | 1.01 | 1142 ms |
+| 0.6B | stream int4 (chunk24) | 0.99 | **575 ms** |
+| 0.6B | file bf16 | 1.08 | 1219 ms |
+| 1.7B | file **int8** | **1.17** | 1705 ms |
+| 1.7B | file int4 (v3) | 1.30 | 1865 ms |
+| 1.7B | stream int4 (chunk24) | 1.28 | 1145 ms |
+| 1.7B | file bf16 | 1.44 | 2069 ms |
+
+Headline: **int8 is the x86 wall-clock winner** (0.6B sub-RT 0.95). q4-VNNI v3 made the int4 KERNEL faster
+per-frame than int8 (row above), but int4/int8 fork the greedy trajectory so wall RTF isn't cross-quant
+comparable.
+
+**⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
+
+| model | config | RTF | TTFA |
+|---|---|---|---|
+| 0.6B | file int8 | 1.60 | 1842 ms |
+| 0.6B | file int4 | 1.60 | 1883 ms |
+| 0.6B | stream int4 (chunk24) | **1.49** | 908 ms |
+| 0.6B | stream int4 + `QWEN_SD_INT8=1` | **1.28** | 932 ms |
+| 1.7B | file int8 | 2.04 | 3116 ms |
+| 1.7B | stream int4 + `QWEN_SD_INT8=1` | **1.80** | 1968 ms |
+
+Decoder-bound box: exact-streaming conv + threaded snake + int8 decoder conv land hardest here (`main`
+0.6B stream int4 1.98 → 1.49, −25%; +conv-int8 1.28). Opposite of x86, **int4 ≈ int8 e2e** after the
+decoder work (the bottleneck moved off the Talker).
 | _Graviton3_ | batch | | | | | bf16+i8mm+SVE |
 
 ### §5.note — EPYC 9555P Zen5 run (2026-07-09) — what DIFFERS from M1
