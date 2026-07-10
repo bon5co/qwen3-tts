@@ -262,59 +262,73 @@ OpenBLAS a 4 thread si contendono 4 core** (oversubscription da parallelismo ann
 ⏳ Restano: spin-pool **dopo** il fix (`submit_mtx` + fence seq_cst), `QWEN_SD_INT8=1` **con ascolto** su
 emotion/clone, e il ramo `__AVX2__` della snake (stesso problema, box x86).
 
-## 5. ⏳ Il lavoro derivato che la PR ha rivelato (e che la PR NON copre)
+## 5. ⚠️ Il "debito delle trascendenti": tesi **in gran parte FALSIFICATA** sulla box
 
-La PR ha trovato **un** ramo che M1 non compila. Non è un caso isolato: è un **pattern strutturale**.
-M1 è la dev box, quindi ogni ramo `#if` che M1 non prende non viene mai profilato né curato.
+**Cosa avevo dedotto dal grep** (e che è finito, sbagliato, in una prima versione di questo doc e nel TODO):
+usiamo Accelerate vForce in due soli punti (`vvexpf` in `qwen_swiglu_inplace:2941`, `vvsinf` in
+`qwen_snake_activation:3046`), entrambi col ramo Apple per primo → quindi ARM-Linux e x86 pagherebbero
+`expf()`/`sinf()` **scalari, per elemento**, e servirebbe un kernel trascendente vettoriale multi-ISA.
 
-Usiamo Accelerate vForce in **esattamente due punti**, ed entrambi mettono il ramo Apple **per primo**:
+**Cosa dice la box.** `nm -D` sul binario compilato lì:
+```
+_ZGVnN4v_sinf@GLIBC_2.38   _ZGVnN4v_expf@GLIBC_2.38
+_ZGVnN4v_erff@GLIBC_2.40   _ZGVnN4v_tanhf@GLIBC_2.40   _ZGVnN2v_expf@GLIBC_2.39
+```
+**gcc, con `-ffast-math`, auto-vettorizza già quei loop chiamando `libmvec` di glibc.** Non c'è nessun
+`sinf` scalare per elemento: il compilatore lo sostituisce con la variante vettoriale a 4 lane. Coerente
+col profilo, dove **`sinf` non compare nemmeno sopra l'1%**.
 
-| sito | M1 (`__APPLE__ && USE_BLAS`) | ARM-Linux **e** x86 | frequenza |
-|---|---|---|---|
-| `qwen_swiglu_inplace` (`qwen_tts_kernels.c:2941`) | `vvexpf` vettoriale | **`expf()` scalare, per elemento** | FFN, **ogni layer, ogni token** |
-| `qwen_snake_activation` (`:3046`) | `vvsinf` vettoriale | **`sinf()` scalare** — la PR fixa **solo** `__ARM_NEON` | decoder conv |
+Conseguenze:
+- **La snake poly rende poco** (−3/−4%, §4.1): non batte lo scalare, batte `_ZGVnN4v_sinf` — e solo perché
+  calcola `sin²` senza gestire il segno né i quadranti. Il commit resta (corretto, gratis), ma **non è il pezzo che vale**.
+- **La tesi "la expf della SwiGLU è un buco"** è morta due volte: prima per volume (40.6M vs 278.6M
+  chiamate, ~1.3% di talker+CP), poi perché `_ZGVnN4v_expf` è già lì.
+- **Un kernel trascendente multi-ISA scritto a mano NON è prioritario** su gcc+glibc≥2.38. Resterebbe utile
+  solo dove libmvec non c'è: **clang** (non emette chiamate libmvec), **musl**, glibc vecchie, e
+  **senza `-ffast-math`**. Da verificare sulla box x86 prima di scriverne una riga.
 
-Volume dello scalare fuori da Apple:
-- Talker 0.6B: 28 × 3072 = **86k `expf()`/token** · Talker 1.7B: 28 × 6144 = **172k/token**
-- CP: 5 × 3072 = 15k/pass × **15 pass/frame** = **~230k `expf()`/frame**
+> Tre previsioni fatte a tavolino, tre smentite dall'hardware in un giorno: il peso della `expf`; il
+> "TTFA invariato" (su N1 è una regressione reale dell'8%); e il buco delle trascendenti. Il pattern:
+> **su questo progetto il grep propone, l'hardware dispone.**
 
-> **⚠️ Ipotesi FALSIFICATA dalla misura (2026-07-10).** Avevo ipotizzato, dal solo conteggio delle
-> chiamate, che la `expf` della SwiGLU costasse **più** della snake. **È falso.** Micro-benchmark su M1
-> (`scratchpad/expbench.c`, exp poly NEON scritta apposta, err. rel. max 3.3e-6):
->
-> | | chiamate / clip (1.7B, 8.1s) | costo scalare |
-> |---|---|---|
-> | `expf` (SwiGLU: Talker + CP) | 40.6M | ~96 ms → **1.3% di talker+CP** |
-> | `sinf` (snake: 4 upsample × (1 + 3×2) + finale) | **278.6M — 6.9×** | è qui che stanno i 1209 ms della PR |
->
-> **La PR ha puntato il bersaglio giusto.** La snake domina; la SwiGLU è marginale.
-> Il micro-benchmark misura comunque il *potenziale del kernel*: `expf` scalare 2.37 ns/elem →
-> **NEON poly 0.41 ns/elem (5.8×)**, e persino **più veloce di `vvexpf` di Accelerate** (0.53 ns/elem).
-> Quindi il kernel vettoriale resta la cosa giusta da scrivere — ma la priorità è **sin**, non **exp**,
-> e il guadagno atteso su swiglu è ~1%, non la doppia cifra che avevo lasciato intendere.
+## 5.1 Quello che il profilo dice DAVVERO di fare (N1)
 
-Il ramo `__AVX2__` della snake (`:3089`) chiama anch'esso `sinf()` scalare → **stesso fix, guadagno x86
-che la PR non copre**.
+| simbolo | % | azione |
+|---|---|---|
+| `sgemm_kernel_NEOVERSEN1` | 30.9% | conv del decoder via OpenBLAS — vedi oversubscription |
+| `q4_0_matvec_sdot` | 28.8% | già ottimizzato (B1 + accumulo float32x4) |
+| kernel scheduling/futex/yield | **~21%** | ⬅ **il vero mostro** |
 
-Inoltre `qwen_causal_attention` (`:2580`) usa `expf()` scalare nel softmax **su tutte le piattaforme,
-M1 compresa**: win universale, più piccolo (O(seq_len)/layer).
+**Oversubscription: il nostro pool (4 thread) e OpenBLAS (4 thread) su 4 core.** Sweep di
+`OPENBLAS_NUM_THREADS` (0.6B `--int4 -j4`, 3 rip, min):
 
-→ **Deliverable: un kernel trascendente vettoriale multi-ISA** (`qwen_vec_sinf` **prima**, poi
-`qwen_vec_expf`; NEON + AVX2/AVX-512 + scalare) dietro il dispatch attuale, con Apple che resta su
-vForce (o vi passa sopra: la poly NEON batte `vvexpf` in micro-bench — da verificare a livello di engine).
-Ordine dettato dalla misura: **sin (278M chiamate) ≫ exp (40M) > softmax**.
+| | OB=1 | OB=2 | OB=3 | OB=4 (default) |
+|---|---|---|---|---|
+| file `--int4` | 2.14 | **1.48** | 1.52 | 1.58 |
+| stream chunk 24 | 2.22 | 1.53 | **1.46** | 1.49 |
 
-> **Nota sull'inventario SIMD (verificato, 2026-07-10):** l'algebra lineare è coperta ovunque —
-> `qwen_tts_kernels.c` ha **40 funzioni con SIMD**, 870 intrinsics NEON, 202 AVX2, 70 AVX-512, 25 VNNI
-> (matvec/matmat bf16-int8-q4, rms_norm, attention, quantizzazione, SDOT, VNNI). **Non manca nulla lì.**
-> Il buco è **esclusivamente** sulle trascendenti: `qwen_swiglu_inplace` è l'unica funzione con *solo*
-> vForce(Apple) e nessun ramo NEON/AVX2; la snake ha rami NEON/AVX2 che però vettorizzano solo load/store
-> e chiamano `sinf()` **scalare per lane**; il softmax dell'attention usa `expf()` scalare ovunque.
+Reale ma **più modesto** del 21% suggerito: −6% in file, −2% in stream (una parte di quel 21% è il futex
+del *nostro* pool, non la contesa con OpenBLAS). E **l'ottimo cambia col modo** (2 in file, 3 in stream) →
+è una manopola da tarare per fase, non una costante. Il prefill usa BLAS pesantemente e vorrebbe più thread.
 
-**Prerequisito, non extra:** `--self-test` oggi copre i matvec, **non** copre snake/swiglu/softmax.
-Estenderlo prima di toccarli.
+→ **Questo, non la snake, è ciò che il commit spin-pool della PR sfiorava.** La sua diagnosi (~7300 futex
+per frame) era giusta; la cura (spin nel *nostro* pool) è la **seconda** mossa. La prima è non oversubscribere.
 
----
+## 5.2 Buchi ISA verificati (inventario, non ipotesi)
+
+`qwen_tts_kernels.c`: **40 funzioni con SIMD** — 870 intrinsics NEON, 202 AVX2, 70 AVX-512, 25 VNNI.
+Matvec/matmat (bf16/int8/q4), rms_norm, attention, quantizzazione, SDOT, VNNI: **tutto coperto**.
+`int8_matvec_fused` e `q4_0_matvec_inner` sembrano "senza AVX-512" ma sono **fallback**: su box VNNI il
+dispatch prende `int8_matvec_vnni` / `q4_0_matvec_vnni` (verificato). Buchi veri che restano:
+
+| dove | cosa | note |
+|---|---|---|
+| x86 | `qwen_causal_attention*` e `qwen_rms_norm` sono **AVX2, mai AVX-512** | metà larghezza su EPYC/SPR — da misurare |
+| x86 | **q4-VNNI compute-bound** (int4 2.76 vs int8 2.01 su EPYC) | il blocco x86 maggiore; serve throughput-packing, **non** il packing della PR |
+| x86 | AMX / AVX512-BF16 mai usati | Track C, serve Sapphire Rapids |
+| ARM server | niente SVE / i8mm / BFMMLA | Track C, serve Graviton3/4 (questa Ampere non li ha) |
+| ARM-Linux | spin-pool | **dopo** il fix; e dopo aver tarato OpenBLAS |
+| ARM-Linux | conv int8 del decoder | opt-in, solo dopo ascolto su emotion/clone |
 
 ## 6. Da dire all'autore (dopo §4 e §5)
 
