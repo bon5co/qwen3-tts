@@ -1,0 +1,65 @@
+# Qwen3-TTS (pure-C, CPU) — API reference for LLM agents
+
+Self-hostable text-to-speech HTTP service. Pure C inference engine for Alibaba's
+Qwen3-TTS models (0.6B / 1.7B), CPU-only, no Python/PyTorch. OpenAI-compatible
+endpoint included. Docker image: `ghcr.io/bon5co/qwen3-tts:latest` (linux/amd64 + arm64).
+
+## Endpoints
+
+Base URL: `http://<host>:<PORT>` (default port 8080).
+
+### POST /v1/tts — synthesize speech, returns audio/wav
+Request JSON:
+{
+  "text": "Hello world",            // required; supports inline emotion markup: "[joy] Great! [sad] Bye."
+  "speaker": "ryan",                 // optional; see GET /v1/speakers (default: ryan)
+  "language": "English",             // optional
+  "emotion": "joy",                  // optional: joy|sad|angry|fear|disgust|surprise|neutral
+  "instruct": "whisper softly",      // optional free-form style instruction
+  "volume": 1.0,                     // optional gain multiplier
+  "rate": 1.0                        // optional speaking-rate multiplier
+}
+Response: WAV bytes (16-bit PCM mono 24000 Hz).
+
+### POST /v1/tts/stream — same body, returns chunked raw PCM (s16le mono 24 kHz)
+First audio arrives before synthesis completes (low TTFA).
+
+### POST /v1/audio/speech — OpenAI-compatible
+Request JSON: { "input": "text to speak", "voice": "ryan", "model": "ignored" }
+Response: WAV bytes. Drop-in replacement for OpenAI's /v1/audio/speech.
+
+### GET /v1/speakers — JSON list of preset speakers
+### GET /v1/health — returns 200 when ready (use for readiness probes)
+
+## Example
+
+curl -X POST http://localhost:8080/v1/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello from Qwen TTS.","speaker":"ryan"}' -o out.wav
+
+## Container environment variables
+
+MODEL       large | small | voice-design | base-small | base-large  (default: large = 1.7B)
+PORT        HTTP port (default 8080)
+WORKERS     concurrent synthesis workers (default 4)
+BATCH_SIZE  request batching, >=2 enables vLLM-style batching (default 1)
+QUANT       int8 | int4 | bf16 (default int8; int4 is 1.7B-only)
+MODELS_ROOT model storage dir (default /models — mount a persistent volume here)
+
+## Operational notes
+
+- First boot downloads model weights from HuggingFace into $MODELS_ROOT
+  (~1.4 GB small, ~3.4 GB large). Mount a volume at /models to avoid re-downloading.
+- RAM: ~3 GB (0.6B int8), ~4-6 GB (1.7B int8). CPU-bound; more vCPUs = lower latency.
+- Synthesis is slower than realtime on typical cloud vCPUs (RTF ~2 on 8 shared vCPU
+  for 0.6B). Use /v1/tts/stream for lower perceived latency.
+- Health endpoint returns 200 only after model weights are loaded.
+
+## Source layout (for code navigation)
+
+- qwen_tts_server.c — HTTP server + JSON parsing (all endpoints above)
+- qwen_tts.c / qwen_tts_talker.c / qwen_tts_code_predictor.c / qwen_tts_speech_decoder.c — inference pipeline
+- qwen_tts_kernels*.c — SIMD matmul kernels (NEON/AVX2/AVX-512, int8 SDOT/VNNI)
+- main.c — CLI entry; `--serve <port>` starts the server
+- Dockerfile / docker-entrypoint.sh — container build + first-boot model download
+- download_model.sh — HuggingFace weight fetcher (invoked by entrypoint)

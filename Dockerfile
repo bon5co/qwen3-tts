@@ -8,9 +8,9 @@
 #   docker run -p 8080:8080 -v qwen3-tts-models:/models qwen3-tts
 #
 # Env:
-#   MODEL      small | large | voice-design | base-small | base-large   (default: small)
+#   MODEL      small | large | voice-design | base-small | base-large   (default: large)
 #   PORT       HTTP port (default: 8080)
-#   WORKERS    concurrent synthesis workers (default: 1)
+#   WORKERS    concurrent synthesis workers (default: 4)
 #   BATCH_SIZE request batching, >=2 enables (default: 1)
 #   QUANT      int8 | int4 | bf16   (default: int8; int4 is 1.7B-only)
 
@@ -48,10 +48,10 @@ COPY presets /app/presets
 COPY download_model.sh docker-entrypoint.sh /app/
 RUN chmod +x /app/download_model.sh /app/docker-entrypoint.sh
 
-ENV MODEL=small \
+ENV MODEL=large \
     MODELS_ROOT=/models \
     PORT=8080 \
-    WORKERS=1 \
+    WORKERS=4 \
     BATCH_SIZE=1 \
     QUANT=int8
 
