@@ -10,6 +10,11 @@
  *   POST /v1/audio/speech — OpenAI-compatible TTS endpoint
  */
 
+/* strcasestr() is a GNU extension: without _GNU_SOURCE glibc hides its prototype,
+ * the implicit declaration truncates the returned pointer to int, and the first
+ * request with a Content-Length header segfaults on Linux (macOS is unaffected). */
+#define _GNU_SOURCE
+
 #include "qwen_tts_server.h"
 #include "qwen_tts.h"
 #include "qwen_tts_thread.h"   /* qwen_parallel_is_reentrant() */
