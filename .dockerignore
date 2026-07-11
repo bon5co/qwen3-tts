@@ -1,0 +1,12 @@
+.git
+blog
+docs
+samples
+tests
+training
+tools
+*.wav
+*.md
+!MANIFEST.md
+qwen3-tts-*/
+voices
