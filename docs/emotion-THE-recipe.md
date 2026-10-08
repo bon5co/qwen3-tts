@@ -15,8 +15,14 @@
 ## How a user invokes it
 **One flag.** `--emotion <sad|joy|anger|fear|disgust|surprise>` (1.7B CustomVoice only). The engine auto-applies
 the table below (expr + steer + a default English instruct + temperature). A vivid **English** `--instruct` and an
-explicit `-T` always override. Emotion is a **1.7B** feature: on the 0.6B model `--emotion` is a no-op
-(parked-neutral) — the legacy `.vec` control-vector path was retired 2026-07-09.
+explicit `-T` always override. `--emotion` is a **1.7B** flag: on the 0.6B it is a no-op (gated on
+`hidden_size >= 2048`) — the legacy `.vec` control-vector path was retired 2026-07-09.
+
+> 🔹 **The 0.6B is NOT emotion-less — it just works differently.** On the small model emotion is not an
+> inference-time lever but a **property of the voice**: you clone from emotional audio and get an emotional
+> voice (4 KB asset, works for presets and clones, composes with `[tag]` paralinguistics, RTF ≈ 0.78 under
+> `--int8`). That recipe lives in **[`emotion-06b-recipe.md`](emotion-06b-recipe.md)** — do not apply the
+> steer/expr/COMBINE recipe below to the 0.6B, it silently does nothing.
 
 ```bash
 ./qwen_tts -d qwen3-tts-1.7b -s ryan -l Italian --emotion sad --text "…" -o out.wav
@@ -52,7 +58,7 @@ Notes:
 
 ## Blended emotions (dyads) — the shelf composes (2026-07-08)
 Emotion steering **directions ADD**: a 50/50 sum of two primary `ryan_<emo>.qlsteer` vectors renders a coherent
-NEW emotion (ear-validated ryan EN+IT, `samples/tests/2026-07-08_emotion-dyads/`). Seven ship as first-class
+NEW emotion (ear-validated, ryan EN+IT). Seven ship as first-class
 `--emotion` values — no new capture, no FT:
 
 | dyad | blend | mix |
@@ -79,6 +85,14 @@ saves/restores the global steer per span). Also works in the HTTP server. The ol
   "[contempt] Oh, sure, that's a brilliant idea. [nostalgia] We used to spend every summer by the sea. [despair] And now there's nothing left." -o switch.wav
 ```
 
+**🔊 Hear the switch happen inside one prompt** (showcase clips, moved here from the README):
+
+| Prompt (inline `[tags]`) | Listen |
+|---|---|
+| `[contempt]` Oh, sure, that's a brilliant idea. `[nostalgia]` We used to spend every summer by the sea. `[despair]` And now there's nothing left. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_contempt-nostalgia-despair.wav) |
+| `[sad]` I really thought this would work out. `[disgust]` But the whole thing is rotten. `[contempt]` As if they ever cared. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_en_sad-disgust-contempt.wav) |
+| *(Italian)* `[outrage]` Hanno annullato tutto senza dirci niente. `[remorse]` Continuo a pensare a cosa ho detto. `[awe]` Poi ho alzato lo sguardo e sono rimasto senza parole. | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_dyads/switch_it_outrage-remorse-awe.wav) |
+
 ## Assets
 - expr packs (`presets/expr/`): `italian_csp_topk6`, `german_csp_k6`, `french_csp_k6` (shipped on HF, fetch with
   `bash download_assets.sh`). Native `{german,french,spanish}_r32` re-exportable from the GPU box checkpoints
@@ -101,10 +115,21 @@ Engine: `compose_from_text` + `text_has_para_event()` + `para_active` in `main.c
 the global emotion steer/expr on spoken spans; each `[tag]` span swaps in its para vector). `[laugh]`/`[sigh]` use
 the steering vector; `[huff]`/`[ugh]`/`[hmm]`/`[mmm]`/`[phew]`/… are soft onomatopoeia macros.
 
-> ⚠️ **STILL UNSTABLE (TODO, plan_emo_v3) — much better than before, but not solid across all langs/voices.**
+> ⚠️ **STILL UNSTABLE — much better than before, but not solid across all langs/voices.**
 > Clearest on `[laugh]`/`[sigh]` with `ryan`/`vivian`. Known rough edge: on a CLONE the laugh span (a separate
 > cold-prefill span) can sound slightly detached/off-timbre (the seam, not audio-splice). Provenance of the
-> per-voice weights + the "anchor + vector" rule: memory `project_paralinguistic_steering_vector` (ear 2026-06-25/28).
+> per-voice weights, plus the "anchor + vector" rule.
+
+**🔊 Emotion + paralinguistics showcase** (a `[tag]` inside an emotional sentence; moved here from the README):
+
+| Language | Voice | Emotion + tag | Text | Listen |
+|----------|-------|---------------|------|--------|
+| Italian | ryan (preset) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_joy_laugh.wav) |
+| Italian | ryan (preset) | 😢 sad + `[sigh]` | *Ho perso tutto quello che avevo, `[sigh]` e adesso non so più cosa fare.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_it_sad_sigh.wav) |
+| English | ryan (preset) | 😄 joy + `[laugh]` | *I can't believe it, `[laugh]` this is the best news of my whole life!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/ryan_en_joy_laugh.wav) |
+| French | vivian | 😢 sad + `[sigh]` | *J'ai tout perdu, `[sigh]` et maintenant je ne sais plus quoi faire.* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/fr_vivian_sad_sigh.wav) |
+| Spanish | vivian | 😄 joy + `[laugh]` | *No me lo puedo creer, `[laugh]` ¡es la mejor noticia de mi vida!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/es_vivian_joy_laugh.wav) |
+| Italian | galatea (cloned voice) | 😄 joy + `[laugh]` | *Non ci posso credere, `[laugh]` è la notizia più bella della mia vita!* | [▶ play](https://github.com/gabriele-mastrapasqua/qwen3-tts/raw/main/samples/emotion_examples/galatea_it_joy_laugh.wav) |
 
 ## Instruct control (strength & speed) — the `--instruct` lever
 `--instruct` (1.7B, COMBINE/clone path only — preset pure-STEER needs none) is a secondary flavour on top of the
