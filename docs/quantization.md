@@ -16,7 +16,7 @@ reducing memory usage and (for INT8) improving speed.
 > (AVX2) and an EPYC 9555P / Zen5 (AVX-512/VNNI), where the int8 kernel is a ~1.85× win at equal core
 > count. x86 single-stream RTF is memory/cache-bound (so it won't reach Apple's sub-1.0 without a
 > cache-rich chip), but `--int8`/`--int4` are the right levers there too. Toggle SDOT/VNNI off with
-> `QWEN_NO_SDOT=1` / `QWEN_NO_VNNI=1`. Measure your box: `bash tests/x86_bench.sh`.
+> `QWEN_NO_SDOT=1` / `QWEN_NO_VNNI=1`. Measure your box: `bash tests/x86_bench.sh`. See PLAN.md 21.3.
 
 ## INT8 (Recommended on Apple Silicon, both models)
 
@@ -30,46 +30,45 @@ reducing memory usage and (for INT8) improving speed.
 - Halves Talker RAM usage on 1.7B (2.8 GB → 1.4 GB)
 - Works with all features: server, streaming, custom voices (`.qvoice` re-quantized after override), instruct
 
-## INT4 (Q4_0 — the fastest lever on Apple Silicon)
+## INT4 (Experimental)
 
 ```bash
-./qwen_tts -d qwen3-tts-0.6b --text "Hello world" --int4 -o hello.wav
+./qwen_tts -d qwen3-tts-1.7b --text "Hello world" --int4 -o hello.wav
 ```
 
-- Q4_0 format: 32 weights per block, **fp16 per-block scale → 18 bytes/block** (llama.cpp layout;
-  was 20 B with an f32 scale — the fp16 scale cut int4 weight traffic another 10% with negligible
-  quality drift, teacher-forced ladder −0.8pp).
-- On ARM the kernel is **SDOT-native** (int8-quantized activations, no per-nibble unpack tax);
-  on AVX-512 x86 it's the VNNI v3 throughput kernel; batched ARM rides a **q4-SMMLA GEMM** (i8mm).
-- Smallest memory footprint (¼ of bf16) — also the pick when RAM is tight.
-- Quality: a touch more aggressive than int8 (per-block-32 scales are coarse for the CP's late
-  residuals) — int8 stays the quality reference; int4 is ear-validated fine on 0.6B.
-- **v0.16.0 — weighted-LSQ scales**: the load-time quantizer now picks each block scale by
-  closed-form weighted least-squares (signed-max→-8 + LSQ rescale, w=v²) instead of naive
-  absmax RTN. Same layout, same kernels, same bytes, same speed — measurably better weights:
-  Talker word accuracy (teacher-forced code0) **83.9% → 90.9%**, and the 1.7B int4 duration
-  stretch vs bf16 gold drops from **+71% to +22%** on the A/B sentence. Applies to every
-  `--int4`/`--quant-mixed` config on every ISA (Metal/CUDA included — single quantizer).
-  `QWEN_Q4_NAIVE=1` restores the old quantizer for A/B. Full study: `docs/quant-sub4.md`.
+- Q4_0 format (4-bit with per-block scale factors)
+- Smallest memory footprint (0.7 GB Talker RAM)
+- Slightly **slower** than BF16 due to nibble unpacking overhead
+- Audio quality may degrade on some inputs
 
-## Comparison (Apple M1 8-core, 16 GB, `-j4`, 2026-07 state)
+## Comparison
 
-| Config | 0.6B best RTF | 1.7B best RTF | Talker RAM (1.7B) |
-|--------|--------------|---------------|-------------------|
-| BF16 (default) | 1.3–1.8 | ~2.0 | 2.8 GB (mmap) |
-| **INT8** | **0.69** | 1.79 | 1.4 GB |
-| **INT4** | **0.51** ⚡ | 1.58 | 0.7 GB |
-| quant-mixed (int4 Talker + int8 CP) | — | **~1.53** | ~1.0 GB |
+**1.7B, Italian, seed=42, Apple M1 16 GB, 4 threads** (these rows predate SDOT — with SDOT the
+INT8 Talker is ~46 ms/f, see the validated figures in the box above):
 
-## Recommendation — per platform (all measured on real silicon, 2026-07-11)
+| Config | Talker ms/f | Total time | RTF | Talker RAM |
+|--------|-------------|------------|-----|------------|
+| BF16 (default) | ~80 ms/f | ~13s | ~4.3 | 2.8 GB (mmap) |
+| **INT8 (recommended)** | **~67 ms/f** | **~11s** | **~3.6** | **1.4 GB** |
+| INT4 (experimental) | ~83 ms/f | ~14s | ~4.5 | 0.7 GB |
 
-| Platform | Pick | Why (measured) |
-|---|---|---|
-| **Apple Silicon (M1+)** | `--int4` for speed, `--int8` for max quality | int4-SDOT is the fastest lever (0.6B: M1 **0.51**, **M4 0.32**); 1.7B best = `--quant-mixed` (M1 ~1.53, **M4 0.57**) |
-| **x86 AVX-512/VNNI** (Zen4+, Ice Lake+) | **`--int8`** — for 1.7B too | EPYC Turin: int8 0.96 vs int4 1.05; **1.7B pure int8 1.22 beats quant-mixed 1.30** (quant-mixed is an Apple-silicon config). Build with `make blas SIMD=avx512vnni` |
-| **x86 AVX2-only** (Zen3, small L3) | `--int4` multi-threaded | memory-starved: fewer weight bytes wins (Ryzen 6800H 3.9→2.02) |
-| **ARM server** (Graviton3+, i8mm) | `--int8` single-stream; int8/int4 batched | 0.6B int8 **0.66**, 1.7B int8 **0.95** (sub-RT); batched matmats ride SMMLA (int8 2.1×, int4 1.6×) |
-| **NVIDIA CUDA** | `--quant-mixed` (dp4a on by default) | A100: 0.50 (Talker −33% ms/f vs the f32-act kernel) — see [cuda-performance.md](cuda-performance.md) |
+## Recommendation
+
+On Apple Silicon, use `--int8` for **both** models — Talker −23% (1.7B) and CP −29% (both) with
+SDOT, and **0.6B goes sub-realtime (RTF < 1.0) in CLI/stream/server**. On x86 the int8 matvec now has
+AVX2 + AVX-512/VNNI (validated on Ryzen 6800H and EPYC 9555P/Zen5) — `--int8` is the right default
+there too; on a memory-starved CPU with a small L3, `--int4` can edge ahead multi-threaded
+(see [x86 optimization](x86-optimization.md)).
+
+INT4 is the lever on **memory-starved x86** (small L3 → fewer weight bytes wins, e.g. Ryzen 6800H
+3.9→2.02). On **cache-rich / bandwidth-rich chips (Apple M1)** INT4 is *slower* than INT8 (nibble
+unpacking dominates) — there INT8 is the quality/speed floor. Per-block-32 int4 scales are also a
+touch coarse for the CP's fine residuals (slight timbre shift), so INT8 stays the quality reference.
+For maximum speed, use the 0.6B model (RTF ~1.3–1.7 vs 3.6 for 1.7B INT8).
+
+On systems with 16+ GB free RAM, expected performance is better than shown above
+(our test machine had high system memory pressure from other applications).
+Projected RTF with free RAM: **0.6B ~1.3, 1.7B BF16 ~3.0, 1.7B INT8 ~2.5**.
 
 ## Testing
 

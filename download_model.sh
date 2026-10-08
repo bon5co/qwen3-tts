@@ -1,4 +1,17 @@
 #!/bin/bash
+# Download Qwen3-TTS model files from HuggingFace.
+#
+# Usage:
+#   ./download_model.sh
+#   ./download_model.sh --model small
+#   ./download_model.sh --model large --dir my-model-dir
+#   ./download_model.sh --model voice-design
+#   ./download_model.sh --model base-small
+#   ./download_model.sh --model base-large
+#
+# Options:
+#   --model small|large|voice-design|base-small|base-large
+#   --dir DIR             Override output directory
 
 set -e
 
@@ -184,34 +197,29 @@ mkdir -p "${MODEL_DIR}/speech_tokenizer"
 
 BASE_URL="https://huggingface.co/${MODEL_ID}/resolve/main"
 
-fetch() {
-    local dest="$1" url="$2" label="$3"
-    if [[ -f "${dest}" ]]; then
-        echo "  [skip] ${label} (already exists)"
-        return 0
-    fi
-    local resume=()
-    [[ -f "${dest}.part" ]] && { resume=(-C -); echo "  [resume] ${label} (ripresa di un .part parziale)"; }
-    echo "  [download] ${label}..."
-    if curl -fL "${resume[@]}" -o "${dest}.part" "${url}" --progress-bar; then
-        mv -f "${dest}.part" "${dest}"
-        echo "  [done] ${label}"
-    else
-        echo "  🚨 download FALLITO: ${label} — il parziale resta in ${dest}.part (rilancia per riprenderlo)"
-        return 1
-    fi
-}
-
 echo "=== Main model files ==="
 for file in "${FILES[@]}"; do
-    fetch "${MODEL_DIR}/${file}" "${BASE_URL}/${file}" "${file}"
+    dest="${MODEL_DIR}/${file}"
+    if [[ -f "${dest}" ]]; then
+        echo "  [skip] ${file} (already exists)"
+    else
+        echo "  [download] ${file}..."
+        curl -fL -o "${dest}" "${BASE_URL}/${file}" --progress-bar
+        echo "  [done] ${file}"
+    fi
 done
 
 echo ""
 echo "=== Speech tokenizer files ==="
 for file in "${SPEECH_TOKENIZER_FILES[@]}"; do
-    fetch "${MODEL_DIR}/speech_tokenizer/${file}" \
-          "${BASE_URL}/speech_tokenizer/${file}" "speech_tokenizer/${file}"
+    dest="${MODEL_DIR}/speech_tokenizer/${file}"
+    if [[ -f "${dest}" ]]; then
+        echo "  [skip] speech_tokenizer/${file} (already exists)"
+    else
+        echo "  [download] speech_tokenizer/${file}..."
+        curl -fL -o "${dest}" "${BASE_URL}/speech_tokenizer/${file}" --progress-bar
+        echo "  [done] speech_tokenizer/${file}"
+    fi
 done
 
 echo ""

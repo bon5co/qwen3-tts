@@ -46,32 +46,6 @@ kernel efficiency and clocks):
 
 The 0.6B model is proportionally faster (smaller Talker).
 
-> ⚠️ **The scaling has a floor — measured on an A100 (2026-07-11).** A cloud **A100-SXM4-40GB**
-> (HBM2, ~1.5 TB/s — 5–6× the reference card) measured **0.50–0.55**, not the ~0.1 the table
-> would extrapolate: past the point where weights stream fast enough, single-stream decode
-> becomes **kernel-launch-latency-bound** (hundreds of small dependent launches per frame,
-> costlier on virtualized cloud GPUs). Big-bandwidth cards pay off in **batch throughput**,
-> not single-stream latency — same lesson as Apple-silicon Metal.
-
-## Measured: datacenter A100 (Verda cloud, A100-SXM4-40GB, 2026-07-11)
-
-Full recipe (`QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_CONVDEC=1`), seed-pinned, greedy:
-
-| Config | RTF |
-|--------|-----|
-| 0.6B bf16 / int4 | **0.39** |
-| 1.7B `--quant-mixed` | 0.55 |
-| 1.7B `--quant-mixed` + `QWEN_CUDA_DP4A=1` | **0.50** |
-
-- **dp4a (int4 weights × int8-quantized activations, integer `__dp4a` dots)** is a measured win on
-  real NVIDIA: **1.7B Talker 8.4 → 5.6 ms/f (−33%)**, 0.6B Talker −19% / CP −16%, ear-validated —
-  **now the DEFAULT for int4/quant-mixed** (`QWEN_CUDA_DP4A=0` reverts to the f32-act kernel).
-- Without `QWEN_CUDA_CONVDEC=1` the speech decoder runs on the host CPU — on a weak cloud host
-  that alone was the difference between RTF 0.94 and 0.39. **Always set both env vars.**
-- **Batch throughput (B=8, 1.7B quant-mixed):** 8 concurrent requests = 30 s wall for 63.5 s of
-  audio → **aggregate RTF 0.47, ~2.1× throughput**; per-request RTF in batch mode 1.27 (the known
-  latency/throughput trade).
-
 ## Throughput — server batching (`--serve --batch-size N`)
 
 With concurrent requests, the per-request matvecs become a **matmat** (each weight row read once
@@ -91,31 +65,12 @@ Streaming (`/v1/tts/stream`) batches too: concurrent streams share the batched f
 each gets its own incremental PCM chunks. WAV requests use the same incremental decoder internally
 (bit-identical to the seam-free full decode, mel-corr 1.0) so they reach the same throughput.
 
-## Serving: the CUDA streaming server has its own page
-
-Running `--backend cuda --serve` — its maturity, the two settings that silently disable most of
-it, the measured concurrency ladders on an A6000 and an RTX PRO 6000 Blackwell, the optimal
-batch width and how to verify a build — is
-[`docs/serving/gpu-cuda.md`](serving/gpu-cuda.md).
-
-It is kept separate from this page, and separate from the CPU serving documents, on purpose:
-the CPU server is qualified and the GPU one is not, and mixing them is how an unqualified number
-gets quoted as a supported one.
-
 ## How to run
 
 Build (pick your arch, or use the default multi-arch):
 
 ```bash
 make cuda                    # multi-arch (sm_80/86/89/120 + PTX)
-```
-
-The CUDA toolkit prefix is auto-detected: `nvcc` on `PATH` (covers conda / environment-modules /
-custom prefixes) → `/usr/local/cuda` (NVIDIA `.run`/`.deb` installers) → `/opt/cuda` (Arch Linux's
-`cuda` package). If yours lives elsewhere, pass it explicitly:
-
-```bash
-make cuda CUDA_HOME=/path/to/cuda
 ```
 
 Single stream (lowest latency):
@@ -138,31 +93,8 @@ Flags / env:
 - `--backend cuda` — select the CUDA backend.
 - `--int8` — int8 weights (Talker + CP). `--quant-mixed` — int4 Talker + int8 CP (fastest, same quality).
 - `QWEN_CUDA_FUSED_TALKER=1` — GPU-resident fused Talker + Code Predictor.
-- `QWEN_CUDA_DECODER=1` — speech-decoder pointwise convolutions through cuBLAS on the device.
-- `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder (the whole conv stack, not just the
-  pointwise convs above; the two are independent and the measurements in this document have both on).
-- `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 16; 8 is the
-  measured optimum).
-- `QWEN_CUDA_BATCH_COMPACT=1` — pack the stepping lanes together so idle slots cost nothing.
-  Default off; verified exact against independent per-lane references.
-- `QWEN_CUDA_BATCH_GRAPH=0` — replay the batched bodies with plain launches instead of CUDA
-  graphs. Default on, bit-identical.
-- `QWEN_CUDA_CP_HEAD=0` — put the code-predictor head (norm + lm_head + argmax) back on the CPU.
-  Default on; the GPU path produces identical codes.
-- `QWEN_CP_PROFILE=1` — break the batched code-predictor frame into seed / step / head and report
-  every 500 frames.
-- `QWEN_CUDA_MM_UNROLL`, `QWEN_CUDA_MM_TPB` — weight loads in flight (default 4) and block size
-  (default 64) for the batched matmats. Both swept on an A6000; exposed to re-sweep elsewhere.
-- `QWEN_CUDA_CUBLAS=1`, `QWEN_CUDA_TC=1` — route the wide batched matmats through cuBLAS, or
-  through the portable wmma tensor-core GEMM. **Both default off and both change what the model
-  generates**: tensor cores require bf16 activations, and at a fixed seed that moved the end of
-  speech and produced a 25% shorter utterance. The code predictor is excluded from both by
-  construction, since it picks the codes through an argmax.
-- `QWEN_CUDA_TF32`, `QWEN_CUDA_VERBOSE` — TF32 in the seam's GEMMs; batched-state diagnostics.
-- dp4a int4 matvec (integer `__dp4a`, activation quantized to int8 per 32-block, even/odd-
-  deinterleaved to match q4_0 packing): **ON by default** since the A100 validation (−33% Talker
-  ms/f on 1.7B, ear-validated). `QWEN_CUDA_DP4A=0` reverts to the f32-activation kernel
-  (trajectory forks between the two — act-quant numerics, benign).
+- `QWEN_CUDA_CONVDEC=1` — GPU-resident ConvNet speech decoder.
+- `QWEN_CUDA_BATCH=1` — GPU-batched fused steps for the server (`--batch-size N`, N ≤ 8).
 
 ## Notes
 
