@@ -1,8 +1,16 @@
-/* qwen_tts_voice_clone.c - Voice cloning support for Qwen3-TTS Base models */
+/*
+ * qwen_tts_voice_clone.c - Voice cloning support for Qwen3-TTS Base models
+ *
+ * Implements:
+ * - WAV file reader
+ * - Mel spectrogram (STFT + mel filterbank + log compression)
+ * - ECAPA-TDNN speaker encoder
+ */
+
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include "qwen_tts_voice_clone.h"
-#include "ingot/safetensors.h"
+#include "qwen_tts_safetensors.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +21,12 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+/* ════════════════════════════════════════════════════════════════════════
+ * WAV Reader
+ * ════════════════════════════════════════════════════════════════════════ */
+
 int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int *out_sample_rate) {
+    /* Quick extension check — catch obvious mistakes before reading */
     const char *ext = strrchr(path, '.');
     if (ext) {
         if (strcasecmp(ext, ".mp4") == 0 || strcasecmp(ext, ".m4a") == 0 ||
@@ -36,6 +49,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
         return -1;
     }
 
+    /* Read and validate file header */
     unsigned char header[12];
     size_t hdr_read = fread(header, 1, 12, f);
     if (hdr_read < 4) {
@@ -43,6 +57,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
         fclose(f); return -1;
     }
 
+    /* Check for common non-WAV formats and give helpful error messages */
     if (hdr_read >= 4 && (memcmp(header, "\x00\x00\x00", 3) == 0 ||
                           memcmp(header + 4, "ftyp", 4) == 0)) {
         fprintf(stderr, "Error: %s is an MP4/M4A file, not a WAV file\n", path);
@@ -70,6 +85,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
         fclose(f); return -1;
     }
 
+    /* Check for RIFF/WAVE header */
     if (memcmp(header, "RIFF", 4) != 0) {
         fprintf(stderr, "Error: %s is not a WAV file (unrecognized format)\n", path);
         fprintf(stderr, "Only 24 kHz WAV (PCM, 16/32-bit) is supported.\n");
@@ -77,12 +93,14 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
         fclose(f); return -1;
     }
 
+    /* header[4..7] = file_size, header[8..11] = "WAVE" (already read) */
     if (hdr_read < 12 || memcmp(header + 8, "WAVE", 4) != 0) {
         fprintf(stderr, "Error: %s has RIFF header but is not a WAV file (no WAVE marker)\n", path);
         fprintf(stderr, "Convert with: ffmpeg -i \"%s\" -ar 24000 -ac 1 output.wav\n", path);
         fclose(f); return -1;
     }
 
+    /* Parse chunks */
     int sample_rate = 0, bits_per_sample = 0, num_channels = 0;
     int16_t audio_format = 0;
     uint8_t *raw_data = NULL;
@@ -109,6 +127,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
             int16_t bps;
             fread(&bps, 2, 1, f);
             bits_per_sample = bps;
+            /* Skip extra fmt bytes */
             if (chunk_size > 16) {
                 fseek(f, chunk_size - 16, SEEK_CUR);
             }
@@ -118,8 +137,9 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
             if (fread(raw_data, 1, data_size, f) != data_size) {
                 fprintf(stderr, "Warning: incomplete data chunk in %s\n", path);
             }
-            break;
+            break;  /* got data, done */
         } else {
+            /* Skip unknown chunks */
             fseek(f, chunk_size, SEEK_CUR);
         }
     }
@@ -143,6 +163,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
         return -1;
     }
 
+    /* Convert to float32 mono */
     int bytes_per_sample = bits_per_sample / 8;
     int total_samples = (int)(data_size / (bytes_per_sample * num_channels));
     float *samples = (float *)aligned_malloc(total_samples * sizeof(float));
@@ -160,6 +181,7 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
                 val = s / 2147483648.0f;
             }
         } else {
+            /* Stereo → mono: average channels */
             float sum = 0;
             for (int c = 0; c < num_channels; c++) {
                 int offset = (i * num_channels + c) * bytes_per_sample;
@@ -185,31 +207,38 @@ int qwen_read_wav(const char *path, float **out_samples, int *out_n_samples, int
     return 0;
 }
 
+/* Trim a contiguous trailing near-silence / fade-out run in place. A reference
+ * clip that fades to silence at the end (e.g. a YouTube outro, or a clip cut
+ * mid-fade) makes the voice clone learn an end-of-utterance decrescendo that then
+ * reappears on every generation (observed on the Silvio .qvoice). We scan 20 ms
+ * windows from the end and cut everything below a relative-energy threshold,
+ * keeping a small margin. Conservative bounds: never trim >40% or below ~2 s. */
 void qwen_trim_trailing_silence(float *audio, int *n_samples, int sample_rate, int silent) {
     if (getenv("QWEN_NO_REF_TRIM")) return;
     int n = *n_samples;
-    if (!audio || n < sample_rate * 3) return;
+    if (!audio || n < sample_rate * 3) return;  /* too short to bother */
 
+    /* Global RMS → adaptive threshold (handles quietly-recorded refs). */
     double sum = 0.0;
     for (int i = 0; i < n; i++) sum += (double)audio[i] * audio[i];
     float global_rms = (float)sqrt(sum / n);
     if (global_rms <= 0.0f) return;
-    float thresh = 0.18f * global_rms;
-    if (thresh < 0.004f) thresh = 0.004f;
+    float thresh = 0.18f * global_rms;          /* "tail" = below 18% of average energy */
+    if (thresh < 0.004f) thresh = 0.004f;        /* absolute floor (~ -48 dBFS) */
 
-    int win = sample_rate / 50;
+    int win = sample_rate / 50;                  /* 20 ms */
     int last_voiced_end = -1;
     for (int i = n; i - win >= 0; i -= win) {
         double s = 0.0;
         for (int k = i - win; k < i; k++) s += (double)audio[k] * audio[k];
         if ((float)sqrt(s / win) >= thresh) { last_voiced_end = i; break; }
     }
-    if (last_voiced_end < 0) return;
+    if (last_voiced_end < 0) return;             /* whole clip is quiet — leave it */
 
-    int new_n = last_voiced_end + sample_rate / 20;
+    int new_n = last_voiced_end + sample_rate / 20;  /* +50 ms margin */
     if (new_n > n) new_n = n;
     int max_trim = (int)(n * 0.40f);
-    if (new_n < n - max_trim) new_n = n - max_trim;
+    if (new_n < n - max_trim) new_n = n - max_trim;  /* never cut more than 40% */
     int min_keep = sample_rate * 2;
     if (new_n < min_keep) new_n = (n < min_keep) ? n : min_keep;
 
@@ -221,7 +250,13 @@ void qwen_trim_trailing_silence(float *audio, int *n_samples, int sample_rate, i
     }
 }
 
+
+/* ════════════════════════════════════════════════════════════════════════
+ * FFT (radix-2 Cooley-Tukey)
+ * ════════════════════════════════════════════════════════════════════════ */
+
 static void fft_radix2(float *re, float *im, int n) {
+    /* Bit-reversal permutation */
     int log2n = 0;
     for (int tmp = n; tmp > 1; tmp >>= 1) log2n++;
 
@@ -235,6 +270,7 @@ static void fft_radix2(float *re, float *im, int n) {
         }
     }
 
+    /* Butterfly stages */
     for (int s = 1; s <= log2n; s++) {
         int m = 1 << s;
         int half = m >> 1;
@@ -260,10 +296,17 @@ static void fft_radix2(float *re, float *im, int n) {
     }
 }
 
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Mel Spectrogram
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Convert frequency to mel scale (HTK formula) */
 static float hz_to_mel_slaney(float hz) {
-    float f_sp = 200.0f / 3.0f;
+    /* Slaney's Auditory Toolbox formula (linear below 1000 Hz, log above) */
+    float f_sp = 200.0f / 3.0f;  /* 66.667 Hz */
     if (hz < 1000.0f) return hz / f_sp;
-    float min_log_mel = 1000.0f / f_sp;
+    float min_log_mel = 1000.0f / f_sp;  /* 15.0 */
     float logstep = logf(6.4f) / 27.0f;
     return min_log_mel + logf(hz / 1000.0f) / logstep;
 }
@@ -276,10 +319,12 @@ static float mel_to_hz_slaney(float mel) {
     return 1000.0f * expf((mel - min_log_mel) * logstep);
 }
 
+/* Build mel filterbank: [n_mels, n_fft/2+1] */
 static float *build_mel_filterbank(int sr, int n_fft, int n_mels, float fmin, float fmax) {
     int n_freqs = n_fft / 2 + 1;
     float *fb = (float *)calloc((size_t)n_mels * n_freqs, sizeof(float));
 
+    /* Mel scale points */
     float mel_min = hz_to_mel_slaney(fmin);
     float mel_max = hz_to_mel_slaney(fmax);
     float *mels = (float *)aligned_malloc((n_mels + 2) * sizeof(float));
@@ -290,6 +335,7 @@ static float *build_mel_filterbank(int sr, int n_fft, int n_mels, float fmin, fl
 
     float freq_step = (float)sr / n_fft;
 
+    /* Slaney normalization: each filter has area = 1 */
     for (int i = 0; i < n_mels; i++) {
         float f_low = mels[i];
         float f_center = mels[i + 1];
@@ -319,14 +365,16 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
     const int win_size = 1024;
     const float fmin = 0.0f;
     const float fmax = 12000.0f;
-    (void)sample_rate;
+    (void)sample_rate;  /* assumed 24000 */
 
+    /* Reflect-pad the audio: padding = (n_fft - hop_size) / 2 = 384 */
     int padding = (n_fft - hop_size) / 2;
     int padded_len = n_samples + 2 * padding;
     float *padded = (float *)aligned_malloc(padded_len * sizeof(float));
 
+    /* Reflect padding (not including boundary sample) */
     for (int i = 0; i < padding; i++)
-        padded[i] = audio[padding - i];
+        padded[i] = audio[padding - i];  /* reflect: audio[pad], audio[pad-1], ..., audio[1] */
     memcpy(padded + padding, audio, n_samples * sizeof(float));
     for (int i = 0; i < padding; i++) {
         int src = n_samples - 2 - i;
@@ -334,6 +382,7 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
         padded[padding + n_samples + i] = audio[src];
     }
 
+    /* Number of frames */
     int n_frames = (padded_len - n_fft) / hop_size + 1;
     if (n_frames <= 0) {
         free(padded);
@@ -341,37 +390,46 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
         return -1;
     }
 
+    /* Hann window */
     float *window = (float *)aligned_malloc(win_size * sizeof(float));
     for (int i = 0; i < win_size; i++)
         window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win_size));
 
+    /* Mel filterbank */
     float *mel_fb = build_mel_filterbank(24000, n_fft, n_mels, fmin, fmax);
     int n_freqs = n_fft / 2 + 1;
 
+    /* Output mel spectrogram [n_frames, n_mels] */
     float *mel = (float *)aligned_malloc((size_t)n_frames * n_mels * sizeof(float));
 
+    /* FFT buffers */
     float *fft_re = (float *)aligned_malloc(n_fft * sizeof(float));
     float *fft_im = (float *)aligned_malloc(n_fft * sizeof(float));
 
     for (int f = 0; f < n_frames; f++) {
         int start = f * hop_size;
 
+        /* Window the frame */
         for (int i = 0; i < n_fft; i++) {
             fft_re[i] = padded[start + i] * window[i];
             fft_im[i] = 0.0f;
         }
 
+        /* FFT */
         fft_radix2(fft_re, fft_im, n_fft);
 
-        float spec[513];
+        /* Magnitude spectrum (only positive frequencies) */
+        float spec[513];  /* n_fft/2+1 = 513 */
         for (int i = 0; i < n_freqs; i++) {
             spec[i] = sqrtf(fft_re[i] * fft_re[i] + fft_im[i] * fft_im[i] + 1e-9f);
         }
 
+        /* Apply mel filterbank + log compression */
         for (int m = 0; m < n_mels; m++) {
             float val = 0.0f;
             for (int i = 0; i < n_freqs; i++)
                 val += mel_fb[m * n_freqs + i] * spec[i];
+            /* Dynamic range compression: log(clamp(x, 1e-5)) */
             if (val < 1e-5f) val = 1e-5f;
             mel[f * n_mels + m] = logf(val);
         }
@@ -388,6 +446,17 @@ int qwen_mel_spectrogram(const float *audio, int n_samples, int sample_rate,
     return 0;
 }
 
+
+/* ════════════════════════════════════════════════════════════════════════
+ * ECAPA-TDNN Speaker Encoder
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/* Helper: 1D convolution with "same" padding (reflect mode)
+ * Input:  [in_ch, in_len]  (channel-first)
+ * Weight: [out_ch, in_ch, kernel]
+ * Bias:   [out_ch]
+ * Output: [out_ch, in_len]
+ * Uses dilation, reflect padding to achieve "same" output size. */
 static void conv1d_same_reflect(
     const float *input, int in_ch, int in_len,
     const float *weight, const float *bias,
@@ -399,6 +468,7 @@ static void conv1d_same_reflect(
     int pad_left = pad;
     int pad_right = effective_k - 1 - pad_left;
 
+    /* Build padded input with reflect padding */
     int padded_len = in_len + pad_left + pad_right;
     float *padded = (float *)aligned_malloc((size_t)in_ch * padded_len * sizeof(float));
 
@@ -406,12 +476,15 @@ static void conv1d_same_reflect(
         float *dst = padded + (size_t)c * padded_len;
         const float *src = input + (size_t)c * in_len;
 
+        /* Left reflect pad */
         for (int i = 0; i < pad_left; i++) {
             int idx = pad_left - i;
             if (idx >= in_len) idx = in_len - 1;
             dst[i] = src[idx];
         }
+        /* Center */
         memcpy(dst + pad_left, src, in_len * sizeof(float));
+        /* Right reflect pad */
         for (int i = 0; i < pad_right; i++) {
             int idx = in_len - 2 - i;
             if (idx < 0) idx = 0;
@@ -419,6 +492,7 @@ static void conv1d_same_reflect(
         }
     }
 
+    /* Convolution */
     for (int oc = 0; oc < out_ch; oc++) {
         for (int t = 0; t < in_len; t++) {
             float val = bias ? bias[oc] : 0.0f;
@@ -436,13 +510,16 @@ static void conv1d_same_reflect(
     free(padded);
 }
 
+/* ReLU in-place */
 static void relu_inplace(float *x, int n) {
     for (int i = 0; i < n; i++)
         if (x[i] < 0.0f) x[i] = 0.0f;
 }
 
+/* Sigmoid in-place (used by SE blocks inline, kept for future use) */
 static inline float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+/* TimeDelayNetBlock: Conv1d + ReLU */
 static void tdnn_forward(
     const float *input, int in_ch, int in_len,
     const float *conv_w, const float *conv_b,
@@ -454,13 +531,14 @@ static void tdnn_forward(
     relu_inplace(output, out_ch * in_len);
 }
 
+/* Res2NetBlock forward */
 static void res2net_forward(
     const float *input, int channels, int in_len, int scale,
     float *res2net_w[7], float *res2net_b[7],
     int kernel, int dilation,
     float *output)
 {
-    int chunk_ch = channels / scale;
+    int chunk_ch = channels / scale;  /* 512/8 = 64 */
     float *prev_output = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
     float *block_input = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
     float *block_output = (float *)aligned_malloc((size_t)chunk_ch * in_len * sizeof(float));
@@ -469,6 +547,7 @@ static void res2net_forward(
         const float *chunk = input + (size_t)i * chunk_ch * in_len;
 
         if (i == 0) {
+            /* Passthrough */
             memcpy(output + (size_t)i * chunk_ch * in_len, chunk,
                    (size_t)chunk_ch * in_len * sizeof(float));
             memcpy(prev_output, chunk, (size_t)chunk_ch * in_len * sizeof(float));
@@ -480,6 +559,7 @@ static void res2net_forward(
                    (size_t)chunk_ch * in_len * sizeof(float));
             memcpy(prev_output, block_output, (size_t)chunk_ch * in_len * sizeof(float));
         } else {
+            /* Add previous output to current chunk */
             for (int j = 0; j < chunk_ch * in_len; j++)
                 block_input[j] = chunk[j] + prev_output[j];
             tdnn_forward(block_input, chunk_ch, in_len,
@@ -496,6 +576,7 @@ static void res2net_forward(
     free(block_output);
 }
 
+/* SE-Res2Net block forward */
 static void se_res2net_block_forward(
     const float *input, int channels, int in_len,
     float *tdnn1_w, float *tdnn1_b,
@@ -508,18 +589,23 @@ static void se_res2net_block_forward(
 {
     int n = channels * in_len;
 
+    /* TDNN1 */
     float *h1 = (float *)aligned_malloc(n * sizeof(float));
     tdnn_forward(input, channels, in_len, tdnn1_w, tdnn1_b, channels, 1, 1, h1);
 
+    /* Res2Net */
     float *h2 = (float *)aligned_malloc(n * sizeof(float));
     res2net_forward(h1, channels, in_len, scale, res2net_w, res2net_b, kernel, dilation, h2);
     free(h1);
 
+    /* TDNN2 */
     float *h3 = (float *)aligned_malloc(n * sizeof(float));
     tdnn_forward(h2, channels, in_len, tdnn2_w, tdnn2_b, channels, 1, 1, h3);
     free(h2);
 
-    int se_ch = 128;
+    /* Squeeze-Excitation */
+    /* Mean across time */
+    int se_ch = 128;  /* hardcoded from config */
     float *mean = (float *)calloc(channels, sizeof(float));
     for (int c = 0; c < channels; c++) {
         float sum = 0;
@@ -528,14 +614,17 @@ static void se_res2net_block_forward(
         mean[c] = sum / in_len;
     }
 
+    /* SE conv1 (channels→se_ch) + ReLU.
+     * kernel=1 Conv1d on the length-1 mean = matmul [se_ch, channels] x [channels] → [se_ch]. */
     float *se1 = (float *)aligned_malloc(se_ch * sizeof(float));
     for (int i = 0; i < se_ch; i++) {
         float val = se_conv1_b[i];
         for (int c = 0; c < channels; c++)
             val += se_conv1_w[i * channels + c] * mean[c];
-        se1[i] = val > 0 ? val : 0;
+        se1[i] = val > 0 ? val : 0;  /* ReLU */
     }
 
+    /* SE conv2 (se_ch→channels) + Sigmoid */
     float *se2 = (float *)aligned_malloc(channels * sizeof(float));
     for (int i = 0; i < channels; i++) {
         float val = se_conv2_b[i];
@@ -547,6 +636,7 @@ static void se_res2net_block_forward(
     free(mean);
     free(se1);
 
+    /* Apply SE: h3 * se2 (broadcast over time) + residual */
     for (int c = 0; c < channels; c++) {
         float scale_val = se2[c];
         for (int t = 0; t < in_len; t++) {
@@ -559,32 +649,33 @@ static void se_res2net_block_forward(
     free(h3);
 }
 
-static float *load_f32_tensor(ingot_st *ms, const char *name) {
-    const ingot_st_tensor *t = ingot_st_find(ms, name);
-    if (!t) return NULL;
-    float *out = malloc((size_t)t->nelem * sizeof(float));
-    if (!out || ingot_st_to_f32(ms, t, out) != 0) {
-        free(out);
-        return NULL;
-    }
-    return out;
+
+/* Helper: load f32 tensor from safetensors by name */
+static float *load_f32_tensor(multi_safetensors_t *ms, const char *name) {
+    safetensors_file_t *sf = NULL;
+    const safetensor_t *t = multi_safetensors_find(ms, name, &sf);
+    if (!t || !sf) return NULL;
+    return safetensors_get_f32(sf, t);
 }
 
 int qwen_speaker_encoder_load(qwen_speaker_encoder_t *enc, void *safetensors) {
-    ingot_st *st = (ingot_st *)safetensors;
-    int saved_enc_dim = enc->enc_dim;
+    multi_safetensors_t *st = (multi_safetensors_t *)safetensors;
+    int saved_enc_dim = enc->enc_dim;  /* may be pre-set from config */
     memset(enc, 0, sizeof(*enc));
     enc->enc_dim = saved_enc_dim > 0 ? saved_enc_dim : 1024;
     enc->mel_dim = 128;
 
+    /* Helper macro */
     #define LOAD_F32(name, ptr) do { \
         (ptr) = load_f32_tensor(st, (name)); \
         if (!(ptr)) { fprintf(stderr, "Error: missing speaker_encoder weight: %s\n", (name)); return -1; } \
     } while(0)
 
+    /* blocks.0 (initial TDNN) */
     LOAD_F32("speaker_encoder.blocks.0.conv.weight", enc->block0_conv_w);
     LOAD_F32("speaker_encoder.blocks.0.conv.bias", enc->block0_conv_b);
 
+    /* blocks.1-3 (SE-Res2Net) */
     int dilations[] = {2, 3, 4};
     for (int b = 0; b < 3; b++) {
         enc->se_blocks[b].dilation = dilations[b];
@@ -617,14 +708,17 @@ int qwen_speaker_encoder_load(qwen_speaker_encoder_t *enc, void *safetensors) {
         LOAD_F32(name, enc->se_blocks[b].se_conv2_b);
     }
 
+    /* MFA */
     LOAD_F32("speaker_encoder.mfa.conv.weight", enc->mfa_conv_w);
     LOAD_F32("speaker_encoder.mfa.conv.bias", enc->mfa_conv_b);
 
+    /* ASP */
     LOAD_F32("speaker_encoder.asp.tdnn.conv.weight", enc->asp_tdnn_conv_w);
     LOAD_F32("speaker_encoder.asp.tdnn.conv.bias", enc->asp_tdnn_conv_b);
     LOAD_F32("speaker_encoder.asp.conv.weight", enc->asp_conv_w);
     LOAD_F32("speaker_encoder.asp.conv.bias", enc->asp_conv_b);
 
+    /* FC */
     LOAD_F32("speaker_encoder.fc.weight", enc->fc_w);
     LOAD_F32("speaker_encoder.fc.bias", enc->fc_b);
 
@@ -633,22 +727,28 @@ int qwen_speaker_encoder_load(qwen_speaker_encoder_t *enc, void *safetensors) {
     return 0;
 }
 
+
 int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
                                  const float *mel, int n_frames,
                                  float *out_embedding) {
     int T = n_frames;
 
+    /* Input: mel is [n_frames, 128] row-major
+     * Python does hidden_states = hidden_states.transpose(1, 2) to get [batch, 128, T]
+     * We need channel-first: [128, T] */
     float *x = (float *)aligned_malloc((size_t)enc->mel_dim * T * sizeof(float));
     for (int f = 0; f < T; f++)
         for (int m = 0; m < enc->mel_dim; m++)
             x[(size_t)m * T + f] = mel[(size_t)f * enc->mel_dim + m];
 
+    /* blocks.0: TDNN(128→512, k=5, d=1) */
     int ch0 = 512;
     float *h0 = (float *)aligned_malloc((size_t)ch0 * T * sizeof(float));
     tdnn_forward(x, enc->mel_dim, T, enc->block0_conv_w, enc->block0_conv_b,
                  ch0, 5, 1, h0);
     free(x);
 
+    /* blocks.1-3: SE-Res2Net */
     float *block_outputs[3];
     float *prev = h0;
     for (int b = 0; b < 3; b++) {
@@ -667,6 +767,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     }
     free(h0);
 
+    /* MFA: concatenate block_outputs[0,1,2] → [1536, T], then TDNN(1536→1536, k=1) */
     int mfa_ch = 1536;
     float *cat = (float *)aligned_malloc((size_t)mfa_ch * T * sizeof(float));
     for (int b = 0; b < 3; b++) {
@@ -680,6 +781,14 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
                  mfa_ch, 1, 1, mfa_out);
     free(cat);
 
+    /* ASP (Attentive Statistics Pooling)
+     * Input: [1536, T]
+     * 1. Compute mean and std across time
+     * 2. Concatenate [hidden, mean_expanded, std_expanded] → [4608, T]
+     * 3. TDNN(4608→128, k=1) → tanh → Conv1d(128→1536, k=1) → softmax over time
+     * 4. Weighted mean and std → concatenate → [3072, 1] */
+
+    /* Compute mean and std */
     float *asp_mean = (float *)calloc(mfa_ch, sizeof(float));
     float *asp_std = (float *)calloc(mfa_ch, sizeof(float));
     for (int c = 0; c < mfa_ch; c++) {
@@ -697,7 +806,8 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
         asp_std[c] = sqrtf(sum_sq / T + 1e-12f);
     }
 
-    int att_ch = mfa_ch * 3;
+    /* Build attention input: [hidden, mean_expanded, std_expanded] → [4608, T] */
+    int att_ch = mfa_ch * 3;  /* 4608 */
     float *att_input = (float *)aligned_malloc((size_t)att_ch * T * sizeof(float));
     memcpy(att_input, mfa_out, (size_t)mfa_ch * T * sizeof(float));
     for (int c = 0; c < mfa_ch; c++)
@@ -707,19 +817,29 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
         for (int t = 0; t < T; t++)
             att_input[(size_t)(2 * mfa_ch + c) * T + t] = asp_std[c];
 
+    /* TDNN(4608→128, k=1) + tanh */
     int att_hidden = 128;
     float *att_h = (float *)aligned_malloc((size_t)att_hidden * T * sizeof(float));
     tdnn_forward(att_input, att_ch, T, enc->asp_tdnn_conv_w, enc->asp_tdnn_conv_b,
                  att_hidden, 1, 1, att_h);
     free(att_input);
+    /* Replace ReLU with tanh (tdnn_forward applied ReLU, but ASP uses tanh) */
+    /* Actually, tdnn_forward does ReLU. But for ASP, the TDNN output goes through tanh.
+     * The Python code: attention = self.conv(self.tanh(self.tdnn(attention)))
+     * The tdnn itself has ReLU activation. Then the outer code applies tanh.
+     * Wait, looking at the Python: self.tdnn is a TimeDelayNetBlock which has ReLU.
+     * Then self.tanh is applied. So: x → ReLU(conv(x)) → tanh(x).
+     * That's a bit unusual but let's follow it exactly. */
     for (int i = 0; i < att_hidden * T; i++)
         att_h[i] = tanhf(att_h[i]);
 
+    /* Conv1d(128→1536, k=1) */
     float *att_w = (float *)aligned_malloc((size_t)mfa_ch * T * sizeof(float));
     conv1d_same_reflect(att_h, att_hidden, T, enc->asp_conv_w, enc->asp_conv_b,
                         mfa_ch, 1, 1, att_w);
     free(att_h);
 
+    /* Softmax over time dimension for each channel */
     for (int c = 0; c < mfa_ch; c++) {
         float max_val = -1e30f;
         for (int t = 0; t < T; t++) {
@@ -735,6 +855,7 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
             att_w[(size_t)c * T + t] /= sum;
     }
 
+    /* Weighted mean and std */
     float *w_mean = (float *)calloc(mfa_ch, sizeof(float));
     float *w_std = (float *)calloc(mfa_ch, sizeof(float));
     for (int c = 0; c < mfa_ch; c++) {
@@ -757,12 +878,15 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     free(att_w);
     free(mfa_out);
 
+    /* Pooled stats: concatenate [w_mean, w_std] → [3072, 1] */
     float *pooled = (float *)aligned_malloc(3072 * sizeof(float));
     memcpy(pooled, w_mean, mfa_ch * sizeof(float));
     memcpy(pooled + mfa_ch, w_std, mfa_ch * sizeof(float));
     free(w_mean);
     free(w_std);
 
+    /* FC: Conv1d(3072→1024, k=1) — just a matrix multiply on length-1 input
+     * fc weight is [1024, 3072, 1]: out[i] = bias[i] + sum_j(w[i,j,0] * in[j]) */
     for (int i = 0; i < enc->enc_dim; i++) {
         float val = enc->fc_b[i];
         for (int j = 0; j < 3072; j++)
@@ -774,8 +898,14 @@ int qwen_speaker_encoder_forward(qwen_speaker_encoder_t *enc,
     return 0;
 }
 
+
+/* ════════════════════════════════════════════════════════════════════════
+ * High-level API
+ * ════════════════════════════════════════════════════════════════════════ */
+
 int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_path,
                                    float *out_embedding) {
+    /* Read WAV file */
     float *audio = NULL;
     int n_samples = 0, sample_rate = 0;
     if (qwen_read_wav(ref_audio_path, &audio, &n_samples, &sample_rate) != 0)
@@ -785,6 +915,7 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         fprintf(stderr, "Reference audio: %s (%d samples, %d Hz, %.2fs)\n",
                 ref_audio_path, n_samples, sample_rate, (float)n_samples / sample_rate);
 
+    /* Truncate to max_ref_seconds if set (default 30s, 0=use all) */
     if (ctx->max_ref_seconds > 0) {
         int max_samples = (int)(ctx->max_ref_seconds * sample_rate);
         if (n_samples > max_samples) {
@@ -795,8 +926,14 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         }
     }
 
+    /* Drop a trailing fade-out / silence so the clone doesn't learn a decrescendo. */
     qwen_trim_trailing_silence(audio, &n_samples, sample_rate, ctx->silent);
 
+    /* By design (decided 2026-06-03; documented in docs/voice-cloning.md + --help):
+     * reference audio MUST be 24 kHz. We deliberately do NOT bundle a resampler —
+     * ffmpeg does it better and keeps this engine dependency-free. The speaker-encoder
+     * mel features are computed at 24 kHz (n_fft=1024, hop=256, 128 mels), so a wrong
+     * rate would silently corrupt the embedding; we reject it loudly instead. */
     if (sample_rate != 24000) {
         fprintf(stderr, "Error: reference audio must be 24 kHz (got %d Hz)\n", sample_rate);
         fprintf(stderr, "Convert with: ffmpeg -i input.wav -ar 24000 -ac 1 output.wav\n");
@@ -804,6 +941,7 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
         return -1;
     }
 
+    /* Compute mel spectrogram */
     float *mel = NULL;
     int n_frames = 0;
     if (qwen_mel_spectrogram(audio, n_samples, sample_rate, &mel, &n_frames) != 0) {
@@ -815,6 +953,7 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
     if (!ctx->silent)
         fprintf(stderr, "Mel spectrogram: %d frames x 128 mels\n", n_frames);
 
+    /* Run speaker encoder */
     if (qwen_speaker_encoder_forward(&ctx->speaker_enc, mel, n_frames, out_embedding) != 0) {
         free(mel);
         return -1;
@@ -823,3 +962,6 @@ int qwen_extract_speaker_embedding(qwen_tts_ctx_t *ctx, const char *ref_audio_pa
 
     return 0;
 }
+
+
+/* Speech tokenizer encoder moved to qwen_tts_speech_encoder.c */

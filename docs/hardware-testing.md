@@ -17,8 +17,6 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 
 | command | what it does |
 |---|---|
-| `make cpu-check` | **run first, before any CPU optimisation**: provenance + hardware + `--self-test` + the RESOLVED dispatch map checked against what this ISA class should select → `profiles/<date>_<host>_<sha8>/` ([cpu-profiling.md](cpu-profiling.md)) |
-| `./qwen_tts --dispatch-map` | per logical feature: compiled / supported / env / **resolved** / reason, plus every `g_mm_gate[]` row as the dispatcher answers it |
 | `./qwen_tts --caps` | runtime SIMD-extension detection (ARM dotprod/bf16/i8mm/SVE/SME, x86 AVX-512/VNNI/BF16/AMX) + the `lever:` line — "does it fire?" |
 | `./qwen_tts --self-test` | cross-ISA kernel correctness oracle (bf16/int8/int4 matmul + matmat twins vs f32 ref). Run twice: native, then `QWEN_NO_SDOT=1 QWEN_NO_VNNI=1` for the fallback |
 | `make matmat-bench` | batched matmat twins (`qwen_matmat_{bf16,int8,q4_0}`) vs B×matvec, per precision/threads (no model) |
@@ -29,42 +27,7 @@ SIMD each one has**, **how to check the extension actually fires**, and **what t
 | `make check-isa` | compile-check the newer-ISA kernel paths (BFMMLA/SMMLA/SME ; VNNI/BF16/AMX) on the dev box, before the hardware exists |
 
 Scripts (copy onto any rented box): `tests/bench_matrix.sh <model> [--full]`,
-`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`,
-`tests/avx512_parity_bench.sh <model>` (the perf/avx512-parity branch battery, below).
-
-### avx512-parity battery (branch `perf/avx512-parity`, authored 2026-08-04 on M1 — HW-UNVALIDATED)
-
-Target box: Scaleway **STANDARD3-X4C-16G** (EPYC 9555P Zen5: `avx512_vnni` + `avx512_bf16`).
-New build flavor: **`make blas SIMD=avx512bf16`** (= avx512vnni + `-mavx512bf16`; check
-`--caps` runtime line for `avx512bf16` first — Ice Lake has VNNI but NOT BF16).
-What the branch adds + its runtime kill-switches (all default ON, A/B without rebuild):
-
-| lever | switch (disables) |
-|---|---|
-| C4: bf16 matvec via `VDPBF16PS` (activation rounded to bf16, BFMMLA-class numerics) | `QWEN_NO_BF16DOT=1` |
-| C7 v4: q4-VNNI deferred-reduce (no cross-lane op in the block loop) | **default OFF su Zen5** (v3 vince 1-2%, 3× A/B 2026-08-04); `QWEN_Q4_VNNI_V4=1` riabilita (`QWEN_Q4_VNNI_V3=0` → v2) |
-| fused-QKV q4 VNNI twin (was f32-dequant on x86) | `QWEN_NO_VNNI_QKV=1` |
-| attention dots/accum + rms_norm + bf16 bulk conv at 512-bit | compile-time only → A/B vs a main-branch binary |
-
-One command: `bash tests/avx512_parity_bench.sh qwen3-tts-0.6b` (add `MAIN_BIN=` for the
-branch-vs-main compile-time A/B).
-
-**✅ MEASURED on the EPYC 9555P (2026-08-04, 0.6B, temp0 seed42)** — self-test 5/5 PASS
-on-silicon; **dpbf16 −21% -j1** (RTF 1.19 vs 1.51; bf16 now TIES int8 single-thread) and
-−3% -j4; **int4 now BEATS int8 -j1** (v3 1.05-1.07 vs int8 1.21 — the old "+21% behind"
-verdict is REVERSED by v3-default + the QKV twin ~5%); v4 measured 1-2% SLOWER than v3 on
-Zen5 (3× A/B) → **default flipped to v3**, `QWEN_Q4_VNNI_V4=1` re-tests elsewhere; branch
-vs main: bf16 −17% / int4 −8% (-j1). `QWEN_PREFILL_MATMAT` A/B ≈ neutral → BLAS stays
-default (audit leftover CLOSED — on 1.7B BLAS wins clearly: 1.43 vs 1.52).
-**1.7B (same battery)**: dpbf16 **−19% -j1** (1.92 vs 2.38), branch vs main bf16 −17% /
-int4 −6% (-j1), int4 −4.5% (-j4). BUT **int8 stays the 1.7B single-stream king on x86**
-(int8 1.74 vs int4 1.84 -j1; 1.16 vs 1.28 -j4; qm 1.21) — the int4>int8 flip is
-**0.6B-only**; gap narrowed from +21% to ~+6% (-j1). QKV-twin share ≈0 on 1.7B.
-mel-corr BETWEEN kernel variants is NOT a valid gate:
-greedy trajectory forks at ~frame 8 from fp-level logit shifts (first 7 frames
-bit-identical — benign known class); quality gate = self-test + ear on the -j1 wavs
-Follow-up found: batched q4 matmat is
-now 0.80× vs the faster seq matvec → port the VNNI-matvec tricks to `q4_matmat_vnni_slice`.
+`tests/serve_batch_bench.sh <model> [port] [batch_N] [clients_M] [threads]`.
 
 ### The 2-command rented-box workflow
 
@@ -183,7 +146,7 @@ wired yet; a future twin). Zen3 (AVX2-only) is where **int4 + batching** already
 
 ## 5. The benchmark matrix (fill this in per box)
 
-Run all four delivery modes with **identical explicit params**, at the
+Run all four delivery modes with **identical explicit params** (per CLAUDE.md testing rules), at the
 default thread count and `-j1`, for bf16 / int8 / int4. Text = one paragraph (~6–8 sentences) so
 `--batch` has something to split.
 
@@ -320,79 +283,6 @@ Headline: **int8 is the x86 wall-clock winner** (0.6B sub-RT 0.95). q4-VNNI v3 m
 per-frame than int8 (row above), but int4/int8 fork the greedy trajectory so wall RTF isn't cross-quant
 comparable.
 
-**Re-validation round (same instance type):**
-- ⚠️ **Build gotcha (bit us again):** `make blas` on x86 defaults to PORTABLE AVX2 — VNNI needs
-  **`make blas SIMD=avx512vnni`**. `--caps` says which one you got ("int8 dot: VNNI" vs "widen->FMA");
-  READ IT before trusting any number.
-- **Batched-server stall fix VALIDATED**: B=4 server, sequential single requests = **8–9 s each**
-  (the historical intermittent bug was 262 s; `submit_mtx` + inactive-slot compaction now on).
-- **fp16 q4 scale (18 B/block)**: `--self-test` PASS on real VNNI; `matmat_q4 vs matvec_q4 L2 = 0`
-  (bit-identical). int8 0.96 vs int4 1.05 wall — x86 story unchanged, int8 stays the pick.
-- **1.7B config note: pure `--int8` (1.22) beats `--quant-mixed` (1.30) on x86** — the int4 Talker is
-  SLOWER than int8 on VNNI (43.2 vs 35.5 ms/f). quant-mixed is an Apple-silicon (M1) config;
-  **on x86 use `--int8`**.
-- **CP 2-token prefill is a measured x86 WIN**: CP 49.6/50.7 → **46.8/46.6 ms/f (−6-8%)**, RTF −3%
-  (the B=2 matmat rides the VNNI GEMM) — **now DEFAULT-ON under AVX-512/VNNI builds**
-  (`QWEN_CP_PREFILL2=0` opts out; on M1/non-VNNI it stays off — measured neutral there).
-- **`QWEN_BLAS_GEN_THREADS` sweep (4 vCPU)**: optimum = **1** (RTF 0.95 vs 0.99 at the nt−1 default of
-  3; =4 catastrophic 1.46, oversubscription). Per-box knob — sweep it on every new box (N1 file-mode
-  optimum was 2).
-
-**⭐ avx512-parity round — EPYC 9555P Zen5, 4 vCPU, `SIMD=avx512bf16` (2026-08-04, branch
-`perf/avx512-parity` @ 74bc18d, temp0 seed42 ryan EN, file mode):**
-
-| model | config | -j1 | -j4 | note |
-|---|---|---|---|---|
-| 0.6B | bf16 **dpbf16 ON** (C4) | **1.19** | 1.07 | ties int8 single-thread |
-| 0.6B | bf16 dpbf16 OFF (widen+FMA) | 1.51 | 1.10 | → **C4 = −21% -j1**, −3% -j4 |
-| 0.6B | **int4 v3 (default)** | **1.05–1.07** | 0.95 | ⭐ **int4 BEATS int8 -j1 on x86** (first time) |
-| 0.6B | int4 v4 (opt-in) | 1.07–1.09 | 0.95 | v4 LOSES to v3 by 1-2% on Zen5 (3× A/B) → default v3 |
-| 0.6B | int4 v2 | 1.35 | — | v3 = −20% vs v2 |
-| 0.6B | int4, QKV-VNNI twin OFF | 1.14 | — | the fused-QKV twin is worth ~5% |
-| 0.6B | int8 | 1.21 | 0.95 | -j4 = int4 parity (bandwidth-bound) |
-| 1.7B | bf16 dpbf16 ON / OFF | **1.92** / 2.38 | 1.43 / 1.45 | **C4 = −19% -j1** on 1.7B too |
-| 1.7B | **int8** | **1.74** | **1.16** | **int8 stays the 1.7B x86 king** (qm 1.21) |
-| 1.7B | int4 (v3 default) | 1.84 | 1.28 | gap vs int8 narrowed +21% → ~+6% (-j1); QKV share ≈0 |
-| — | branch vs main (same SIMD) | 0.6B bf16 1.43→1.19, int4 1.18→1.09 · 1.7B bf16 2.30→1.91, int4 1.90→1.79 | 1.7B bf16 1.48→1.43, int4 1.34→1.28 | attention/rms/conv 512-bit |
-
-Self-test 5/5 PASS on-silicon (both models). `QWEN_PREFILL_MATMAT` A/B: neutral on 0.6B,
-BLAS clearly better on 1.7B (1.43 vs 1.52) → BLAS stays default, audit leftover CLOSED.
-mel-corr between kernel variants is NOT a gate (greedy fork at ~frame 8, first 7 frames
-bit-identical — benign); quality gate = self-test + ear
-Follow-up: batched q4 matmat now 0.80-0.90×
-vs the faster seq matvec → port the VNNI-matvec tricks into `q4_matmat_vnni_slice`.
-Recommended x86 defaults after this round: **0.6B → `--int4`** (new fastest), **1.7B → `--int8`**;
-bf16 mode always benefits from dpbf16 (default ON under `SIMD=avx512bf16`).
-
-**⭐ Graviton3 (AWS c7g.2xlarge, Neoverse-V1, 8 vCPU, `-j4`, 2026-07-11) — first server-ARM with
-i8mm/bf16; the MMLA twins' first silicon:**
-
-| what | result |
-|---|---|
-| `--self-test` | **SMMLA int8 matmat L2 = 0.00e+00 (bit-identical to B× SDOT matvec)**; BFMMLA 3.4e-03 (expected bf16-act signature) — both PASS first run |
-| matmat-bench int8 (B=8) | old twin **0.32-0.38×** (batching LOST vs seq) → **SMMLA 2.03-2.10×** (batch 0.90→0.16 ms — ~6× better) |
-| matmat-bench bf16 (B=8) | old 1.01-1.20× → **BFMMLA 1.38-1.58×** |
-| matmat-bench int4 (B=8) | 0.29× with the old scalar batch → **1.55-1.63× with the q4-SMMLA twin** (same-session follow-up; self-test L2 ~7e-8). On M1-class (no i8mm) the batch now falls back to B× SDOT matvecs: 0.43-0.65× → 0.95-1.13× (loss gone) |
-| single-stream RTF | 0.6B int8 **0.66** (beats EPYC Turin 0.96!) · int4 0.73 · bf16 1.11 · **1.7B int8 0.95 — sub-realtime 1.7B on an ARM server CPU** |
-| batched server B=4 (e2e A/B) | 4 concurrent: **17 s with MMLA vs 21 s without = −19% wall** (aggregate RTF 0.84) |
-| batched server B=4 **int4** (e2e) | aggregate RTF **0.94** with the q4-SMMLA twin — int4 batched serving viable on ARM |
-| `QWEN_BLAS_GEN_THREADS` | optimum = 3 (= the nt−1 default) on 8 vCPU — opposite of the 4-vCPU EPYC; the knob is genuinely per-box |
-
-Build: plain `make blas` (Linux ARM uses `-march=native` → i8mm/bf16 auto-enabled; `--caps` must say
-"SMMLA ACTIVE"/"BFMMLA ACTIVE"). Kill-switches for A/B: `QWEN_NO_SMMLA=1` / `QWEN_NO_BFMMLA=1`.
-
-**⭐ Apple M4 (Scaleway M4-S Mac mini, 10-core, 16 GB, `-j4`, 2026-07-11) — first M4 + SME silicon:**
-
-| what | result |
-|---|---|
-| `--caps` | i8mm + bf16 + **SME/SME2 detected at runtime** (first SME silicon; no SME kernels yet) — MMLA twins ACTIVE |
-| `--self-test` | ALL PASS (SMMLA int8 L2=0, q4-SMMLA 7.6e-08, BFMMLA 3.4e-03 — same signatures as Graviton3) |
-| matmat-bench (B=8) | **per-box heterogeneity vs Graviton**: q4-SMMLA **1.50-1.84× WIN** · int8-SMMLA 0.61-0.91× (loses — M4's SDOT matvec + bandwidth too strong) · BFMMLA 0.72-0.91× (loses — transpose overhead doesn't pay on bandwidth-rich cores) → per-platform gating is a real question for the merge |
-| CPU single-stream | 0.6B int8 **0.44** · **int4 0.32** ⚡ · 1.7B quant-mixed **0.57** — the M4 CPU alone nearly matches the A100 GPU numbers |
-| **Metal** | 0.6B int8 0.38 · **int4 0.28 — new all-device record** (M2 Pro was 0.39) · 1.7B int4 **0.41** (M2 Pro: 0.50). **int4 > int8 on M4 Metal even with the SCALAR q4 shader** — the M4 GPU reversed the M2-era ordering by itself |
-| q4-vec shader verdict | `QWEN_METAL_Q4_VEC=1` = **NEUTRAL on M4** (0.28 vs 0.28) and a regression on M1 → stays **opt-in** (re-evaluate on M4 Pro / M5) |
-| merge defaults applied | int8-SMMLA + BFMMLA **default OFF on Apple** (`QWEN_APPLE_MMLA=1` re-enables, for M4 Pro/M5 re-eval); q4-SMMLA stays ON everywhere (wins on both Apple and Graviton) |
-
 **⭐ Full RTF+TTFA — Neoverse-N1 (Ampere Altra Max, 4 vCPU, `-j4`, 2026-07-10, post-PR#17, min of 3):**
 
 | model | config | RTF | TTFA |
@@ -417,7 +307,7 @@ diverge from the M1 dev box — record these so we don't assume M1 behavior carr
    = ~37% SLOWER** — the *opposite* of M1, where int4-SDOT beats int8. Even the legacy f32-dequant q4 (2.31)
    beats int4-VNNI. Cause: the v1 kernel is correctness-first (per-block 2× `_mm512_reduce`, 32-wide block
    zero-extended into a 512-bit `dpbusd` = half the lane width wasted) → compute overhead eats the
-   half-the-bytes bandwidth win. The throughput follow-ups (2-blocks-per-512b full-width, drop the
+   half-the-bytes bandwidth win. The plan_v4 C7 throughput TODOs (2-blocks-per-512b full-width, drop the
    per-block reduce, 2-row fusion) are **REQUIRED, not optional**, before int4 can win on x86.
 2. **int4 < int8 on Zen5 single-stream** (int8 is the fastest quant here), vs **int4 > int8 on M1**. Do NOT
    port the M1 "int4 is the fast default" conclusion to x86 until C7 is optimized + re-measured.

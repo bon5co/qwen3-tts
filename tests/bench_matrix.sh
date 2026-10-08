@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
+# bench_matrix.sh — one-command SIMD check + RTF benchmark matrix for ANY box.
+#
+# Runs the full per-box validation from docs/hardware-testing.md: what the CPU has
+# (--caps), kernel correctness (--self-test native + fallback), batched-matmat twins
+# (--matmat-bench), and the RTF matrix (single / batch [/ stream / server]) x precision.
+# Designed to be copy-pasted onto a freshly-rented ARM/x86 box. Quiet-machine only.
+#
+# Usage:
+#   tests/bench_matrix.sh [MODEL_DIR] [--full]
+#     MODEL_DIR   model dir (default: qwen3-tts-0.6b)
+#     --full      also run streaming + server modes (slower; spawns/kills a server)
+#
+# RTF = wall_seconds / audio_seconds (lower is better; <1.0 = sub-realtime).
 set -u
-cd "$(dirname "$0")/.." || exit 1
-MODEL="qwen3-tts-0.6b"; FULL=0; SILICON=0
-for a in "$@"; do
-    case "$a" in
-        --full)         FULL=1 ;;
-        --silicon-only) SILICON=1 ;;
-        -*)             echo "unknown option: $a"; exit 2 ;;
-        *)              MODEL="$a" ;;
-    esac
-done
+MODEL="${1:-qwen3-tts-0.6b}"
+FULL=0; [ "${2:-}" = "--full" ] && FULL=1
 BIN=./qwen_tts
 SEED=42; SPK=ryan; LANG=Italian
 TXT="Quel ramo del lago di Como, che volge a mezzogiorno, viene a ristringersi. Don Abbondio tornava bel bello verso casa. Stava recitando tranquillamente il suo ufficio. Alzando gli occhi, vide due uomini fermi sul sentiero. Quel tipo di incontro non prometteva nulla di buono. Il povero curato si fermò di colpo, impietrito. Sentiva il cuore battergli forte nel petto."
 
 [ -x "$BIN" ] || { echo "build first: make blas"; exit 1; }
-if [ "$SILICON" = "0" ]; then
-    command -v python3 >/dev/null || { echo "python3 required for RTF"; exit 1; }
-fi
+command -v python3 >/dev/null || { echo "python3 required for RTF"; exit 1; }
 
 hr(){ printf '%.0s─' {1..72}; echo; }
 audio_s(){ python3 -c "import wave,sys; print(round(wave.open(sys.argv[1]).getnframes()/24000,2))" "$1" 2>/dev/null || echo 0; }
+# run a synthesis, print "wall  audio  RTF"
 rtf_run(){ # $1=label  $2..=qwen args
   local label="$1"; shift
   local out=/tmp/bm_$$.wav
@@ -36,24 +40,7 @@ rtf_run(){ # $1=label  $2..=qwen args
   rm -f "$out"
 }
 
-echo; hr
-if [ "$SILICON" = "1" ]; then
-    echo "  qwen-tts BOX REPORT (silicon only, no model)   $(date 2>/dev/null)"
-else
-    echo "  qwen-tts BENCH MATRIX   model=$MODEL   $(date 2>/dev/null)"
-fi
-hr
-
-echo "### 0. Hardware inventory + memory bandwidth (tools/box_info.sh) ###"
-HW_JSON="${HW_JSON:-/tmp/tts/box_info.json}"
-if [ -r tools/box_info.sh ]; then
-    mkdir -p "$(dirname "$HW_JSON")" 2>/dev/null
-    bash tools/box_info.sh --out "$HW_JSON"
-    [ -s "$HW_JSON" ] && echo "  (JSON confrontabile fra box: $HW_JSON)"
-else
-    echo "  tools/box_info.sh missing — hardware inventory skipped"
-fi
-echo
+echo; hr; echo "  qwen-tts BENCH MATRIX   model=$MODEL   $(date 2>/dev/null)"; hr
 
 echo "### 1. SIMD capabilities (--caps) ###"
 "$BIN" --caps 2>&1 | sed 's/^/  /'
@@ -66,19 +53,7 @@ echo
 
 echo "### 3. Batched matmat twins (--matmat-bench, B*matvec vs matmat) ###"
 "$BIN" --matmat-bench 2>&1 | sed 's/^/  /'
-echo "  --- single thread (compute-bound reference) ---"
-"$BIN" --matmat-bench -j 1 2>&1 | sed 's/^/  /'
 echo
-
-if [ "$SILICON" = "1" ]; then
-    hr
-    echo "  This is the GROUND TRUTH ABOUT THE SILICON. Before any server number:"
-    echo "    · --self-test red              -> the matrix below measures the wrong kernel"
-    echo "    · --caps without the expected primitive -> it measures a FALLBACK, not this machine"
-    echo "  Poi: ./download_model.sh --model small && make bench-matrix"
-    hr
-    exit 0
-fi
 
 echo "### 4. RTF matrix: single vs batched x precision (temp0, seed $SEED) ###"
 for P in "bf16:" "int8:--int8" "int4:--int4"; do
@@ -118,6 +93,6 @@ if [ "$FULL" = "1" ]; then
 fi
 
 hr
-echo "  Paste this block + the --caps output into the per-box hardware notes."
+echo "  Paste this block + the --caps output into docs/hardware-testing.md (§5 matrix)."
 echo "  Correctness gate (separate, run once): make test-serve-all"
 hr

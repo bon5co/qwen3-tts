@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Score the ICL emotion-dilution sweep."""
+"""Score the ICL emotion-dilution sweep.
+  movement = mel_corr(emotion@cap, neutral@cap)   LOWER = emotes more
+  identity = mel_corr(neutral@cap, neutral@full)  HIGHER = voice preserved
+Also reports per-clip RMS dB (volume) — emotion that only collapses energy is a fail.
+"""
 import sys, os, glob
 import numpy as np
 import librosa

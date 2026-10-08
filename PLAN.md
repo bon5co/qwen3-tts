@@ -1,1755 +1,1362 @@
-# Current Plan
-
-`ENGINEERING.md` is normative. This file is the short task queue; reasoning and reviewed
-evidence live in the linked `.work/*.md` addenda.
-
-## Mission
-
-Build a CPU TTS server that starts quickly, continuously feeds a real 1x player without
-repeated starvation, keeps realtime headroom, protects established streams from new
-arrivals and from unrelated slow clients, and only then maximizes sustainable concurrency
-and cost per stream. The qualification process discovers the highest concurrency that
-satisfies the complete streaming envelope; C4 is not a required operating point.
-Rationale and evidence: `.work/professional-streaming-architecture.md`.
-
-## Current trusted state
-
-- Host: GCP c4-standard-24 (12 physical cores, SMT off), 1.7B INT8, decoder Design D
-  INT8 AMX with persistent packs, 2x6 prefork, engine-owned pool, batch cap 2.
-- Current conservative short q8/threshold2 control: C2/C3 are GOOD; C4 is MARGINAL
-  (`STREAM_RTF` p50/p95 0.793/0.856, required-prebuffer p95 596 ms, stall@500 25%).
-  `STREAM_RTF < 1` is capacity, not a continuous playback proof.
-- Fused-residual Design-D candidate: pooled five-minute C4 SOAK passed the hard stream
-  gate in all four windows (`STREAM_RTF` p50/p95 0.8304/0.8933, TTFA p95 526 ms,
-  safe-play-start p95 917 ms, zero errors/rejects/timeouts); preferred `<=0.90` was
-  missed in one window and per-class p95 was under-sampled. The flag remains default-off.
-- Post-C4 capacity screen: C5 is the first NOT STREAMABLE point under the complete
-  envelope (STREAM p95 0.852 but TTFA p95 4.44 s and safe-play-start p95 4.60 s); C6
-  shows the same failure. F2 causally decomposed the C5 tail: under cap 2, three full-wave
-  requests waited 3.6–4.9 s before parent `accept()` and >97% of client-to-first-PCM
-  elapsed before engine admission; `--max-queue 0` converted the same overload to 3
-  immediate parent-side 503s. A secondary child/engine queue + prefill term remains, but
-  is sub-second. Do not advertise C5/C6 as realtime capacity. Detail:
-  `.work/p4-prefork-admission-bound-20260907.md`, `.work/f2-c5-startup-decomposition-20260908.md`.
-- CT-1 confirms prebuffer follows quantum (q8 ~0.7 s p95 in short SOAK; q32 ~2.5 s)
-  while RTF changes less. q32 is rejected as a production streaming policy.
-- Decoder MACs already run on real AMX with wide N; its wall is glue (im2col, quantization,
-  ~41 rendezvous and ~110 BLAS calls per call, snake, tails). AMX can touch at most
-  ~10-20 % of request wall; more tile tasks regressed (M split rejected).
-- Per-worker effective batch ~1.1-1.3 at C4: Talker/CP run as DRAM-bound B=1 GEMV, weights
-  read per worker. The 1x12/batch-4 probe measured decode-burst coupling, not Talker
-  batching, and is not evidence against a single engine.
-- Inline prefill stalls every established stream 108-240 ms per admission; a slow client
-  blocks its worker's engine thread (blocking writes, no send timeout).
-- LS-4 utilization-aware admission was falsified on the same host: thresholds 40/60/80 ms
-  admitted all tested fifth arrivals, but established STREAM_RTF p95 stayed 0.985-1.004,
-  stall@250 was 50%, and post-admission max-gap p95 reached 653-704 ms. Keep the
-  diagnostic default-off; cap2/q4 remains the reference. Detail:
-  `.work/ls4-utilization-aware-admission-20260908.md`.
-- Harness (2026-09-07): one metric core `tests/playback_sim.py` with per-request
-  safe_play_start, fixed-buffer stall rates, max_gap, coalesced-read share; marks are
-  client-observed. Batched synchronous streams now publish the header at admission and
-  accepted sockets set `TCP_NODELAY`; PCM writes remain synchronous unless OUT is enabled.
-  Detail: `.work/mt4-transport-boundary-20260907.md`.
-
-### Current 8-core AMX product decision
-
-- The current 8-physical-core reference is `1x8@0-7`, SMT off, Design-D INT8,
-  fused residual, warm strip, q4, engine pool and fail-fast admission. The
-  strict `amx-product` profile now explicitly enables the official known-text
-  SL-1 layout (`QWEN_TTS_STREAM_LAYOUT=1`); ICL/clone and live incremental text
-  are outside this lane.
-- 1.7B: **C2/cap2 is the highest full-envelope GOOD point**. C3 is a healthy
-  short/isolated-bank screen but not a full production point because the
-  corrected C3 SOAK still has tail drift and pooled STREAM_RTF p95 just over
-  one. Detail: `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
-- 0.6B: **C3/cap3 is the highest full-envelope GOOD point** on this host. C4 is
-  a non-promoted screen; C5 is the first clearly bad short-bank point. Detail:
-  `.work/gcp-c4-highcpu16-amx-product-capacity-20260908.md`.
-- These are playback-aware product points, not a claim that the 8-core host can
-  sustain C4 or that low-rate Poisson probes establish an economic rate. Cost
-  per good stream remains UNKNOWN without grounded pricing.
-
-## Immediate priorities
-
-### Serving documentation and release readiness
-
-- [x] DOCS-1 **Serving docs split by backend under `docs/serving/`** (2026-09-17). One index
-      (`docs/serving/README.md`) linking two separate strategies, because the CPU server is
-      qualified and the CUDA one is not, and a shared document is how an unqualified number gets
-      quoted as a supported one. The former top-level `server`, `serving-operations` and
-      `server-batching` pages are now `docs/serving/api.md` (the API is the one thing both backends
-      share), `docs/serving/cpu-operations.md` and `docs/serving/cpu-batching.md`; the CUDA
-      streaming-server sections moved out of `docs/cuda-performance.md` into
-      `docs/serving/gpu-cuda.md`, which keeps the backend page about the backend. Every inbound reference in the repository was rewritten and
-      every relative link verified to resolve.
-- [x] DOCS-2 **New: `docs/serving/cpu.md`** — the production CPU serving strategy, in the order a
-      new box is actually approached: `make doctor` first, build for the ISA, launch from a
-      deployment profile rather than by hand, qualify on the whole envelope. Carries the expanded
-      Arm and x86 invocations verbatim, since ~40 flags per ISA is exactly the thing nobody will
-      remember and the reason `tools/perf_profile.py command` exists.
-- [x] DOCS-3 **New: `docs/serving/boxes.md`** — the index of every measured host, its profile JSON,
-      the status that profile carries and what it was observed to hold, plus the GPU boxes marked
-      as screens. States explicitly that no GPU equivalent of `configs/perf/*.json` exists, which
-      is why a GPU run has no gate that can refuse to start misconfigured.
-- [x] DOCS-4 **`configs/perf/schema.json` widened to accept what profiles already record**
-      (2026-09-17). `tools/perf_profile.py validate` was failing on two committed files:
-      `preferred_concurrency` could not express one qualified point per checkpoint size (the form
-      ARM-SOAK-9 wrote into the Graviton4 profile), and the Milan cross-screen used five fields the
-      schema had never been told about. Added `preferred_concurrency_evidence`,
-      `isa_features_absent`, `selected_leaves`, `interpretation`, `status_matrix`,
-      `DIAGNOSTIC_CLOSED_LOOP`, and the **whole playback envelope** in `qualification.measured`
-      (TTFB, `stream_rtf_p95`, safe-start, prebuffer, `max_gap`, all four stall thresholds,
-      audio-s/wall-s, completed/rejects/timeouts) — the schema could previously record only TTFA,
-      `stream_rtf_p50` and throughput, i.e. everything except the metrics that decide acceptance.
-      20/20 profiles valid, `tests/test_perf_profile.py` green.
-- [x] DOCS-6 **Capacity claims split by ERA, not only by status** (2026-09-17). The serving docs,
-      the blog post and the v0.22.0 release description listed the 16-core Axion (C4) and the
-      8-core Xeon AMX (C1) beside the 32-core points as "what it holds today, from those soaks".
-      Both were wrong twice over: those hosts were qualified **before** the v2 serving work
-      (2026-09-07 to 09-15, x86-8c-amx at commit `266f706`, 2026-09-01) and their numbers come from
-      three-wave TTFA sweeps, not 30-minute closed-loop soaks — so they were neither current nor
-      the same kind of evidence. The v2-qualified set is exactly the four 32-core hosts. Removed
-      from every capacity claim; kept in `docs/serving/boxes.md` under an explicit
-      "Measured before v2 — history, not current capacity" heading, because the topology and flag
-      lessons they taught still hold while the concurrency they reached does not. Residue: the
-      `v0.22.0` tag annotation still carries the old sentence; the release description is corrected.
-- [x] DOCS-7 **Era labelling swept across every serving document** (2026-09-17). DOCS-6 removed the
-      pre-v2 rows from the capacity tables; this pass went through the rest. Confirmed by
-      `git log -S` that the 16-core Axion topology sweep, the profile-environment A/B (including the
-      arm labelled "current build") and the `QWEN_POOL_SPIN` measurement all date from **2026-09-01**
-      — every one of them pre-v2. Added: an era convention in `docs/serving/README.md` stating that
-      the v2-qualified set is exactly the four 32-core boxes and why (brute-force the largest CPUs
-      available); an era box at the top of `docs/serving/cpu.md` and of
-      `docs/serving/cpu-operations.md`; inline `pre-v2` markers on each affected table; a warning on
-      the 2026-07 batching table in `docs/serving/cpu-batching.md`; a scope note on the Apple M1
-      single-request figures in `docs/serving/api.md`; host attribution in the blog post (the
-      admission decomposition is the 12-core GCP reference host, the bimodal profile measurement is
-      the 16-core Arm host on 2026-09-01). Dates added to the pre-v2 rows in
-      `docs/serving/boxes.md`. Nothing deleted: the lessons those hosts taught are kept, the
-      concurrencies they reached are no longer presented as current.
-- [x] DOCS-5 **Blog: `blog/cpu-streaming-server-that-never-stalls.md`** — the v2 CPU serving design
-      as a narrative, for dev.to: the envelope, the admission decomposition, the decode quantum,
-      the falsified utilization-aware admission, the bimodal configuration measurement, `doctor`,
-      and the doubling-ladder lesson.
-
-### Serving lifecycle — cancel on disconnect and session books — detail: `.work/cancel-on-disconnect-20260925.md`
-
-- [x] CD-1 Zombie regression test: `make test-server-faults`, cases discriminating, model work
-      after the disconnect read from `frames_generated`; FAILED on the old default on every path.
-- [x] CD-2 Disconnect cancels on every path (batched, single-job clone, plain server; stream and
-      WAV): reset within one frame, FIN within one chunk, half-close still served.
-- [x] CD-3 `QWEN_CANCEL_ON_DISCONNECT` defaults ON (`=0` for A/B); test passes on the default and
-      fails with `=0`.
-- [x] CD-4 Session books: one close per request on every path, `balanced` in `/v1/health` and
-      `/metrics`; a mixed workload moves them by exactly the workload.
-- [x] CD-5 Fault suite (`make test-server-faults`, 40 invariants) incl. abort-loop memory: no
-      per-abort growth vs a no-abort control (macOS, gross bound in the suite).
-- [~] CD-6 **Arm DONE 2026-09-25** (Axion: fault suite OK, control arm fails as it must, K1-K8 pass, K9 needs an LSan build). Open: x86 and LSan. Run `make test-server-faults` and `tests/cancel_correctness.py` on Linux x86 and Arm,
-      including `--prefork 2` for per-worker books.
-- [ ] CD-7 DECISION: a FIN during a WAV request is not seen until the final write (legal
-      half-close); accept, treat EOF as gone for WAV, or send interim 1xx.
-- [ ] CD-8 Single-job path ignores `--max-request-seconds`; its queue bound follows batched
-      occupancy.
-- [ ] CD-9 A stopped reader blocks the synchronous batched writer up to the send timeout,
-      stalling that worker's other slots (the async writer does not; default-off).
-
-### OTEL — telemetry endpoint for the streaming server (ANALYSIS FIRST) — detail: `.work/otel-metrics-endpoint-20260917.md`
-
-Goal: let a standard observability reader watch a production CPU streaming server, without
-inventing numbers the server is not entitled to claim, and without complicating the server.
-**Nothing is implemented until OTEL-1 and OTEL-2 are answered** — the survey found that the wire
-format is the easy half and the honest-metric boundary is the hard half.
-
-**IMPLEMENTED 2026-09-17 on `feat/metrics-endpoint`** — `--metrics-port` / `--metrics-bind`,
-`docs/serving/metrics.md`, `tests/serve_metrics.sh`, `tools/metrics_watch.py`. Touches
-`main.c` (flags), `qwen_tts_server.h` (one prototype) and `qwen_tts_server.c` only; no kernel,
-engine or compute file is in the diff, and no worker process changes at all. **Open: the
-prefork parent path is Linux-only and is compiled out on macOS, so it is written but not yet
-executed — OTEL-7 validates it on the 32-core Axion.**
-
-**DECIDED 2026-09-17 (owner): tier 1 only, and it must publish state that already exists.**
-No new instrumentation, nothing added to any serving path, nothing that can slow a request.
-`/metrics` is a *rendering* of what the process already holds when somebody asks for it, and
-that is the whole feature — collection, retention, alerting and rate computation are the
-scraper's job, not ours. Pull model: the server does nothing between scrapes, keeps no
-telemetry state, runs no background thread and pushes nothing. Tier 2 stays parked unless tier 1
-proves insufficient. Rationale below.
-
-**Recommended shape (two tiers, and tier 1 costs nothing).**
-The prefork parent already holds the per-worker picture over time in its own memory —
-`active[w]` in-flight, `completed[w]` cumulative finished connections (`srv_conn_close()` at
-`qwen_tts_server.c:1458` writes one byte per finished connection, the parent counts them at
-`:3026`), `kids[w]` alive, `rejected`, elastic `replans` and `cur[w]`. Nothing has to be
-measured; something has to be *printed*. Tier 1 registers a second listening socket in the
-parent's **existing `pfd[]` poll set** — no thread, no shared memory, no atomics, since the
-accept loop is the sole owner of that state — and emits it as per-worker labelled series. Cost
-on the request path is **structurally zero**: no code is added to any path a request traverses,
-and the child does not change at all. Tier 2 (latency, audio seconds, the write-gap proxy) is
-child-side, needs the shared segment, and happens only if tier 1 proves insufficient.
-
-- [x] OTEL-1 **Decide what the server is entitled to export.** (2026-09-17) Our envelope is half
-      client-side by construction. Server-observable: TTFB, TTFA, queue/admission time, request
-      duration, audio-seconds per wall-second, `STREAM_RTF`, and the **write-gap / cadence debt**
-      proxy. Not server-observable: `required_prebuffer`, `safe_play_start`, `stall_rate@N` —
-      a stall is an event in a *player*, and the server does not hold the playback clock.
-      Deliverable: the exported set, each metric named so that the proxy can never be quoted as
-      the harness's `stall_rate`, plus the standing rule that a bucketed Grafana p95 is an
-      operations signal and **not** a qualification number (the harnesses stay the acceptance
-      instrument). Same discipline as the `doctor` provenance labels.
-- [x] OTEL-2 **Decide the aggregation model, because the server is prefork.** (2026-09-17 —
-      per-worker series, never aggregated in C. The `/v1/health` worker-attribution fix is
-      **still open**, tracked as OTEL-8.)
-      `static server_state_t g_srv` (`qwen_tts_server.c:597`) is process-local, so each worker
-      counts only itself — which means `GET /v1/health` **already** returns one worker's
-      counters on a 12-worker box, a different twelfth each scrape. Verify empirically, then
-      choose. **Recommended: never aggregate in C at all** — emit per-worker labelled series
-      and let the reader do `sum()` / `rate()`. That keeps a wedged worker *visible* (inflight
-      pinned at cap, `connections_total` flat) instead of averaged away, which is the failure the
-      soak work kept finding, and for tier 1 it needs no shared memory: the parent already owns
-      the numbers. The `qwen_admission_health_t` mmap pattern at `:2804` stays the answer for
-      tier 2 only. Separately and cheaply: `/v1/health` should report which worker answered
-      (`"worker": N`) and the doc should say its counters are that worker's while its limits are
-      the server's — two lines, no behaviour change. Check what in `tests/` reads it.
-- [x] OTEL-2b **Do NOT expose `/v1/health` as the metrics source, even via a sidecar**
-      (decided 2026-09-17). The zero-code route exists — `prometheus-community/json_exporter` or
-      a Telegraf `http` input maps a JSON endpoint to Prometheus series with a config file and no
-      C at all — but on a prefork server it inherits the defect in OTEL-2: each scrape lands on
-      whichever worker got the handoff, so `admitted`/`done`/`rejected_*` jump between unrelated
-      per-worker values and every `rate()` over them is noise. A wrong time series is worse than
-      no time series, because it is the one a dashboard will be built on. The parent is the only
-      process with a stable complete view, which is what makes the small C change the *minimum
-      correct* option rather than merely the nicer one.
-- [x] OTEL-3 **Format: Prometheus/OpenMetrics text on `/metrics`, opt-in.** (2026-09-17) Readable directly by
-      Prometheus, Grafana Alloy, VictoriaMetrics and the Datadog OpenMetrics check, and by the
-      OpenTelemetry Collector through its `prometheus` receiver, which converts to OTLP for
-      anything downstream — so a text page reaches every OTel consumer without linking a
-      protobuf/gRPC client into a dependency-free C server. Path `/metrics`, not `/v1/metrics`
-      (scraper default; `/v1/metrics` is OTLP-over-HTTP's own push path). **On a separate port**
-      (`--metrics-port`, off by default, loopback-bound): the parent does not read the service
-      socket at all today — it `accept()`s and passes the fd with `SCM_RIGHTS` (`:1468`) — so
-      teaching it to peek at HTTP on the data path just to route `/metrics` would be the single
-      most invasive change available, for no gain. A separate port also makes "answers without
-      the synth lock, outside admission" structural rather than a thing to be careful about, and
-      it keeps concurrency/capacity/build identity off the public port.
-- [x] OTEL-4 **Namespace and the cardinality rule — done for tier 1** (2026-09-17: `qwen_tts_`
-      with underscores, labels limited to `worker` and `reason`, no `voice` or `language` label
-      anywhere. The bucket/threshold design below applies to tier 2 and is not yet needed.) Tier 2 note: **prefer no
-      histograms.** A Prometheus histogram is a set of "how many exceeded X" counters, and we have
-      already declared the only threshold that matters — so `_sum`/`_count` pairs (mean over any
-      window via `rate()`) plus exact threshold counters such as
-      `qwen_tts_ttfa_over_1s_total{worker}`, which encodes the `safe_play_start` hard line
-      directly and is exact rather than an estimated quantile. ~12 `uint64` per worker instead of
-      four bucket arrays. Prefix `qwen_tts_` with
-      underscores — *not* vLLM's `vllm:` colon, which their own docs concede is contrary to
-      Prometheus convention. Adopt the GenAI semantic-convention TTFT bucket set for the latency
-      histograms (`0.001 … 1.0 … 10.0 s`; the `1.0` boundary happens to be our `safe_play_start`
-      line); pick our own for `stream_rtf` and `write_gap`. **`voice` must never be a label** —
-      presets are bounded at 9 but the clone path takes arbitrary names, so a voice label is an
-      unbounded series generator driven by user input; same for `language`. Allowed labels:
-      `worker`, `route`, `outcome`, plus static identity on `qwen_tts_build_info`. Copy vLLM's
-      deprecation policy verbatim (notice in the HELP string, release-note entry, one-cycle CLI
-      escape hatch).
-- [x] OTEL-5 **`gen_ai.server.*` aliases: NOT emitted** (decided 2026-09-17; revisit only if a
-      reader actually asks for them). As of
-      2026-09-17 every `gen_ai.*` metric is still stability **Development**, none Stable, and on
-      2026-06-12 (semconv v1.42.0) the whole namespace was deprecated out of the main repository
-      into `open-telemetry/semantic-conventions-genai`, which has no tagged release. The
-      conventions are token-centric and define **no audio or text-to-speech operation at all**:
-      `gen_ai.operation.name` has `chat`, `text_completion`, `embeddings`, … and nothing for
-      speech. So `gen_ai.server.time_to_first_token` / `.request.duration` /
-      `.time_per_output_token` are at best an alias set for three of our metrics, for a
-      convention that can rename fields without a deprecation window. Open sub-question: whether
-      to propose an audio operation upstream — we have an unusually well-specified envelope to
-      argue from.
-- [x] OTEL-6 **Cost gate — not applicable to tier 1** (2026-09-17). Tier 1 adds no code to any path a request traverses,
-      so there is nothing to gate; do not run a campaign to prove zero. For tier 2:
-      instrumentation is not
-      free until measured. The per-request instants already exist in `batch_job_t`
-      (`t_recv`/`t_parsed`/`t_admit`/`t_first`/`t_write_complete`, `first_audio_ready_us`,
-      `audio_ready_samples`) and are discarded at job completion, so the addition is aggregation,
-      not clock reads — but it still has to clear **< 0.2 % of wall** on `make cost-map` plus a
-      C12 wave A/B on the frozen Turin profile before the endpoint is documented as safe under
-      load.
-- [x] OTEL-7 **Prefork parent validated on Linux — 32-core Neoverse-V2 Axion, 2026-09-17.**
-      Clean build (`rc=0`, zero errors) — the first time the `#if defined(__linux__)` parent block
-      was compiled at all — with `--caps` reporting SMMLA and BFMMLA active and `--self-test`
-      passing. `tests/serve_metrics.sh` 13/13 including block 5: four distinct per-worker series,
-      every worker dispatched, `dispatched_total` summing to the offered load, counters monotonic
-      across scrapes. A 120 s C16 closed-loop soak with `tools/metrics_watch.py` at 5 s returned
-      monotonic / conserved / balanced, and the arithmetic closes: `dispatched - completed = 4`
-      per worker, 16 in total, exactly the offered concurrency still in flight. Per-worker spread
-      43..64 — normal duration variance, and visible only because nothing is summed.
-      **Cost: below the noise floor.** Three arms (off / on / off) of the same soak on the frozen
-      `axion-c4a-highcpu32-0p6b-all-on` profile: the two identical OFF arms already differ 6.6% on
-      TTFA p50 and 12.2% on p99, every on-vs-off delta is inside that, and several ON numbers are
-      better than both OFF arms — which cannot be real. Table in `docs/serving/metrics.md`.
-      **One defect found by measuring:** `accept()` can return before the request lands, so
-      answering and closing raced with the arriving request, the kernel sent `RST` and the scraper
-      discarded an already-written response — one empty scrape in ~300 under load. Fixed with a
-      single bounded 2 ms `poll()`; 1000 scrapes under load afterwards, zero empty.
-      Full observability example added: `configs/observability/` + `tools/observability_up.sh`,
-      verified end to end with Prometheus 3.14 and Grafana 13.2 on the box (target `up`, four
-      worker series in the TSDB, dashboard provisioned).
-- [x] OTEL-9 **QoS on the scrape port** (2026-09-17). The decision that makes the page free at a
-      sane interval — rendering inside the prefork parent's dispatch loop — is what made a
-      runaway client dangerous, so `--metrics-max-rate` (default 5 scrapes/s, `0` disables)
-      serves at most that and answers `429` + `Retry-After` above it. A token bucket holding
-      `2 x rate`, not a minimum interval, for the reason DynamoDB uses one: a fixed floor
-      punishes two scrapers landing together and does nothing about a sustained flood. The
-      refusal path does not render the page (a refusal must be cheaper than an answer, or the
-      limit funds the attack) and refusals do not consume tokens (a hammering client must not
-      lock out everyone including itself). Refusals are published as
-      `qwen_tts_metrics_throttled_total`. Verified on the Axion under C16 load: a 100-request
-      burst at full speed served 12 and refused 88, with the counter reading exactly 88, while
-      the Prometheus 5 s scrape stayed `up` throughout. Scope stated in the docs: QoS against
-      accident, not DDoS protection — a flood is a firewall's problem and the port is
-      loopback-bound by default.
-- [x] OTEL-10 **Tier 2 shipped: the measurements only a worker can see** (2026-09-17). One
-      `MAP_SHARED` page, one slot per worker, single writer, read by the parent at scrape time.
-      Adds audio seconds produced, TTFA and TTFB as `_sum`/`_count`, an exact
-      `ttfa_over_1s_total` for the `safe_play_start` line, and a behind-realtime chunk-gap proxy.
-      Hooked into `qwen_life_emit()` and `sink_on_chunk()`, which already ran once per request
-      and once per chunk with every timing in hand, so nothing new is computed: with metrics off
-      it is one never-taken branch, with them on a few relaxed atomic adds per request.
-      **Two defects found while building it, both by measuring rather than reading.** The gap
-      counter first used a 250 ms threshold and fired on 15 of 17 chunks of a *healthy* stream —
-      a chunk carrying 500 ms of audio arriving 400 ms later is filling the buffer, not draining
-      it. Re-defined as gap-versus-audio-delivered and validated by discrimination: same text,
-      same box, bf16 (RTF~1.3) 13/13 behind realtime, `--int8` (RTF~0.85) **0/12**. And the new
-      series overflowed the page buffer, which truncated mid-sample while `Content-Length` agreed
-      with the truncation — a corrupt page that parses. Buffer resized and the renderer now grows
-      and re-renders; the test asserts the last line is a whole sample.
-      **Cost: still below the noise floor.** Same three-arm C16 soak: the two identical OFF arms
-      differ 23.5% on TTFA p99 (265.0 vs 202.6) while every on-vs-off delta is at most 7.5% and
-      mostly under 1%. Live at C16 on the Axion: 14.0 realtime streams sustained, zero requests
-      past the 1 s line, and ~2.9% of chunks arriving behind realtime — which is the kind of
-      thing the proxy exists to make visible.
-      Dashboard reorganised around the listener (realtime streams, TTFA mean against the 1 s
-      line, TTFA past 1 s, behind-realtime fraction) with server health below; `Build` panel
-      fixed to show labels, and a `up{job}` panel added so a gap in the graphs can be told apart
-      from a server that was down.
-- [x] OTEL-11 **Scrape cost measured directly, not inferred** (2026-09-17). A soak A/B can only
-      say "below the noise floor", and this box's floor is several percent, so the parent's own
-      CPU time was read from `/proc/<pid>/stat` over three 120 s windows under C16 load: idle,
-      1 scrape/s, idle again. The parent consumed **less than one clock tick in every arm**, so
-      119 scrapes cost under 10 ms in total: an upper bound of **~84 us per scrape**, and the
-      real figure is below the instrument's resolution. Closes OTEL-7b: a 1 s interval is free.
-- [x] OTEL-12 **Worker-0 asymmetry: my softirq explanation was WRONG, and the error was mine.**
-      (2026-09-17.) Three signals agreed that worker 0 was ~10% slower — TTFA, completions and
-      behind-realtime chunks — and I attributed it to network softirq work concentrated on its
-      cores, citing 58.7% of NET_RX against an even 25%. **That number was cumulative since
-      boot**: it counted every earlier experiment, ssh session and tmux run on the box, not the
-      benchmark window. Measuring the delta *during* each arm shows NET_RX split evenly —
-      24.5 / 27.8 / 23.9 / 23.7 — and the hypothesis is refuted. Hardware interrupts were
-      already even (25.9% vs 25%) and were refuted earlier.
-      What survives is simpler and fits every arm: the **load generator runs unpinned on the
-      same box**, the scheduler favours low-numbered idle CPUs, and it was observed on cpu0 —
-      inside worker 0's slice. Pinning it anywhere (w1 or w3 cores) removed most of worker 0's
-      penalty without transferring it, because eight TTS threads dilute one python process.
-      Consequences: every closed-loop soak run with a co-located generator has carried this,
-      systematically on worker 0, worth ~2.5% aggregate; and the lesson is the method one —
-      **a cumulative counter is not a measurement of a window.**
-- [ ] OTEL-7b **Not yet measured: a 1 s scrape interval.** SUPERSEDED by OTEL-11. Note it is within the shipped default
-      limit (1/s against 5/s), so this is a cost question, not a behaviour one. Everything above was at 5 s. 1 s is
-      5x the scrapes and should still be invisible, but it is a claim, not a measurement.
-      The parent path is inside `#if defined(__linux__)` and is compiled out on macOS, so every
-      line of it shipped unexecuted: the poll-set registration, the per-worker rendering, the
-      never-reset counter twins and the teardown ordering are all reviewed but unrun. On the box:
-      `bash tests/serve_metrics.sh` (its block 5 runs only on Linux — one series set per worker,
-      distinct, every worker moving, counters monotonic across scrapes), then a **2-minute mini
-      soak** with `tools/metrics_watch.py --duration 120 --interval 10` against real load, which
-      checks monotonic / conserved (`completed <= dispatched`) / balanced (no idle worker).
-      Watch for: a worker that never receives work, a counter that resets, and whether the
-      parent's `all_workers_full` rejects track the harness's own reject count.
-- [ ] OTEL-8 **`/v1/health` should say which worker answered.** Found while surveying, unrelated
-      to the endpoint: `g_srv` is a process-local static, so on a prefork server the health
-      counters are one worker's, a different one per probe, while the limits it reports are the
-      server's. Add `"worker": N` and say so in `docs/serving/api.md`. Two lines, no behaviour
-      change; check what in `tests/` reads it first.
-
-### Legacy CPU / v2 portability audit — detail: `.work/legacy-cpu-v2-audit-20260916.md`
-
-- [x] LEGACY-CPU-0 Read-only architecture audit at `15a5850`: reconstructed model load,
-      quantization/packing, ISA dispatch, Talker/CP/decoder, GEMV/GEMM crossover and v2
-      serving. Current evidence: AVX2 has batched INT8/Q4 emulation but no native INT8/Q4
-      GEMV; AVX-512 without VNNI has no dedicated integer matrix family; dotprod-only ARM
-      has native GEMV but SDOT matmat is opt-in and KAI currently requires i8mm. M1
-      `--caps`, `--dispatch-map` and `--self-test` were rerun on a clean rebuilt HEAD.
-      No execution code was changed.
-- [ ] LEGACY-CPU-1..VALID-1 Execute the linked plan in order: dispatch/profile truth,
-      measured AVX2/AVX512-no-VNNI and dotprod/NEON baselines, one kernel family per A/B,
-      then backend-aware v2 policy. Do not infer legacy capacity from VNNI/AMX/KleidiAI
-      results.
-- [ ] LEGACY-X86-1 AVX2 INT8 GEMV candidate: the opt-in
-      `QWEN_AVX2_INT8_GEMV=1` signed-widening dot path is IMPLEMENTED and the existing
-      AVX2 FMA GEMV remains the default. Dispatch/census names the candidate precisely and
-      self-test coverage includes signed extremes and a non-multiple-of-32 tail. Structural
-      x86_64/AVX2 compilation passed; runtime PARITY VERIFIED, PERFORMANCE VERIFIED and
-      DEFAULT/PROMOTED remain NO until a real AVX2 host executes the adversarial self-test
-      and complete-call A/B. Detail: `.work/legacy-cpu-v2-audit-20260916.md`.
-- [ ] LEGACY-X86-2 AVX2 Q4 B1 GEMV candidate: the opt-in
-      `QWEN_AVX2_Q4_GEMV=1` path uses the Q4_0 nibble/correction contract with a
-      non-saturating-safe Q4×signed-activation dot and keeps the existing FMA path
-      as default. Dispatch/census and adversarial two-block/output-tail tests are
-      present; runtime PARITY/PERFORMANCE VERIFIED and DEFAULT/PROMOTED remain NO
-      until a real AVX2 host runs the candidate and complete-call A/B.
-- [ ] LEGACY-ARM-1 SDOT B>1 candidate: `QWEN_INT8_SDOT_MM=1` remains opt-in and now
-      has an explicit `arm-sdot-matmat` census leaf. IMPLEMENTED and M1 parity verified;
-      the first M1 microbench is negative (B2/B4/B8 SDOT matmat loses to B×SDOT GEMV),
-      so it is not promoted. Keep the path for other shapes/hosts and do not conflate
-      kernel B with server concurrency C. KAI dotprod/i8mm separation remains separate.
-- [ ] LEGACY-ARM-1b KAI dotprod/i8mm split: **BLOCKED BY PACK CONTRACT**. The vendored
-      KAI source has dotprod GEMV (and some dotprod GEMM) separately from i8mm, but the
-      Makefile/build guard and `qwen_kleidi_register_q4/i8()` currently require the
-      i8mm pack metadata. Relaxing the CPU boolean would risk executing a dotprod runner
-      on an i8mm-packed RHS, so no unsafe partial split was made. Detail and exact source
-      evidence: `.work/legacy-cpu-v2-audit-20260916.md` §16.
-- [ ] LEGACY-X86-DECODER-1 decoder INT8 feasibility: **DESIGN/AUDIT COMPLETE, CODE NOT
-      STARTED**. AVX2 and AVX-512-no-VNNI are excluded by `qwen_sd_int8_available()`;
-      the required panel quantization/conv/streaming backend is materially larger than
-      the new GEMV primitive. Keep f32/BLAS default and measure decoder shapes before
-      implementing. Detail: addendum §17.
-- [ ] LEGACY-X86-3 AVX-512-no-VNNI: **DESIGN SCREEN COMPLETE, NO NEW KERNEL**. The build
-      can use/report the AVX2 legacy candidates; no dedicated 512-bit emulation is added
-      until hardware shows a complete-call win after frequency/downclock measurement.
-      Detail: addendum §18.
-- [x] LEGACY-CPU-SCREEN fast qualification harness: add one model-free command that saves
-      topology, flags, source/build identity, caps, dispatch, self-test, bandwidth and
-      legacy candidate A/B output without mixing physical-core and SMT modes. Keep all
-      candidates opt-in and performance status UNVERIFIED until a target host runs it.
-      **IMPLEMENTED** as `make legacy-cpu-screen`; use separate `LEGACY_SCREEN_MODE=physical`
-      and `LEGACY_SCREEN_MODE=smt` output directories. First cloud command and manifest
-      contract: `.work/legacy-cpu-v2-audit-20260916.md` §19.
-- [x] LEGACY-CPU-AMD-MILAN GCP AVX2 screen: EPYC 7B13, 8 physical cores, SMT off, no
-      AVX-512/VNNI. Doctor measured 61.55 GB/s host read and 47.1 GB/s 8T engine GEMV;
-      simultaneous 2x4 and 4x2 retained near-linear aggregate scaling with only 1.08x/
-      1.10x per-worker slowdown, unlike Graviton5. AVX2 INT8 candidate dispatch and parity
-      passed but complete 28-layer performance was negative (82.52 ms vs 25.89 ms FMA),
-      so it remains opt-in/default-off. Q4 candidate dispatch/parity passed; performance
-      remains unverified. Detail: addendum §21.
-- [x] LEGACY-CPU-AMD-MILAN-V2-SCREEN: the 0.6B C1 two-minute cross-v2 flag bundle reduced
-      TTFA p95 1667->1034 ms and safe-start p95 2175->1613 ms, but worsened STREAM p95
-      0.888->0.988 and introduced 10% stall@250/@500 versus the same-duration control.
-      Classification: PARTIAL, unqualified and not promoted. Exact environment and raw
-      KPI comparison: `configs/perf/gcp-milan-8c-avx2-v2-cross-screen.json` and audit §22.
-
-### MAXIMUM PRIORITY — P0 sustained closed-loop soak regression — detail: `.work/arm-sustained-soak-regression-20260913.md`
-
-This is the current serving blocker before any new headline concurrency claim. Keep the
-benchmark families separate: TRUE-WAVE / parallel capacity, sustained closed-loop capacity,
-and realistic arrival-load capacity (for example POISSON). A true-wave result is never a
-sustained qualification.
-
-- [x] ARM-SOAK-0 Reproduce and classify the regression (2026-09-13): C6/C7/C8 mini-soaks
-      reproduce it in roughly 2–5 minutes; zero crashes, rejects, request timeouts and
-      obvious functional failures, but STREAM_RTF p95 is around/above 1, safe-start rises,
-      and stall@250/@500 becomes material. The baseline does not show systematic
-      window-by-window growth; memory, threads, FDs and scratch remain stable. Long STAGE
-      iterations are 271–364 ms and the problematic samples contain roughly 171–196 ms of
-      admission/prefill while decoder time is negligible. This is currently a
-      serving/scheduling/QoS problem, not a proven allocator leak.
-- [x] ARM-SOAK-0a Prefill-helper A/B: control vs `QWEN_PREFILL_HELPER=1`, same Arm v2
-      all-on C8/4x8 1.7B closed-loop run. The helper removed inline prefill from STAGE but
-      worsened STREAM p95 `1.041 -> 1.098`, safe-start p95 `717 -> 1129 ms`, stall@250
-      `20.1% -> 46.8%` and stall@500 `2.8% -> 10.1%`; errors/rejects/timeouts stayed
-      `0/0/0`. **REJECTED** as a treatment; the broader admission/prefill resource-
-      interference hypothesis is **PARTIALLY CONFIRMED**, because the helper still uses
-      the shared engine pool and adds contention. Keep helper default-off.
-- [x] ARM-SOAK-1 **P0-A playback-first admission guard** (2026-09-13): implemented as a
-      reversible `QWEN_ADMISSION_GUARD` policy in the continuous batched lane and tested
-      at the same all-on C8 closed-loop point. With a 400 ms ready-audio target, control →
-      guard changed STREAM_RTF p95 `1.061 -> 1.053`, stall@250 `25.5% -> 13.8%`, but
-      stall@500 `4.7% -> 6.5%`, safe-start p95 `776 -> 3066 ms`, TTFA p95 `241 ->
-      2805 ms`, and completed requests `173 -> 147`; errors/rejects/timeouts stayed
-      `0/0/0`, with stable threads/RSS/FDs. The guard recorded 111 deferred admissions
-      versus 87 immediate admissions; defer p50 was roughly 1.0–1.6 s per worker, p95
-      2.8–3.0 s, and the largest observed defer was 19.4 s. **PARTIALLY CONFIRMED**:
-      it reduces short playback gaps, but the current policy over-protects by making
-      fresh admission latency and throughput unacceptable, while the 500 ms tail remains
-      unsafe. Do not promote this target or start slicing yet; tune/retest the admission
-      decision as the next P0 experiment. The guard is intentionally limited to the
-      continuous batched queue; `JOB_SINGLE` is not covered by this A/B.
-- [x] ARM-SOAK-2 **P0-B cooperative prefill slices** (2026-09-13): the existing
-      token-range path was exercised at `QWEN_PREFILL_SLICE=24` and `48` on the same C8
-      setup, with `[ADMSLICE]` proof in both runs. It did not provide bounded playback
-      occupancy: nonzero `prefill_ms` was invariant at about `83.5/96.6 ms` p50/p95 for
-      24 and `82.4/96.7 ms` for 48; STREAM/safe-start/stall tails did not improve enough
-      to offset the cost. **REJECTED for playback protection in this configuration**;
-      do not test 72. The next blocker is the source of the approximately 80–100 ms
-      non-preemptible floor (kernel/layer/setup granularity), to be located before any
-      finer-grained preemption or genuine resource-isolation A/B.
-- [x] ARM-SOAK-2a **P0-B finer prefill checkpoint**: the short component trace found no
-      single 90 ms kernel. A 28-layer range is serial and non-yielding: per-layer total
-      `2.92/3.29 ms` p50/p95, range total `83.24/88.43 ms`, setup/finalize approximately
-      zero. The layer-level checkpoint is implemented behind `QWEN_PREFILL_LAYER_SLICE`
-      and the prescribed C8 sweep ran with token slice/guard/helper off on the same new
-      binary. Occupancy scaled as intended: baseline `84.9/119.5 ms`, layer 1 single-
-      digit (sampled ~3 ms), layer 2 `5.9/10.6 ms`, layer 4 `11.7/20.1 ms` nonzero
-      `prefill_ms` p50/p95. Results were:
-
-      | layer group | TTFA p95 | safe-start p95 | STREAM p95 | stall@250 | stall@500 | completed |
-      |---:|---:|---:|---:|---:|---:|---:|
-      | 0 (baseline) | 223 ms | 846 ms | 1.049 | 30.4% | 6.3% | 79 |
-      | 1 | 2460 ms | 3380 ms | 1.105 | 25.8% | 11.3% | 62 |
-      | 2 | 1208 ms | 2079 ms | 1.076 | **11.8%** | **2.9%** | 68 |
-      | 4 | **757 ms** | **1872 ms** | 1.131 | 22.9% | 11.4% | 70 |
-
-      All points had zero errors/rejects/timeouts. **PARTIALLY CONFIRMED**: true layer
-      checkpoints remove the ~85 ms non-preemptible floor and layer=2 materially protects
-      playback, but the one-pending-admission design turns that protection into admission
-      starvation; no point is promoted as the production default. Do not micro-tune 3/5/6
-      layers. Next discriminator is genuine admission/playback resource isolation (or an
-      equivalent bounded admission policy) rather than another token/layer sweep.
-- [ ] ARM-SOAK-3 **P0-C explicit temporal/QoS budget**: cap admission wall time and return
-      control to active generation when the playback budget is at risk; start from the
-      layer=2 checkpoint, not the rejected token-range slice.
-- [x] ARM-SOAK-4 **P1 resource isolation** (2026-09-13): tested a genuine per-worker CPU
-      partition on Graviton5 C8/4x8, with layer=2 and no shared-pool helper. The treatment
-      reserved CPU 7/15/23/31 for admission and left engine masks 0-6/8-14/16-22/24-30;
-      helper binding was observed on each reserved CPU, OpenBLAS stayed at one thread and
-      the resource sample stayed at 216 threads with no RSS/FD growth. It did not retain
-      the layer=2 playback benefit: control vs isolate-1CPU STREAM p95 `1.070 -> 1.156`,
-      stall@250 `31.4% -> 30.3%`, stall@500 `8.6% -> 24.4%`, safe-start p95
-      `2.60 -> 3.63 s`, while TTFA p95 improved `1.39 -> 0.78 s`; completed requests
-      were `51 -> 49`, with zero errors/rejects/timeouts in both. Actual 2-layer groups
-      were initially 7-14 ms but under sustained load commonly 31-47 ms, with full
-      14-group prefill about 425-580 ms on the one reserved CPU. **REJECTED for this
-      1-CPU partition**: isolation was real, but it did not protect playback and is
-      underprovisioned for admission. Do not call the architecture fixed; no 2-CPU
-      follow-up is justified because continuity did not improve strongly.
-- [x] ARM-SOAK-4a **Graviton5 topology/bandwidth discriminator** (2026-09-13): the 32-core
-      Neoverse-V3 guest exposes one socket, one NUMA node and one 48 MiB L3 shared by
-      CPUs 0-31. Existing `membw` measured full-host read 13.1/102.3/159.0/160.8 GB/s
-      at 1/8/16/32 threads. The real Talker INT8 GEMV measured 1x8 at 8.82 ms/159.9
-      GB/s, 2x8 simultaneously at 19.82--22.19 ms/63.5--71.1 GB/s per worker, and
-      4x8 at 38.56--40.10 ms/35.1--36.5 GB/s per worker (aggregate ~143.4 GB/s).
-      The same 4x8 spread layout reached ~152.7 GB/s, only ~6.5% better. The follow-up
-      measured isolated 1x6/1x16 references and simultaneous 2x16 at 17.25--19.07 ms,
-      73.9--81.7 GB/s per worker, **155.6 GB/s aggregate**, plus 4x6 at 35.45--37.06 ms,
-      38.0--39.8 GB/s per worker, **155.4 GB/s aggregate**. Thus 2x16 is the next serving
-      baseline (4x6 is a close spare-core fallback); 1x32 is only a single-worker point.
-      **CONFIRMED**: cross-worker shared-cache/memory/fabric contention is material; 4x8
-      is not four independent Turin-like bandwidth domains. No production soak or
-      scheduler change was started; next is a short C6/C8 closed-loop check on 2x16.
-- [x] ARM-SOAK-4b **Graviton5 serving-width/affinity sweep** (2026-09-13): reused the
-      same five-repetition `roof_matvec` primitive, with isolated references 1x6
-      `10.50 ms/134.2 GB/s` and 1x16 `10.52 ms/134.0 GB/s`. Simultaneous 2x16 reached
-      `17.25--19.07 ms`, `73.9--81.7 GB/s` per worker and `155.6 GB/s` aggregate;
-      4x6 reached `35.45--37.06 ms`, `38.0--39.8 GB/s` per worker and `155.4 GB/s`;
-      contiguous 4x8 was `143.4 GB/s`, spread 4x8 `152.7 GB/s`. **2x16 wins** the
-      concurrent shape screen; 4x6 is a close spare-core fallback. Next: short C6/C8
-      closed-loop validation on 2x16, with no admission-policy tuning before that check.
-- [x] ARM-SOAK-4c **Axion cross-host GEMV control** (2026-09-13): the 32-core Neoverse-V2
-      Axion guest also exposes one NUMA node and one shared L3, but the same kernel gives
-      1x8 `8.98 ms/156.9 GB/s`, 2x8 `10.22--10.23 ms/137.8--137.9 GB/s` per worker
-      (`275.7 GB/s` aggregate), and 4x8 `15.97--16.49 ms/85.5--88.3 GB/s` per worker
-      (`347.8 GB/s` aggregate). Per-worker slowdown is only ~1.81x at 4x8 versus ~4.45x
-      on Graviton5, whose aggregate does not scale. **GRAVITON5-SPECIFIC CONTENTION
-      STRONGLY CONFIRMED**; no Axion engine soak was run. Keep 2x16 as the next G5
-      serving candidate, but treat the fabric/cache issue as a hardware-shape constraint
-      that scheduler tuning alone cannot remove.
-- [x] ARM-SOAK-4d **Graviton4 cross-host GEMV control** (2026-09-13): the AWS spot guest
-      reports 32 Neoverse-V2 cores, one NUMA node and one 36 MiB shared L3. The same
-      unchanged benchmark measured 1x8 `8.26 ms/170.7 GB/s`, 2x8 `9.65--10.07 ms` and
-      `139.9--146.1 GB/s` per worker (`286.0 GB/s` aggregate), and 4x8 `12.91--12.99 ms`
-      and `108.5--109.2 GB/s` per worker (`435.1 GB/s` aggregate). Per-worker slowdown is
-      ~1.57x at 4x8 versus ~4.45x on Graviton5. **GRAVITON5-SPECIFIC CONTENTION STRONGLY
-      CONFIRMED by two ARM controls**; no G4 engine soak or spread sweep was run.
-- [x] ARM-SOAK-4e **Graviton4 short closed-loop curiosity screen** (2026-09-13): with
-      the explicit Arm-v2 all-on environment and unchanged 4x8 server, 1.7B/C8 completed
-      131 requests in 2 minutes with STREAM p95 `0.680`, safe-start p95 `230 ms`,
-      stall@250/500 `0%/0%`, and zero errors/rejects/timeouts (**PASS**). The 0.6B/C16
-      screen completed 128 with zero functional errors but STREAM p95 `1.084`, safe-start
-      p95 `1.876 s`, stall@250/500 `46.8%/14.7%` (**FAIL playback**). These are diagnostic
-      screens only, not G4 qualifications or capacity promotion.
-- [ ] ARM-SOAK-8 **P0 decoder-lane lifecycle/QoS** (2026-09-14): on the scalable 4x8
-      Arm control, C10 reaches the playback knee at B=3. Synchronous mailbox waiting was
-      causal; bounded async removes that wait but leaves pause/resume tails. The first
-      default-off urgency ordering A/B (`QWEN_SD_SCHED=urgency`) retained every runnable
-      slot and only changed decoder enqueue order; it was **REJECTED** (STREAM p95 1.077,
-      stall@250/500 14.0%/6.1%, TTFA p95 335 ms). Trace shows repeated slot pause/resume
-      and mostly singleton decoder groups, not a permanently lost slot. Active baseline
-      diagnostic: event-only READY→ENQUEUE→START→DONE→COMPLETE_SEEN→RESUME→NEXT_PROGRESS
-      timing attributes the residual tail to lane queue/dispatch plus paired cohort work:
-      B3 enqueue→start p95 `213.77 ms` vs B2 `55.56 ms`; pair compute p95 `272.05 ms`
-      vs singleton `86.33 ms`; completion-seen and resume-progress stay ~35–40 ms p95.
-      **CONFIRMED**: do not tune urgency or completion polling. Singleton-only (`MULTISLOT=1`)
-      kept all controls fixed and moved B3 enqueue→start p95 to `135.13 ms`, B3 compute p95
-      to `83.49 ms`, STREAM p95 `1.058→0.829`, stall@250/500 `10.0%/3.6%→0%/0%`,
-      TTFA p95 `312→159 ms`, safe-start p95 `1049→415 ms`, completions `120→126`.
-      Paired cohorts are causally poisoning B3. Static audit of the two decoder paths plus
-      an isolated `decode_quantum_bench` A/B then closed the "why": `ng>1` selects a second,
-      separately written decoder implementation, and on Graviton4 at the product quantum a
-      cohort costs **1.63x two sequential singletons** (chunk 4: group 1 `40.6 ms`, group 2
-      `81.0 ms` at `MULTISLOT=0` vs `132.1 ms` at `MULTISLOT=2`; group 1 identical across
-      arms). The one clearly accidental difference found statically -- the ragged path never
-      sets `g_sd_arena`, so ~40 multi-MB `posix_memalign`/`free` cycles per call replace the
-      per-slot bump arena -- was **REFUTED** by a zero-code allocator arm (0% at chunk 4,
-      ~5% at chunk 8). **CONFIRMED: the pair is intrinsically expensive on the Arm ragged
-      path, and it is a pure loss at B=2 too, at zero queue pressure.** Option B is closed;
-      no ragged-kernel project is justified by this evidence. Next is option A, dynamic
-      cohort admission, implemented default-off as `QWEN_SD_COHORT_MAX_B` (cohorts only
-      while `n_active <= N`, decided once per frame turn).
-      **A/B RESULT (2026-09-14), KEEP default-off:** at C10 the cap removed the knee --
-      STREAM p95 `1.035 -> 0.847`, safe-start p95 `1032 -> 504 ms`, stall@250/@500
-      `11%/2% -> 0%/0%`, TTFA p95 flat `301.7 -> 307.8 ms`, 0/0/0 errors, resources PASS;
-      the trace proves the mechanism fired and nothing else moved (B=3 cohorts `460 -> 0`,
-      B=2 cohorts preserved `32 -> 108`, B=3 enqueue->start p95 `213.59 -> 134.93 ms`,
-      reproducing the singleton-only arm's 135.13). Cost: completions `133 -> 122` (~-5%
-      throughput). At C8 it is correctly **inert** (every delta inside single-window noise;
-      per-worker occupancy there is essentially B=2, so only 8 B=3 cohorts existed to cap).
-      NOT promoted: one measured window per arm, `SOAK RESULT PARTIAL`, no per-class KPI,
-      no audio gate. **Open decision, do not skip to a slack formula:** microbench and the
-      C8 server trace both say a cohort loses at B=2 too (B=2 pair compute p95 ~252-264 ms
-      vs singleton ~86-89 ms), so the next one-change A/B is `COHORT_MAX_B=1` vs `=2`; if
-      1 wins, the cohort mechanism has no operating point on the Arm ragged path and should
-      be retired there rather than tuned.
-      **Architectural review (2026-09-14, G4 box, no code change):** three independent
-      decompositions agree the penalty is one kernel, not the ragged structure -- cost map
-      puts 100% of the +49.9 ms in `conv_stack`; `QWEN_SD_PHASE` puts +42.5 ms in res1 and
-      +7.1 ms in res2 (the two `qwen_conv1d_int8_v2_multi` call sites) with convt/transformer
-      at parity or better; `objdump` shows `sd_dconv_multi_worker` spilling its runtime-indexed
-      accumulators (40 q-stores / 33 q-loads around 30 `sdot`) where the single kernel has 0.
-      The penalty is ~1.6x sequential in **every** regime (chunk 1/2/4/8: 1.59/1.65/1.63/1.71;
-      S=3: 1.61/1.67); the mechanism's sharing ceiling from weight sizes and measured
-      bandwidth is a few ms per pair on G4 or G5; the DL-4 unit-cost gate was never recorded
-      as passed and Turin never isolated the cohort. Eight attempts to falsify retirement all
-      failed. **Answer: no server condition where ng>1 wins; one concrete fix exists (S==2
-      named-accumulator specialisation, exact by self-test) but its best case is parity, so it
-      is not a reason to keep cohorts. Decide with `COHORT_MAX_B=1` vs `=2` at C8 then C10
-      (pre-registered rule in the .work file; a null result counts against the cohort); if no
-      win above noise, express retirement as `QWEN_SD_MULTISLOT=0` in the Arm profile.**
-      x86/Turin untouched (`MULTISLOT=2` stays); the VNNI twin shares the array structure
-      and deserves the same three-cell microbench when a Turin box is next rented.
-      **Decision A/B run (2026-09-14): `COHORT_MAX_B=2` vs `=1`, C8 then C10, same binary.**
-      Mechanism proven (B=2 cohorts 82/56 in cap 2, 0 in cap 1; pair compute p95 ~260-270 ms
-      vs singleton ~87 ms). Pre-registered rule NOT met: STREAM p95 C8 0.625 vs **0.612**
-      (cap 1 better), C10 0.831 vs 0.835 (tie); stalls 0/0 everywhere; completions +4 cap 2
-      at C8, +5 cap 1 at C10; TTFA/safe-start deltas ~20-45 ms flip sign between points --
-      noise at the predicted ~1.5% effect size. **VERDICT: RETIRE cohorts on Arm.**
-      Recommended expression, NOT applied yet (qualification-level): `QWEN_SD_MULTISLOT=0` in
-      the Arm all-on profile; `COHORT_MAX_B` stays a default-off diagnostic; Turin/VNNI
-      untouched. Next: multi-window soak + per-class KPI on that profile before promotion.
-      **PRODUCTION DECISION APPLIED + QUALIFIED (2026-09-15).** `QWEN_SD_MULTISLOT` set to `0`
-      in `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json` only (Turin/Axion/arm-product
-      untouched; `COHORT_MAX_B` stays a default-off diagnostic in no profile). Full qualification
-      on the G4 box, profile as committed: caps/self-test/dispatch-map/strict preflight PASS
-      (`multislot_active:false`, `feature_status.multislot:"VALID FALLBACK"`,
-      `per-item-int8-dotprod`); **C8 30-min SOAK PASS** (3805 done, 0/0/0, STREAM p95 0.562,
-      safe-start p95 179 ms, stall@250/@500 0%/0%, per-class + latency + resource PASS) and
-      **C10 30-min SOAK PASS** (3892 done, 0/0/0, STREAM p95 0.805, safe-start p95 361 ms,
-      stall@250/@500 0%/0%, all KPI PASS). Paired against the previous private measurement
-      generation on the same host/commit with cohorts ON: C8 STREAM p95 `0.801 -> 0.562`, completions +13.9%;
-      **C10 `OVER LIMIT -> PASS`**, STREAM p95 `1.04 -> 0.805`, safe-start `723 -> 361 ms`,
-      stall@250 `19.3% -> 0%`, completions +19.9%. **0.6B sustained recommendation moves
-      C8 -> C10 (+25% density).** Only TTFA p95 at C8 regressed (+25.6 ms); at C10 it improved
-      96 ms. No regression attributable to singleton decode, so cohort tuning stays closed.
-      Detail: `.work/arm-sustained-soak-regression-20260913.md`.
-- [x] ARM-SOAK-11 **`make soak-fast` — adaptive knee SCREEN in the suite** (2026-09-15):
-      `tests/soak_fast.py` drives the canonical `serve_soak.py` at 30 s warm-up + 2x90 s per
-      point, classifies CLEAR/HEALTHY/KNEE against a pre-fixed rule, stops at the knee and
-      names the point worth a 30-minute run; `screen_summary.json` carries
-      `"is_qualification": false`. Registered in `docs/BENCHMARKING.md` (tool table + new step
-      **H2**). Screen-vs-soak calibration is OPEN: the one direct same-point pair (Axion 1.7B
-      C12 cohorts-ON, 30-min `0.67` vs 180 s screen `0.653`) says screens are approximately
-      faithful; the G4 "one step optimistic" reading was interpolated, not measured. Pick the
-      highest CLEAR anyway — it costs nothing. **RESOLVED 2026-09-15: screens are faithful.**
-      Same-point pairs: G4 0.6B C12 screen `0.829` vs 30-min `0.8364`; G4 1.7B C10 screen
-      `0.830` vs 30-min `0.8307`; Axion 1.7B C12 screen `0.653` vs previous 30-min `0.67`.
-      The "one step optimistic" reading compared different points and is withdrawn.
-- [x] ARM-SOAK-12 **G4 knee screens** (2026-09-15, production profile `MULTISLOT=0`):
-      0.6B C11 CLEAR `0.803`, **C12 CLEAR `0.829`**, C13 **KNEE `1.013`**; 1.7B C8 CLEAR
-      `0.698`, **C10 CLEAR `0.830`**, C11 HEALTHY `0.829`, C12 HEALTHY `0.842`. Canonical
-      30-minute qualification launched at **0.6B C12** and **1.7B C10**. Screens are not
-      qualifications and are not reportable operating points.
-- [x] ARM-SOAK-13 **G4 v2 canonical qualification — both points PASS** (2026-09-15):
-      **0.6B C12** (3962 done, 0/0/0, STREAM p95 `0.836`, TTFA p95 198 ms, safe-start p95
-      356 ms, stall@250/@500 `0%/0%`) and **1.7B C10** (3665 done, 0/0/0, STREAM p95 `0.831`,
-      TTFA p95 207 ms, safe-start p95 364 ms, stall@250/@500 `0%/0%`); latency, per-class (5)
-      and resource KPI PASS on both, threads flat at 92. Operating points move **C8/C8 ->
-      0.6B C12 (+50%) / 1.7B C10 (+25%)**. Caveat to carry into any report: `stall@100` is
-      22-23% at these densities, so the points are safe for a >= 250 ms client prebuffer
-      (consistent with safe-start p95 356/364 ms), not for a 100 ms one.
-- [x] ARM-SOAK-9 **CLOSING ITEM A — DONE (2026-09-15): qualified operating point published into
-      the G4 profile.** `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json`:
-      `objective.preferred_concurrency` `"unspecified" -> "0.6B C12; 1.7B C10 (per checkpoint
-      size)"`, `concurrency_range` `[1,16] -> [1,12]`, a new
-      `objective.preferred_concurrency_evidence` carrying both 30-minute soak results and the
-      >= 250 ms prebuffer assumption, and the stale `parity.notes` sentence ("does not promote a
-      concurrency point before the host-specific audio and soak gates pass") replaced by the
-      promoted points. Original item text:
-      After the 30-minute canonical qualifications at the screened winning points, update
-      `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json`: `profile.objective.preferred_concurrency`
-      (today `"unspecified"`) and the `server` block / notes must carry the qualified point per
-      model size, with the soak evidence path in the `why`. Today the file still reads "does not
-      promote a concurrency point before the host-specific audio and soak gates pass" — those
-      gates have now passed for 0.6B C8 and C10, so that sentence has to be replaced by the real
-      number rather than left stale. Do not promote a point that only has a SCREEN behind it.
-- [x] ARM-SOAK-14 **Axion v2 qualification — both points PASS** (2026-09-15): **1.7B C16**
-      (5207 done, 0/0/0, STREAM p95 `0.789`, TTFA p95 175 ms, safe-start p95 332 ms,
-      stall@250/@500 `0%/0%`) and **0.6B C16** (5281 done, 0/0/0, STREAM p95 `0.845`, TTFA p95
-      195 ms, safe-start p95 371 ms, `0%/0%`); all KPI PASS, threads flat at 216. 1.7B moves
-      **C12 -> C16 (+33%)**; 0.6B keeps C16 but gains the sustained gate it never had (the
-      previous generation recommended it on true-wave evidence alone). Knee at C18 for both.
-      Audio gate 12/12 `mel_corr 1.00000` against a cohort-ON control. **Attribution caveat:**
-      the paired screens say the cohort retirement alone is worth ~-17.5% safe-start / +4.6%
-      completions at 1.7B C12; most of the C12 -> C16 move is that the ladder had never been
-      walked past C12. Do not credit the flag with the whole jump.
-- [x] ARM-SOAK-10 **CLOSING ITEM B — DONE (2026-09-15).** Axion measured, not assumed: the
-      three-cell microbench gave `1.20x` (vs `1.63x` on Graviton4) and two paired serving
-      screens agreed, so `axion-c4a-highcpu32-0p6b-all-on.json` moved to `QWEN_SD_MULTISLOT=0`
-      with all three measurements recorded in its `why` and a `revert` condition. Every Arm
-      profile now ships the per-item decoder; `turin-c8a-32c-vnni-product` stays at `2` until
-      its own isolated microbench. Original item text:
-      Audit after the G4 retirement: `arm-product.json` **0**, `axion-16c-ttfa.json` **0**,
-      `aws-c8g-8xlarge-32c-arm-v2-all-on.json` **0** (retired 2026-09-14/15), and
-      **`axion-c4a-highcpu32-0p6b-all-on.json` is the only Arm profile still at `QWEN_SD_MULTISLOT=2`**.
-      x86 is out of scope: `turin-c8a-32c-vnni-product` stays `2` until its own isolated microbench.
-      Two independent reasons to expect the same verdict on Axion: the pathology is in the shared
-      Arm dotprod leaf (`sd_dconv_multi_worker` spills its runtime-indexed accumulators — 40 q-stores /
-      33 q-loads around 30 `sdot` versus 0 in the single-slot kernel), and `arm-product.json`'s own
-      `why` already records that its short 0.6B/1.7B 2-slot and 3-slot A/B was **2.8-3.9% slower**.
-      **Do not flip it blind.** The cheap discriminator is ~2 minutes on an Axion box:
-      `decode_quantum_bench` three cells (g1/c4 singleton, g2/c4 at `MULTISLOT=0` = two sequential
-      singletons, g2/c4 at `MULTISLOT=2` = ragged cohort) with the profile env applied correctly
-      — see the void-run warning above about the comma-joined `server-env` string. If it reproduces
-      the ~1.6x penalty, retire there too (`QWEN_SD_MULTISLOT=0`, the preflight-valid fallback) and
-      confirm with `make soak-fast` before any 30-minute run. Keep the flag, kernel and multi-slot
-      self-test cases in the tree either way.
-- [x] X86-COHORT-1 **ANSWERED 2026-09-15: the cohort loses on x86 too, but the change was NOT
-      made.** Fresh Zen5 Turin (EPYC 9R45, VNNI, no AMX), OSS checkpoints, English bank.
-      Microbench confirmed the prediction on a third host and a second ISA: chunk 4 gives
-      `24.1 / 47.6 / 65.0 ms` = **1.37x**, chunk 8 **1.41x**, sequential pair exactly linear.
-      So the penalty is the shared multi-kernel source shape, not the ISA. **But the serving
-      evidence is mixed**, unlike Arm: at 1.7B C12 retiring the cohort zeroes stall@250
-      (1.03% -> 0%) while STREAM p95 gets slightly worse (0.903 -> 0.923), and nothing on the
-      ladder reached CLEAR (every point 0.90-0.99 against 0.83 for the qualified Arm points).
-      **Owner's decision: stop.** `turin-c8a-32c-vnni-product` keeps `MULTISLOT=2` and its
-      C12/C20 recommendations. Note these screens used OSS checkpoints and an English bank,
-      not the customer workload, so they locate the knee for THIS workload and are **not**
-      evidence against the earlier x86 recommendations. Revisit only if the exact `S == 2`
-      named-accumulator kernel is written: x86 has the most per-call headroom left (1.37-1.41x).
-      **No x86 regression from the Arm parity work** — the other thing this run had to
-      establish. The Zen5 box was built from the same tree that carries every Arm change
-      (`--self-test` 0 failures, `check-isa` PASS on the 23-file VNNI+AMX compile pass, VNNI
-      resolved native in `--caps`), and with the cohort either ON or OFF the screened envelope
-      sits in the same region the earlier x86 report described. Nothing in the Arm campaign
-      moved x86 behaviour.
-      Detail: `.work/arm-sustained-soak-regression-20260913.md`. Original item text: The Arm campaign
-      retired `QWEN_SD_MULTISLOT` on four profiles after measuring a per-call loss; x86 still
-      ships `2` on `turin-c8a-32c-vnni-product` and that value rests on weaker evidence than
-      the Arm retirement now does. Two reasons to suspect it:
-      (a) the VNNI multi worker has the **same source structure** that costs Arm its margin —
-      `acc[3][4][2]` / `facc[3][4][2]` / `xv[3][2]` indexed by a runtime `S` and `mn`, where
-      the single-slot kernel uses named registers; on Arm `objdump` showed 40 q-stores /
-      33 q-loads around 30 `sdot` versus 0 loads in the single-slot twin.
-      (b) the Turin cohort was promoted from a **combined** lane+RES1_V2+cohort smoke, never
-      from an isolated arm; the DL-4 spec's own unit-cost gate (`conv_up` at 1 slot vs 2) is
-      not recorded as passed anywhere in `.work`.
-      Cost to answer: ~2 minutes. Recipe, exactly as used on both Arm hosts:
-      `tests/decode_quantum_bench.c` patched for one cell, three runs at chunk 4 with the
-      profile env applied as **separate assignments** (see the void-run warning: the profile
-      emits one comma-joined line and `env $BASE` silently sets a single malformed variable) —
-      g1/`MULTISLOT=2`, g2/`MULTISLOT=0` (two sequential singletons), g2/`MULTISLOT=2` (cohort).
-      If the cohort is >= the sequential pair, disassemble `sd_dconv_multi_worker`'s VNNI twin
-      to confirm the spill, then run `make soak-fast` on the Turin ladder before any 30-minute
-      soak. Arm found +50%/+25%/+33% of density this way; x86 may well have some too.
-      **Do not flip the Turin profile on the Arm result alone** — the Arm retirement itself was
-      only taken after this host's own microbench plus two paired serving screens.
-- [x] X86-COHORT-2 **CLOSED UNSTARTED 2026-09-15**: the ladder was walked far enough to see the
-      knee (1.7B OFF C16, 0.6B ON past C20) and the answer did not justify a 30-minute
-      qualification. Original item text: re-walk the Turin capacity ladder with
-      `make soak-fast` (the C12 gate has been chased for a long time at a fixed concurrency;
-      the Arm campaign showed the previous recommendation was simply below the knee on one
-      host and that the ladder had never been walked past it). Then qualify only the winning
-      point, and regenerate the x86 customer-facing numbers if they move.
-- [ ] ARM-SOAK-5 **P1 admission concurrency cap**: test max one concurrent admission/prefill,
-      accepting some fresh-request TTFA increase in exchange for existing-stream safety.
-- [ ] ARM-SOAK-6 **P1 cohort preservation**: measure active cohort size, phase skew and
-      batched-vs-per-item GEMM/GEMV behaviour; test bounded staggering only after the
-      playback-first guard evidence.
-- [ ] ARM-SOAK-7 **P2 allocation/churn audit**: inspect ragged temporaries and request
-      setup/teardown only after scheduling experiments; current evidence does not justify
-      a broad malloc/thread refactor.
-
-### P0 BLOCKER — `make test-all` does not pass on main: first request differs from the rest
-
-- [x] REPRO-1 **`test-serve-repro`: FIXED 2026-09-15.** Root cause was the cross-request
-      **delta-prefill** in `qwen_tts_generate()` (`qwen_tts.c:1515-1546`): the context keeps
-      `prev_input_embeds` and re-prefills only from the first position whose embedding differs,
-      reusing the KV rows of the common prefix. Causally sound but NOT bit-identical — the tail
-      is then computed in a shorter prefill with different GEMM tiling and accumulation order,
-      and over ~96 autoregressive frames that forks the trajectory.
-      **The test was accusing the wrong requests.** The CLI is the reference path and it matches
-      `r2`/`r3` at `mel_corr = 1.00000`, and `r1` at `0.92744` — so `r1` was the anomaly while
-      `test-serve-repro` used it as its baseline.
-      **The rule was not "the first request"** but *any request whose text differs from the
-      immediately preceding one*: with A, then B, then B, the first B is the divergent variant
-      and only the exact repeat is correct (an exact repeat matches the whole prefix, trips
-      `if (delta_start >= prefill_len) delta_start = 0` and recomputes in full).
-      **The batched server was never affected** — `qwen_tts_generate_batch()` already clears
-      `prev_prefill_len` per item (`qwen_tts.c:2091`), as do `generate_batch_multi` (`:2276`)
-      and compose (`qwen_tts_compose.c:291`). Production serving is batched + prefork, so the
-      qualified Arm/Axion/Turin operating points and every customer-facing number stand. The
-      defect was confined to the single-process `--serve` path (the default when `--batch-size`
-      is absent).
-      **Refuted along the way:** the prefix cache (flag provably applied, output byte-identical)
-      and the lazily built quantized weight packs (`QWEN_SD_INT8=0` and `QWEN_SD_RES1_V2=0` both
-      leave all three WAVs byte-identical, so they do not participate). `server_prewarm` is only
-      the first instance, not the cause: with `QWEN_NO_PREWARM=1` the A-then-B divergence
-      survives, so disabling the pre-warm would have been a cosmetic patch over a live bug.
-      **Fix:** `reset_request_state()` (`qwen_tts_server.c:908`) now clears
-      `ctx->prev_prefill_len`, so the single-process server agrees with the batched server and
-      with the CLI. Server-scoped; CLI and engine untouched. Gate goes from
-      `ndiff=118333 (81.094%)` to `ndiff=0 (0.000%)`.
-      Open follow-up on a GPU box: the fused-GPU guard at `qwen_tts.c:1529-1543` still forces
-      `delta_start = 0` only when steering is active, so a fused CUDA talker without steering
-      may still fork across requests. Detail: `.work/cuda-parity-track-20260915.md` §1.1.
-
-### P0 Metric truth — detail: `.work/professional-streaming-architecture.md` E1, E8, E11, E12
-
-- [x] MT-1 Receive-mark semantics audited; TTFB stamped independently of TTFA
-      (`header_to_audio_ms`); coalesced-read share reported per run — detail:
-      `.work/professional-streaming-architecture.md` E12.
-- [x] MT-2 Per-request `safe_play_start`, stall_rate/stall_ms @100/250/500/1000 ms,
-      max_gap; summaries in the wave and soak analyzers; `tests/test_playback_sim.py`.
-- [x] MT-3 Superseded readings corrected in `docs/serving/cpu-operations.md` section 5,
-      `docs/BENCHMARKING.md` sections 7-8, `ENGINEERING.md` section 9, AWS reference notes.
-- [x] MT-4 Runtime transport boundary: batched streams send the header before synthesis and
-      accepted sockets use `TCP_NODELAY`; server/client event ordering is proven on the
-      continuous path. Per-chunk flush tracing remains optional and client marks remain
-      client-observed. Detail: `.work/mt4-transport-boundary-20260907.md`.
-
-### P0 C12 preferred gate on the frozen Turin architecture (ladder paused after bounded falsifiers) — detail: `.work/c12-win-track-20260909.md`, checkpoint: `.work/c12-win-checkpoint-20260909.md`
-
-Goal: sustain C12 with the full streaming contract AND STREAM_RTF p95 <= 0.90 including
-the short/conversational soak tails (today waves 0.82-0.85, soak pooled 0.912, short
-0.959, conversational 0.914; cadence already good). One mechanism at a time against the
-frozen `turin-c8a-32c-vnni-product` control; lever of record: decoder residency down ->
-CP-overlap share down -> sustained tail down. Codex owns implementation; no push unless asked.
-
-      Review 2026-09-09 (`.work/c12-architecture-review-20260909.md`, read-only): the
-      remaining unit is half f32 BLAS (transformer/convnext/init ~12 ms + convt 8.6 ms,
-      ~330 MB f32 weights per unit, excluded from int8 by construction) plus ~8 ms of
-      copy/calloc glue; closed-loop admission (inline prefill) is the likely short-class
-      tail; width is bounded out; phase-aware placement cannot help at sustained B3.
-- [x] C12-WIN-1 Zero-code discriminators (2026-09-09): helper is NO-GO as an implementation
-      (TTFA p95 172 -> 683 ms, safe-start 417 -> 922 ms, stall@250 appears) but it CONFIRMS
-      the mechanism: with prefill off the loop the short class drops 0.966 -> 0.915 and
-      pooled 0.923 -> 0.915 — inline admission is the short tail, worth ~0.05; fixed B3
-      shows 54.9% decoder-overlap wall and CP 22.2 -> 36.5 ms median; spin 4096/16384 does
-      not beat the 65536 control. Decoder unit 49.2 ms by cost map (conv_stack 43.3,
-      transformer 5.2). Detail: `.work/c12-win-step1-3-20260909.md`.
-- [x] C12-WIN-1a Pre-upsample BF16 diagnostic (2026-09-09): persistent BF16 weights and
-      matmat path implemented/default-off. The bounded Turin server screen moved modestly
-      (STREAM p95 .842 -> .825), but the same-generation paired audio gate failed
-      (`mel_corr=.97890 < .98`) and the non-clean B3 diagnostic did not show lower decoder
-      residency or CP overlap cost. Keep BF16 default-off; detail:
-      `.work/c12-win-bf16-preup-20260909.md`.
-- [x] C12-WIN-2 Decoder-residency falsifiers, first round (2026-09-09): BF16 pre-up,
-      ConvT one-GEMM, allocation-only glue, and VNNI RES1_V2 split-input were each
-      isolated; no candidate earned a serving A/B. These are IMPLEMENTATION verdicts:
-      the tested BF16 arm covered the transformer only (5 ms of the unit) with bf16
-      activations; the ConvT arm used a zero-expanded input panel (k× the FLOPs), not the
-      proposed one-GEMM-per-layer on the un-expanded input; the glue arms were two pieces
-      run separately. Untested: weight-only bf16/int8 for the conv_stack f32 weights
-      (convnext pw, initial conv, convt ≈ 190 MB/unit) and the combined glue removal.
-      Forensic audit: `.work/c12-win-forensic-audit-20260909.md`.
-- [x] C12-WIN-2a ConvT one-GEMM falsifier (2026-09-09): exact decoder batch parity passed,
-      but the expanded f32 panel made the treatment 14–32% slower across B1–B4/chunk 1–8.
-      Rejected and reverted; no server A/B. Detail: `.work/c12-win-convt-one-gemm-20260909.md`.
-- [x] C12-WIN-2b VNNI glue/preparation falsifiers (2026-09-09): allocation-only and
-      split-input V2 were exact/parity-safe where tested but slower or neutral; both
-      were reverted. The remaining alternative geometries are not justified by the
-      current evidence. Detail: `.work/c12-win-glue-vnni-20260909.md`.
-- [x] C12-WIN-10 Admission slicing (prefill as resumable token-range slices inside the frame
-      loop). Spec: `.work/c12-win-admission-slicing-implementation.md`; local evidence
-      `.work/c12-win-admission-slicing-20260910.md`. CLOSED 2026-09-10 on Turin: state parity
-      CORRECT, serving behaviour a severe REGRESSION, flag stays default-off and unpromoted.
-      Sliced-state parity was proven exact for every partition without a one-token slice, and
-      two engine defects were found and fixed while proving it. The server A/B says the
-      mechanism must not be promoted. Closed-loop C12, 10 minutes per arm, frozen profile,
-      one variable: completed 1294 -> 721 (-44 %), TTFA p95 183 -> 1574 ms, STREAM_RTF p95
-      0.922 -> 4.609, and 7 server request timeouts against 0 on the control. It made the
-      established-stream interference it was built to remove about five times worse.
-      Note what it did NOT test: all four workers report mean_slices=1.00, so with a warm
-      prefix cache the admission prefill is ~1 new token (seq_len=10, prefix=9) and nothing
-      was ever actually split. The damage therefore comes from the sliced-admission PATH, not
-      from slicing -- most likely the one-admission-per-frame-iteration break stealing
-      iterations from running streams. A first A/B attempt with the true-wave arrival model
-      was void and is not cited: with a positive flag and n_active==0 the code takes the whole
-      prefill in one slice by design, so a wave that releases every request into an idle
-      engine cannot reach the mechanism at all. Any retry needs a redesign of the admission
-      path first, plus a cold-prefix workload so real multi-slice prefills occur.
-- [x] C12-WIN-11 A Conv-stack traffic: ConvT as ONE un-expanded GEMM per layer with a fused
-      two-tap carry/bias epilogue. Spec: `.work/c12-win-conv-stack-implementation.md`.
-      CLOSED 2026-09-10 on Turin: implementation CORRECT, effect NULL, flag stays default-off.
-      Correctness passes on x86 -- self-test 0 failures with the convt_stack cases at 3e-8..1e-7
-      against a 1e-5 contract, dispatch verified ON/OFF, CLI audio mel-corr 0.99962 at identical
-      duration. The microbench (1.7B, 4 threads, taskset 4-7, B1-B4, 9 warm reps) shows no
-      effect at the product quantum: chunk-4 deltas B1 -0.20, B2 -0.70, B3 +0.70, B4 +1.30 ms,
-      and 16 of 32 cells faster -- a coin flip. A control-vs-control run of the SAME arm on the
-      same binary in the same minutes measured a noise floor of -0.40..+2.70 ms at chunk 4 and
-      up to 32 ms at chunk 16, so every one of those deltas is inside the noise. Note for any
-      future rung: the >= 2 ms gate this spec asked for is BELOW this harness's own resolution
-      at B3/B4 (noise alone is +2.7 ms there); a rung that needs to resolve 2 ms needs paired
-      replicates, not a single run of each arm.
-- [x] C12-WIN-12 VNNI glue as one combined change: out-of-place snake1, V2 kernel with
-      (tail, tail_cols) context and residual epilogue, plain allocs, ownership transfer.
-      Spec: `.work/c12-win-vnni-glue-implementation.md`. CLOSED 2026-09-10 on Turin:
-      correctness REPAIRED, performance NO-GO, flag stays default-off and unpromoted.
-      The first x86 `--self-test` failed 10 cases, all the `ctx+residual` contract: with
-      -ffast-math the compiler re-associates the epilogue's four-term sum only when a
-      residual is supplied. Not benign here, because the next residual unit re-quantises
-      per position, so one ulp shifts amax and the whole position's scale: 115 LSB on a
-      9550 peak end to end. Fixed in `d49aa10` by disabling reassociation for
-      `sd_dconv_worker` alone -- self-test 10 failures to none, `QWEN_SD_GLUE=0/1`
-      byte-identical, and the attribute costs nothing on the default path (control vs
-      control -2.4..+2.9 ms, no systematic sign). With the epilogue exact the MECHANISM
-      is slower than its control in 21 of 32 cells: +0.8 ms at B3 chunk 4 against a gate
-      asking for -3 ms, rising to +60 ms at B4 chunk 16. The -11 ms seen before the fix
-      was measured while the fused path was still free to re-associate, so it was not
-      computing the same result as the control and was never a valid comparison.
-- [ ] C12-WIN-3 Short-class fixed cost: only after WIN-10: ramp 1,2,4 (control) vs 1,4
-      (vs 2,4 only inside the TTFA gate); short + conversational playback metrics. No q8.
-- [x] C12-WIN-4 Old preparation flags: DIRECT_DWCONV/INPUT, STRIP, FUSED_RESIDUAL are
-      inert on VNNI (AMX-D gated); the VNNI glue falsifiers are now closed. DIRECT_CONVT
-      is superseded by the rejected one-GEMM falsifier.
-- [x] C12-WIN-5 Phase-aware decoder overlap: NO-GO at the measured pinned B3 overlap
-      share of 54.9%; no asymmetric Talker/CP width mechanism is justified.
-- [ ] C12-WIN-6 Opportunistic B2 lane batching (optional, last): residency of 2 units vs 2
-      requests, decoder off the critical path, mailbox bounded, reject on any cadence loss.
-- [ ] C12-WIN-6b AWS campaign order, model matrix and gates for specs 10/11A/12:
-      `.work/aws-qualification-checklist-20260910.md`. PRIMARY qualification path is
-      1.7B Base OSS + Galatea qvoice (clone conditioning), SECONDARY control is 1.7B
-      CustomVoice + Ryan (preset-speaker). The public ~25 MB CC0 grafts load on Base with
-      `--load-voice ... --icl-only`; what is NOT yet exercised is the clone conditioning
-      path through the BATCHED SERVER, which Phase A0/A confirms before any timing claim.
-- [ ] C12-WIN-7 Short A/B gate per candidate (control vs one mechanism, repeated short C12
-      waves, playback-aware metrics, gain > noise) before any soak.
-- [ ] C12-WIN-8 Qualify the winner: C12 class waves, long+short, Poisson, overload
-      unchanged, 30-min soak by class and 5-min window; STREAM p95 <= 0.90 overall and per
-      class, stall@500 0, cadence targets kept; report an exact boundary rather than move the gate.
-- [ ] C12-WIN-9 Capacity curve C10-C16 after the win, classified as preferred /
-      mandatory-qualified / hard-capacity (never one "max C" number).
-- Stop: if no target, no falsifier and no screen moves C12 above noise, hand the evidence to
-      the post-Turin architecture review instead of stacking micro-optimizations.
-
-### ARM-LINUX-V2 — parity implementation complete; optional policy qualification deferred
-
-- [x] Arm Linux serving is at the v2 generation on `feature/arm-parity-vnni` (`6117437`).
-      The implementation, exact self-tests, ISA/link checks, dispatch checks and final
-      config policy are complete. The track document with the verified/unverified split
-      and do-not-carry-over list remains `.work/arm-linux-v2-parity-track-20260910.md`.
-      Headline finding, CONFIRMED against this tree: the decoder lane
-      (`QWEN_SD_LANE_SPLIT` / `QWEN_SD_LANE_ELASTIC`) has NO ISA guard — only `__linux__` —
-      so the mechanism of record on the Turin product profile ports to Arm unchanged, and no
-      Arm profile sets it. The reason it was never tried is a wrong sentence in our own
-      handoff, corrected 2026-09-10. Also confirmed: the five newest decoder flags have zero
-      entries in `docs/feature-flags.md`, and `g_mm_gate[]` has no KleidiAI int8/bf16 rows.
-      The old unpaired n=12 probe on a heterogeneous box at concurrency 2 against a 2-slot
-      server remains non-evidence. The new exact-commit Axion screen is recorded below as
-      a one-wave performance screen only, not as an Arm product qualification.
-      Ordering: the build break above is NOT part of this track and must not wait for it.
-      Progress on `feature/arm-parity-vnni` (2026-09-10): items 0 (link fix, = TQ-6), 1
-      (KleidiAI gate rows), 2 (prefork plans on the inherited mask), 3 (docs + expectation
-      rows), 4 (lane honours the requested engine width) and the Arm DL-4 leaf of item 8
-      are implemented; the leaf passes the 20-case `--self-test` on aarch64 dotprod.
-      Item 7's region body is wired on Arm through the prepared-state API that was written
-      for it and never connected: Talker and CP batched regions now pack the KleidiAI LHS
-      once per projection group and run the same kai_i8_task in-region.  Verified on the
-      16-core Neoverse-V2: Talker region 12/12 WAV byte-identical on/off, CP region 12/12
-      byte-identical, arm-product preflight VALID, dispatch gate PASS; C10 2x8 lane4
-      elastic + RES1_V2 + GLUE + CONVT_STACK measures STREAM p95 0.843 against 0.939 for
-      the untreated tree (WAVE screen, no SOAK yet).  RES1_V2 audio gate: 21/21 paired
-      files, mel-corr min 0.9945.
-      The original next list is now closed at implementation level: pre-transformer BF16
-      wiring, rectangular/wide DL-4, and multi-slot DL-4 are all implemented and tested.
-      The lane-team constraint is handled by the prepared-state prep/run pair (tid/nt),
-      while the region/prepared-state API remains keyed on the ORIGINAL f32 weight pointer.
-      DONE since: DL-4 rectangular/wide shapes (API `in_ch`/`out_ch`, any shape when the flag is
-      on; two rectangular self-test cases exact / 5.6e-3); ConvNeXt pointwise pair on KAI
-      int8 (`QWEN_SD_CNEXT_I8`, default off) --
-      6 paired server texts mel-corr min 0.99736 / mean 0.99805, C10 0.843 -> 0.821.
-      Item 1 implementation is now wired through full, streaming and ragged pre-transformer
-      forwards: Arm KAI registers all persistent BF16 rows and unregisters them on teardown;
-      the Neoverse-V2 smoke is functional on both 0.6B and 1.7B. The corrected Graviton5
-      prepared-LHS micro A/B and paired C1 WAV gate are now PASS, while the broader BF16
-      product promotion screen remains open (the implementation is default-off). Item 3 is implemented for VNNI and
-      Arm SDOT with compact and production strided APIs, exact S=2/S=3 oracles, and a lane
-      cohort. The Arm 2/3-slot WAVE reached group=2/3 with zero mailbox overruns, but measured
-      2.8--3.9% slower on the short 0.6B/1.7B A/B, so it is also default-off. Evidence and
-      remaining qualification gaps: `.work/arm-linux-v2-parity-implementation-20260911.md`.
-      Exact-commit Axion FAST screen (Neoverse-V2, 2x8, short synchronized wave, custom
-      1b7 model, INT8) reached C8 with lane split=4: C6/C8 STREAM p95 `.646/.716`,
-      TOTAL p95 `.699/.806`, TTFA p95 `236/303 ms`, zero errors/rejects; C12/C14 are
-      screen-only and miss playback headroom. Inline control was `.917/.860` STREAM p95
-      at C6/C8; split=2 was slower, so no lane split is promoted in the Arm profile.
-      This is not an apples-to-apples Turin claim: Turin has 32 cores and the reference
-      screen uses the open 1.7B model. Turin's 4x8 screen was `.87/.87` STREAM p95 at
-      C6/C8, making the Arm C6/C8 steady-state screen comparable despite half the cores;
-      first-audio and full qualification still need a repeated product run.
-      Arm cost map (REPORTED-MEASURED, not reproducible here): res1 is ~48 % of the upsample
-      convs and the conv stack ~92 % of the decoder unit, so the missing V2 leaf aims at the
-      largest single item. DO NOT chase the AMX strip/range port: it was measured first and
-      discards only 0.4 % of columns at a 10-frame quantum (~5 % of residual-conv time). The
-      three September AMX gaps are CLOSED on this branch; do not reopen them from the older
-      cross-backend audit page. AMX lacking V2 is a dispatch-order CHOICE (Design-D precedes
-      V2), not a gap.
-      Follow-up 2026-09-11: `c6e6e26` shares the KleidiAI activation preparation across
-      Talker/CP region workers (same prepared-state kernel); `5b03269` makes the BF16 KAI
-      pre-up prepare synchronously before dispatch, removing a barrier that was unsafe for
-      serial/GCD/narrowed pools. Mac build/self-test and a clean Graviton5 build/self-test
-      pass; four Graviton5 C4 WAVs are byte-identical to the pre-change baseline. The
-      Graviton5 4x8 all-on FAST screen is exploratory only (C8/C12 TTFA p95 257/328 ms,
-      STREAM p95 0.794/0.853, zero errors/rejects); it does not close the Turin regression
-      gate or qualify the Arm product profile.
-- [x] ARM-LINUX-V2 item 8: the residual unit (res1/res2). VERIFIED backend map in
-      `.work/arm-linux-v2-parity-track-20260910.md` section 2b. Four facts the dispatch map
-      does not show: `QWEN_SD_RES1_V2` selects on SHAPE (`kernel>=1 && in_ch==out_ch &&
-      !(in_ch&3)`), so it takes res2 and every square conv, not just res1 — implementing
-      from the flag name builds half of it; residual fusion needs AMX, so VNNI also pays a
-      separate pass (`QWEN_SD_GLUE` is the VNNI answer, default off, unqualified); AVX2 and
-      AVX-512F-without-VNNI have NO int8 decoder conv at all, so the gap is three CPU
-      families; and an undeclared `in_ch <= 768` gate drops every backend to f32 above it,
-      AMX and VNNI included. Work: one dotprod/i8mm DL-4 leaf against the already ISA-neutral
-      packing path, written to the `qwen_conv1d_int8_v2_ctx` contract. DONE on
-      `feature/arm-parity-vnni`: the leaf exists for Arm dot-product and the API is now
-      rectangular (`in_ch`/`out_ch`, Cp from `in_ch`), so DL-4 also takes the initial/pre
-      convs and the wide channels that the v1 panel and Design-D paths cannot; --self-test
-      covers both rectangular shapes and the 20 square ones. AVX2/AVX-512F-without-VNNI stay
-      on the f32 fallback, so the three-family claim of this item is not delivered. The flag
-      and the `decoder.res1_v2` row are re-documented but not renamed. Arm widened-path
-      quality/perf promotion remains intentionally open; parity implementation and exact
-      Arm/x86 build/self-test gates are complete (the VNNI kernel shares the API change).
-
-- [x] ARM-LINUX-V2 final config TODO, completed last after the BF16/multi-slot A/B and x86
-      VNNI compile/parity checks: update `configs/perf/arm-product.json` and
-      `configs/perf/axion-16c-ttfa.json` with RES1_V2, lane, multi-slot and BF16 policy.
-      RES1_V2 is available; BF16 pre-up and multi-slot remain explicit default-off controls
-      until their separate quality/16-core qualification gates pass.
-
-- [x] VNNI DL-4 multi-slot promotion smoke (2026-09-11): after the exact multi-slot oracle
-      fix, the Turin product A/B ran three synchronized short waves at C4/C8/C12/C16 and
-      two mixed short/long waves at C8/C12 against the explicit `QWEN_SD_MULTISLOT=0`
-      control. All 120 requests per arm completed with zero errors/rejects; sustained
-      stream/total p95 and req/s improved coherently at C8-C16. The Turin product profile
-      now defaults `QWEN_SD_MULTISLOT=2`; the control profile pins 0, Arm/KleidiAI stays
-      default-off pending its own 16-core/quality gate, and paired audio quality remains
-      required before calling the feature qualified across products.
-
-- [x] PRE-GRAVITON-5 Turin regression applicability gate: the Turin VNNI product/control
-      A/B and the C4/C8/C12/C16 multi-slot smoke are already recorded in the Turin handoff
-      and the preceding VNNI promotion work. The later commits `c6e6e26` and `5b03269` touch
-      only the KleidiAI/Arm paths: on x86 VNNI the new region helpers are not selected and
-      the BF16 KAI consumer is a fallback no-op. Therefore Turin does not need another run
-      solely for this Arm-only delta. Reopen this gate if shared x86 kernels, threading,
-      profiles, or dispatch code change. The Turin checkout remains a dirty bench checkout:
-      sync only tracked source/config/commits, never models/private/WAVs, and keep the
-      privacy/log/tree check in force.
-
-- [x] GRAVITON-5 v2 mini-sweep and flow audit (2026-09-11): clean 32-core Neoverse-V3
-      build/self-test/doctor passed; 4x8 was the useful topology. The exploratory all-on
-      Arm v2 screen held C12/C16 at STREAM p95 `.834/.947` and TTFA p95 `347/470 ms`,
-      while C18 crossed the edge (`1.514` STREAM, `529 ms` TTFA). Lane+multi-slot was the
-      main gain; BF16-only was marginal and remains default-off. The marker follow-up now
-      attributes the decoder panels: C2/C4 cost-map parity is still PASS, with 8/8 workers
-      entered and 100% panel occupancy at both levels; the previous UNACCOUNTED row was
-      instrumentation, not an inactive kernel. `conv_stack` is 93.0%/91.4% of the serve
-      decoder map and pool wait is a real 16.2%/24.1% completion-wait share. The prepared
-      BF16 LHS reuse is wired through full/streaming/ragged decoder paths; corrected C12
-      FAST A/Bs improve STREAM/TOTAL p95 directionally in both orders with zero errors, and
-      paired C1 WAVs are byte-identical. Pool-spin 0/4096/16384/65536 was noisy, so the
-      Arm 65536 default remains. Scratch stats showed zero spills and grow-once/reused
-      arenas. Full qualification remains open; details:
-      `.work/graviton5-arm-v2-mini-sweep-20260911.md`.
-
-- [x] GRAVFULL-1 Graviton5 qualification campaign execution (2026-09-11): the clean `arm-product`
-      RES1_V2/KAI INT8 baseline was built and dispatched on the selected 4x8 topology;
-      doctor, strict preflight, caps/dispatch/self-test, CPU check, paired structural
-      audio, capacity waves and C4 SOAK passed with zero errors/rejects and zero fixed-
-      buffer stalls. The all-on arm also passed serving/resource SOAK and the 1.7B/0.6B
-      FAST ladders, but its paired mel gate failed (`0.88559` minimum vs `0.98`), so
-      BF16 pre-up and multi-slot remain default-off. This closes the campaign execution,
-      not the per-concurrency capacity qualification; exact evidence:
-      `.work/graviton5-arm-v2-full-qualification-20260911.md`.
-
-- [ ] GRAVFULL-2 Graviton5 per-concurrency SOAK qualification (campaign execution complete;
-      strict promotion gate remains open): when the box is leased
-      again, split the matrix by model. For 1.7B, run identical closed-loop SOAKs for
-      control OFF and exploratory all-on at C6/C8/C12/C16; run C18 as a diagnostic edge
-      only if admission remains meaningful (C4 is already covered for 1.7B). For 0.6B,
-      extend the existing C1/C4/C8/C12 FAST screen through C16/C20/C22/C24+ until the
-      knee, then SOAK the selected levels for both arms. Keep the current fail-fast
-      admission/batch cap as the control, but add a second small-model pass with an
-      explicitly raised per-worker batch/admission cap when testing C20/C22/C24; record
-      the exact cap and queue policy in the manifest. A WAVE is not a capacity
-      qualification: do not call any 1.7B C12/C16/C18 or 0.6B C16/C20+ level qualified
-      without same-model SOAK evidence and errors/rejects=0. A c4a 32-core Arm result
-      can select candidate C levels and cap settings for this pass, but cannot replace
-      same-host Graviton5 evidence. All-on remains non-promotable unless paired audio
-      also passes. After the current c4a campaign, if the 1.7B C12-C16 interval is
-      incomplete or C16 fails at the current cap, add a fine-grained C13/C14/C15
-      sweep for control and all-on. Run it first at the existing cap for comparability;
-      if admission rejects are the limiting factor, repeat the selected levels with an
-      explicitly raised cap and label that as a separate admission experiment.
-      The c4a candidate admission experiment is now complete (2026-09-12): with
-      batch-cap 8 per worker on 4x8, WAVE admission reached C32 with zero rejects for
-      both 0.6B arms and C36 rejected 12; no raised-cap C20+ SOAK passed the strict
-      playback/KPI gate. This selects C20 as an exploratory all-on candidate and C32
-      as an admission-only candidate, not as qualification. Detail:
-      `.work/c4a-arm-v2-raised-cap-report-20260912.md`.
-
-      Graviton5 32-core all-on OSS campaign executed 2026-09-13 on clean `dc8bc48`
-      (4x8, C9g.8xlarge/Neoverse-V3): complete 1.7B C1-C20 and 0.6B C1-C26
-      capacity waves, short/long parallel waves, Poisson, 30-minute C12/C20 gates,
-      and the additional 1.7B C10 30-minute gate. All completed requests had zero
-      errors/rejects/timeouts in the measured gates. The customer-facing playback
-      rule still classifies 1.7B C10 as EDGE (TOTAL_RTF p95 1.03, stall@250 9.2%),
-      1.7B C12 as EDGE (1.07, 18.6%), and 0.6B C20 as EDGE (1.12, 65.8%); clean
-      wave candidates are C12 and C16 respectively, not sustained qualifications.
-      No extra small-model C24/C26 soak or WAV probe was needed after the full
-      capacity/parallel coverage. Private evidence and the customer report remain
-      outside the OSS tree; all-on is not promoted by this run.
-
-- [x] GRAVBOX-2 AWS Graviton5 profile decision (2026-09-13): the 32-core G5
-      `roof_matvec_int8` discriminator rejected 4x8 as a serving baseline (aggregate
-      throughput did not scale and each worker slowed by about 4.45x). Do not retain a
-      4x8 all-on profile for G5; preserve the topology evidence and test 2x16/1x32 only
-      as a separate host-specific experiment if the box is rented again.
-
-- [x] GRAVBOX-3 AWS Graviton4 all-on profile artifact (2026-09-13): created and validated
-      `configs/perf/aws-c8g-8xlarge-32c-arm-v2-all-on.json` for the 32-core Neoverse-V2
-      control, using the measured 4x8-friendly KAI/RES1_V2/BF16-pre-up/lane/multislot
-      feature set. It is host-scoped and remains `unqualified`; the G4 C8/C12 screens
-      select the candidate shape but do not replace full same-host quality and soak gates.
-
-- [x] ARM-TOPO-1 doctor topology preflight (2026-09-13): `tools/doctor.py` now runs a
-      short fixed-mask `roof_matvec_int8` 1x8 / simultaneous 2x8 / simultaneous 4x8
-      discriminator on Arm Linux boxes with at least 32 online CPUs. It archives parsed
-      rows and raw worker output in `arm_gemv_scaling.json` / `arm_gemv_*.txt`, prints
-      the 4x8 scale and per-worker slowdown near the top of the report, and recommends
-      `2x16` then `1x32` for G5-like contention. The verdict is topology-specific, not
-      a claim that the whole instance is unusable. Offline doctor tests pass; an actual
-      Arm run remains part of the next box preflight.
-
-- [x] ARM-SOAK-CLEANUP engine baseline restored (2026-09-13): the rejected admission
-      guard/helper, layer/token slicing, isolation and temporary tracing changes were
-      removed from the engine. The source baseline is `dc8bc48`; the evidence and
-      topology doctor changes remain local and unqualified until deliberately committed.
-
-- [ ] GRAVBOX-1 GCP c4a highcpu-32 Arm candidate: record the Iowa region and quoted
-      `$1.21/hour` cost, then—only after the per-model SOAKs and feature gates—derive a
-      separate 32-core Arm profile from `arm-product` with the newly qualified flags.
-      The box setup alone must not promote BF16 pre-up, lane, multi-slot or other
-      optional features; keep the profile explicitly tied to its 32-core topology.
-      A host/model-scoped all-on deployment candidate is now recorded at
-      `configs/perf/axion-c4a-highcpu32-0p6b-all-on.json`: C16 preferred, C20 soft edge,
-      C32 admission-only. The final clean-tree confirmation run completed 2026-09-12:
-      C16 had zero errors/rejects/timeouts with STREAM p95 0.881 but missed only the
-      per-class drift gate; C20 had STREAM p50/p95 1.02/1.09 and playback degradation;
-      paired 0.6B audio was 0.94558–0.96306 vs 0.98. Keep the candidate policy scoped
-      and `unqualified` until the numerical/audio delta is fixed or explicitly accepted.
-      Detail: `.work/c4a-arm-v2-0p6b-profile-qualification-report-20260912.md`.
-
-- [x] TURIN-POST-ARM **DONE 2026-09-15** — satisfied by the X86-COHORT-1 run on a fresh Zen5
-      Turin box built from the tree that carries every Arm change. Gates: `--self-test` 0
-      failures, `check-isa` PASS, `--caps` resolves VNNI/BF16 native, strict preflight valid.
-      Screens compared the committed VNNI product profile against a one-variable cohort-OFF
-      arm on both checkpoint sizes. **No regression attributable to the Arm parity work.**
-      Deviations from the original wording, stated so the closure is auditable: the screen ran
-      at **C12-C16 / C20** rather than C6/C8 (the ladder had to reach the knee to be useful),
-      and used **OSS checkpoints with an English bank** rather than the customer workload, so
-      it is a regression-safety screen and not a capacity claim. Detail and numbers:
-      `.work/arm-sustained-soak-regression-20260913.md`.
-
-- [ ] ARM optional-feature promotion: qualify BF16 pre-up and CNEXT-I8 as separate paired
-      A/Bs. **Multi-slot is CLOSED (2026-09-15): retired on every Arm profile with a measured
-      per-call loss, paired serving screens and a 1.00000 mel-corr audio gate** — this item's
-      note that "the current multi-slot short A/B was negative" was right and has now been
-      settled with host-specific evidence, see ARM-SOAK-10/14. BF16 pre-up and CNEXT-I8 remain
-      unqualified: do not bundle them into a baseline claim without paired audio plus serving
-      evidence. **Open discrepancy to resolve before any release claim that quotes them:** the
-      host-scoped all-on Arm profiles set `QWEN_SD_BF16_PREUP=1`, while `docs/feature-flags.md`
-      still describes that flag as "failed its x86 audio gate and stays off". Both statements
-      can be true (x86 gate failed, Arm host-scoped policy enables it) but the doc does not say
-      so, and a reader cannot tell. Fix the doc row or the profile, and say which.
-
-### Deferred DECODER-XISA — converge decoder dataflow after C12-WIN
-
-- [ ] After the Turin C12-WIN track reaches a stable checkpoint, commonize the winning
-      streaming-decoder dataflow across x86 VNNI, x86 AMX and Arm/KleidiAI; keep this
-      deferred and do not mix it into the current paid Turin ladder. Start with a short
-      design/dataflow audit, then parity-gated leaves in this order: RES1_V2 direct causal
-      convolution, common glue/materialization removal, pre-upsample BF16/INT8 matmat,
-      and one-GEMM ConvT. Detail and gates: `.work/decoder-xisa-deferred-track-20260909.md`.
-
-### Deferred QUANT-PTQ — calibration-aware quantization revisit (MEDIUM/LOW)
-
-- [ ] Revisit lower-precision prefill and weight storage using calibration/optimization-aware
-      PTQ (AutoRound-style or equivalent) instead of the engine's earlier straightforward
-      conversion. Production keeps prefill in BF16 deliberately; the earlier simple INT8
-      prefill and simple INT4/Q4 attempts were rejected because pronunciation and speaker character
-      drifted audibly while the audio stayed otherwise valid. Those verdicts reject THOSE
-      IMPLEMENTATIONS, not lower precision as a direction -- do not record "INT8 prefill" or
-      "INT4" as architecturally disproven. Tracks: calibrated INT8/W8A8 prefill; quality-
-      optimized Q4/INT4 or mixed precision for suitable Talker/CP/prefill regions; offline
-      calibration only, with the C runtime consuming packed weights and scales and no
-      training machinery; and a re-test of whether the V2 kernels change the premise. GATE:
-      a performance gain is irrelevant unless pronunciation and speaker character survive against the current INT8 + BF16-prefill baseline, judged by paired audio, ASR
-      and listening -- waveform/mel/duration equality is necessary and not sufficient, since
-      the earlier rejections passed exactly those. Start only after the C12-WIN items and
-      the report qualification work. Detail: `.work/quantization-ptq-revisit.md`.
-
-- [x] QP-0 **AutoRound / calibration-aware rounding evaluated — CLOSED NO at 8 bits**
-      (2026-09-15). The revisit note's §2 hypothesis is answered. At 8 bits the rounding
-      rule has no headroom: Intel's own INT8/W8A8 table puts AutoRound **0.86 pt BELOW plain
-      RTN** on Llama-3.1-8B-Instruct (70.06 vs 70.92, BF16 70.42) for ~10x the time and ~16x
-      the VRAM; 8-bit weight tuning buys +0.0008/+0.0003 average; `auto_round` auto-disables
-      its own scale search at `bits>=8` and recommends `iters=0`; neither AutoRound paper
-      evaluates 8 bits across five versions; Intel publishes 58 int4 models and **one** int8,
-      built with tuning off. Independently corroborated by Dettmers arXiv 2212.09720 App. C.3
-      ("No scaling improvements for 6 to 8-bit models"), ZeroQuant-V2 (<0.05 ppl), the Qwen3
-      quantization study, and llama.cpp discarding the imatrix at `q8_0`. **Also excluded:**
-      our granularity is already the INT8 hardware maximum (per-output-channel weights x
-      per-token dynamic activations = AutoRound's own `INT8` preset), and the BF16->INT8
-      prefill speed ceiling is **2.0x on every ISA we run** (Arm N2/V1/V2, AMX, Zen4/5,
-      M4 SME) against the **1.8x we already measure** -- there is no second speedup behind a
-      better quantizer. AutoRound stays live and valuable at **2-4 bits only** (track 2).
-      Redirection, ideas backlog and citations:
-      `.work/quant-prefill-int8-analysis-20260915.md`.
-- [ ] QP-1 **Activation-range profile (do this first, blocks QP-3/4/5).** Per linear layer,
-      per token position, `max/median` ratio, across languages, with and without a voice
-      prefix, prefix vs generated positions. ~20 lines of C behind a flag, no default change.
-      Hypothesis under test: the SwiGLU activation-spike signature (arXiv 2405.14428) on the
-      `down_proj` input, concentrated on BOS/newline/apostrophe -- tokens that live in the
-      text prefix the PREFILL carries and that the acoustic-token DECODE never sees. If the
-      signature is absent, QP-3/4/5 lose their rationale and the track needs a new hypothesis.
-- [ ] QP-2 **Distance gate before any candidate.** Teacher-forced `KL(bf16 || int8)` per
-      decode step plus flip rate, on the BF16 token stream, on LONG utterances, PER LANGUAGE,
-      at temperature > 0; reuse `tools/quant/fakequant_cp.py` + `tests/quant_ladder.py`
-      (references: int8 79.4 %, int4 46.3 %). Rationale: arXiv 2407.09141 -- aggregate
-      accuracy and perplexity are structurally blind to the damage that matters, distance
-      metrics are not. This does **not** replace the ear/ASR gate in the parent note; it makes
-      it affordable by filtering candidates before a listener spends time on them.
-      ⚠️ The `mel-corr 0.39-0.60` figure in `docs/runtime-map-c8a-c4.md` is uninformative on
-      its own (trajectory divergence of a sampled AR model, not damage). The INT8-prefill
-      rejection was an EAR verdict and it stands -- do not re-open the path on the metric.
-- [ ] QP-3 **Per-K-block activation quantization in the prefill** (B=32, then 128) instead of
-      one absmax over the whole K per token. No calibration, no new format; reuses the per-32
-      machinery already written for Q4_0. Confines an outlier channel to its own block instead
-      of crushing the token's whole row; overhead O(1/B). Cheapest real candidate.
-- [ ] QP-4 **QFeP: first N prefix tokens in BF16, INT8 from there.** Removes the spike tokens
-      by construction, and covers the attention-sink token that Mix-Quant's
-      attention-concentration defence (arXiv 2605.20315) does not reach.
-- [ ] QP-5 **QFeM: exclude the 1-3 worst layers** from the INT8 prefill, selected by QP-1's
-      max/median ratio, `down_proj` first. Static and AMX/VNNI-friendly, unlike LLM.int8()
-      dynamic column decomposition (which breaks tiling and is rejected).
-- [ ] QP-6 **SmoothQuant alpha-sweep folded into RMSNorm / `v_proj` / `up_proj`** -- verify
-      foldability against our block graph first. Free at runtime if it folds, but the first
-      idea needing calibration data: start ONLY if QP-3/4/5 fall short.
-- [ ] QP-7 **KV-seam control arm**: INT8 prefill everywhere except the K/V projections.
-      Demoted from hypothesis to control (Mix-Quant rejects KV poisoning as the mechanism);
-      cheap enough to run inside the QP-3 A/B.
-- [ ] QP-8 **`iq4_nl` revisit — belongs to the INT4 track, not this one.** Same 4.5 bpw and
-      the same 18-byte block as our Q4_0, a 16-entry LUT; QErr 1.10 % vs Q4_0's 1.84 %; our
-      own measurement recorded +8.8 pt on the CP with the kernel parked. AutoRound **cannot**
-      emit it; llama.cpp can. Already named as the cheap follow-up in `docs/quant-sub4.md` §5.
-- [ ] QP-9 **Offline quantizer via `ggml_quantize_chunk()`** if the INT4 track restarts: link
-      `ggml-quants.c`, feed an imatrix (diagonal of the activation second moment), consume
-      `q4_K`/`iq4_xs`/`q6_K` blocks in our own kernels. No Python, no GGUF parsing.
-      Side finding worth reading regardless: auto-round ships a Qwen3-TTS GGUF converter
-      (`export_to_gguf/conversion/qwen3tts.py`) documenting an independent llama.cpp mapping
-      of our model's structure.
-
-### P1 Cadence truth (current binary, Tier A only) — detail: `.work/p1-cadence-truth-20260907.md`
-
-- [x] CT-1 Quantum discriminator at C3/C4, including gang-off control; q32 is rejected.
-- [x] CT-2 Decoder intercept/slope and `[SDPHASE]` attribution; SQ-1 remains GO.
-- [x] CT-3 Inline admission interference measured with matched control; LS-4 remains P3.
-- [x] CT-4 Talker B1/B2 measured; EO-2 remains viable (B2/B1 step ratio ~1.10).
-- [x] CT-5 C2/C3/C4 playback envelope: GOOD / GOOD / MARGINAL.
-
-### P2 Small-quantum decoder — CLOSED checkpoint: `.work/p2-checkpoint-20260907.md`
-
-- [x] SQ-1 Bounded warm range slice: newly produced columns use direct INT8 A preparation
-      and persistent Design-D B packs in the serving reference. The complete
-      strip → snake → conv1 → snake → conv2 → residual executor is not implemented and
-      moves to AR-1 as an architectural candidate.
-- [x] SQ-2 Bounded fixed-cost audit: default-off slices cover direct streaming/ragged
-      ConvT, depthwise and warm-input preparation; fused residual remains a candidate.
-      Direct one-row gather/quantization and BLAS-C residual were rejected and reverted.
-      Details: `.work/p2-checkpoint-20260907.md` and the linked experiment addenda.
-- [x] SQ-3 Decoder AMX reachability and scoped accounting recorded; the four whole-request
-      quantities are not fabricated where the current evidence has no valid denominator.
-      Detail: `.work/p2-checkpoint-20260907.md`.
-
-
-### AR-2 reviewed order — CLOSED docs checkpoint
-
-- [x] AR-1 implementation audit and AR-1b external/model supplement are frozen against
-      the P2 HEAD: `.work/ar1-post-p2-architecture-review-20260907.md`,
-      `.work/ar1-codex-implementation-audit-20260907.md`,
-      `.work/ar1b-external-research-supplement-20260907.md`.
-- [x] AR-2 verified the official known-text dual-track layout against the C prompt/step
-      path and froze the implementation order: `.work/ar2-sl1-semantics-20260907.md`.
-      Prefix-cache reuse is not resumable prefill; q1/q2/q4 are smaller complete decoder
-      calls, not intra-call preemption; whole-request AMX wall remains UNKNOWN.
-
-### P3 Serving cadence and first-play
-
-- [x] OUT-1/OUT-2 Bounded per-stream PCM queue, detached non-blocking writer, byte/memory
-      cap, timeout, cancellation/disconnect semantics and slow/stopped-reader tests are
-      implemented behind `QWEN_SERVER_ASYNC_OUTPUT=1`; C1/C2 path, matched C3/C4 Tier-A
-      integration, byte-identical audio and slow-reader gates pass. It remains default-off:
-      the C3/C4 wave shows no material KPI change, and longer-concurrency thread/memory
-      qualification is still open. Engine enqueue and transport-write timestamps remain
-      distinct. Detail: `.work/stream-output-isolation-20260907.md`.
-- [x] SL-1 Known-text official dual-track layout implemented behind
-      QWEN_TTS_STREAM_LAYOUT=1 and carried through CLI, batch and continuous-server
-      admission paths. The known-text Ryan/English lane passed current-generation
-      structural/audio, prefill-scaling and 8-core server interference gates and is
-      explicit in `amx-product`; ICL/clone and live incremental text remain outside
-      the lane. Detail: `.work/sl1-known-text-stream-layout-20260907.md` and
-      `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
-- [x] LS-1 Minimal credit-gate skeleton implemented and falsified at C3/C4 behind
-      `QWEN_STREAM_LEAD_GATE=1`: first audio remains eligible, but hard suppression at a
-      250 ms target parks ~95.8% of checks, lowers useful worker work and does not improve
-      stall rates. Keep default-off; do not add EDF/LS-2 on this realization without a new
-      mechanism. Detail: `.work/playback-lead-gate-fc-20260907.md`.
-- [x] LS-3' Small complete decoder calls at safe existing boundaries; q1/q2/q4/q8 floor
-      established in a Tier-A C3/C4 screen. q1 is rejected; q2/q4/q8 remain policy
-      candidates and no intra-call preemption is claimed. Detail:
-      `.work/decoder-quantum-floor-20260907.md`.
-- [ ] LS-2 Lead-feedback steady-state quantum: first chunk remains one frame, bounded lead
-      window, explicit minimum efficient quantum; q8 remains the upper control until proven.
-- [ ] PF-1 Residual fixed-prompt chunked prefill only if a retained ICL/reference or
-      non-streaming mode still leaves a genuinely long prefix after SL-1. It is not a
-      blocker for the current known-text 1.7B product point; the cloned-context
-      helper/LOW falsifier is rejected as a serving substitute. Detail:
-      `.work/prefill-helper-c34-20260907.md`; do not confuse it with live text.
-- [x] LS-4 Bounded utilization-aware third-slot admission falsifier: the parent health
-      predicate was implemented behind `QWEN_ADMIT_UTIL`, but all predeclared 40/60/80 ms
-      thresholds damaged the established-four playback envelope despite making the fifth
-      request interactive. Keep default-off; do not run a local threshold qualification.
-      Cap2/q4 fail-fast remains the control. Detail:
-      `.work/ls4-utilization-aware-admission-20260908.md`.
-
-### P4 Overlap and decoder structural cost
-
-- [x] Same-pool decoder consumer tested and rejected: `QWEN_DECODER_THREAD=1` on the
-      engine pool caused C4 STREAM_RTF p95 `0.847 -> 1.296`, TTFA p95 `174 -> 1126 ms`
-      and max-gap p95 `511 -> 1286 ms`; it observed `group=1` and did not preserve the
-      inline decoder batching path. Keep default-off; detail:
-      `.work/p4-same-pool-decoder-20260907.md`.
-- [x] Fused residual Design-D epilogue passed the CLI byte/audio gate, a short server
-      A/B in both per-slot and ragged forms, and a pooled five-minute mixed-bank C4 SOAK:
-      short A/B STREAM_RTF p95 `0.831 -> 0.788`; SOAK p95 `0.8933` with zero errors and
-      hard p95 `<1` in every window. Promote as an isolated **default-off** candidate;
-      per-class p95 remains under-sampled. C5/C6 screens fail startup/safe-start despite
-      STREAM p95 <1. Detail:
-      `.work/p4-fused-residual-20260907.md`.
-- [x] F1 fused-residual × quantum screen (2026-09-08): fused-on q4 is the next C4
-      playback/realtime reference candidate (STREAM_RTF p95 `0.868`, prebuffer p95
-      `201 ms`, stall@250 `0%`); q8 remains the higher-throughput control and q2 misses
-      the preferred STREAM p95 target. Three-wave screen only; not a qualification, and
-      no causal fused-vs-off frontier shift was isolated. Detail:
-      `.work/f1-fused-quantum-20260908.md`.
-- [x] F-cap3 C5 capacity screen (2026-09-08): cap 3 accepted the fifth-request
-      wave without the multi-second parent-backlog tail, but cap-3 C5 failed the
-      realtime promotion gate (`STREAM_RTF` p95 `0.969`, fifth-launch proxy `1.028`,
-      stall@250 `13.3%`). Cap 2/q4 remains the reference; established-four causal
-      impact is UNKNOWN because the short run used true simultaneous waves. No C6.
-      Detail: `.work/f-cap3-c5-capacity-20260908.md`.
-- [ ] DL-1 4+4 intra-CCX decoder lane, default-off `QWEN_SD_LANE_SPLIT=N` (2026-09-09):
-      the worker mask is split into a STEP part (engine pool: Talker/CP/prefill) and a
-      DECODER part (private pinned team, never the engine pool or its submit lock); the
-      frame loop enqueues one bounded decoder unit per slot and blocks only when that
-      slot needs another quantum while its unit is in flight (lead <= 1 quantum). Built
-      from the single-CCX lane law (`T(B) = 40 + 13.5·B` ms, decoder 9.7 ms per slot,
-      Talker+CP saturate the CCX at 2-4 threads) and the L3 contention falsifier (+12 %).
-      A/B: one worker on one CCX, 1.7B, fixed text, q4, SL-1, inline vs lane at B2/B3/B4
-      (+B5 if B4 is healthy). **GO**: B3 STREAM p95 <= 0.85, B4 <= 0.92, stall@250 = 0,
-      no lifecycle/correctness issue; **strong GO**: B4 <= 0.90 without TTFA/prebuffer
-      regression; **FAIL**: < 10 % better than inline at B3/B4, or Talker/CP inflation
-      erases the overlap, or the mailbox recreates equivalent blocking, or lifecycle is
-      unsafe. PASS -> 4x8 host screen at C8/C12/C16; FAIL -> stop, use the measured
-      split to decide whether res1/VNNI decoder work is the next lever. Same task:
-      `vnni-bf16-product` lane (native bf16 prefill; the f32 pin of `vnni-product` is a
-      backend-selection defect) and `QWEN_POOL_SPIN=65536` promoted in the VNNI product
-      lanes (measured 2x16 C8 0.893 -> 0.808). **A/B done 2026-09-09: NOT GO, not FAIL** —
-      iteration wall matched the prediction (B3 64 ms, B4 72 ms; decoder-call spikes gone,
-      stall@250 at B4 100 % -> 0 %) but STREAM p95 B3 0.871 / B4 0.997 miss the gate: the
-      4-thread STEP side inflated Talker+CP by +27-29 % (per-slot region sections, ~8 ms per
-      slot) and the 2 s clip pays the pipeline's fixed latency (+0.05 STREAM, +30-64 ms
-      TTFA). Kept default-off; no host screen. Next lever per the split: the step side
-      (5+3 / 6+2 split, long-bank A/B), not res1. **5+3 and 6+2 run 2026-09-09: both
-      worse than 4+4 (fixed B4 1.113 / 1.364; long B4 1.015 / 1.263) — the decoder needs
-      >= 4 cores to stay hidden at B4 and the step side gains only 3-7 ms from 5-6
-      threads; no host screen; 4+4 is the allocation of record, architecture promoted,
-      allocation not. DL-2 elastic 8<->4+4 (`QWEN_SD_LANE_ELASTIC=1`, pool width capped only
-      while a decoder unit is in flight, preallocated per-slot handoff) run the same day:
-      fixed B4 0.987 vs static 0.997, long B4 0.895 vs 0.906, Talker+CP 69.5 vs 69.8 ms —
-      the static-partition tax is NOT the cause; the step is slowed ~2x only while the
-      decoder unit runs (CP loses L3 residency to the decoder's f32 activations). Next
-      lever: the decoder unit's cache footprint, measured by CP ms during overlap.**
-      DL-3 falsifiers (2026-09-10): sub-quantum decode, direct ConvT/dwconv/input, NTA
-      weight prefetch, hot lane workers, q8 — none moves the CP-in-overlap tax (35-38 ms
-      vs 23.5); q8 reaches long B4 0.864 but at prebuffer 806 ms / stall@250 100 %. The tax
-      is ~+20 ms per overlapped iteration whatever the decoder does; only the overlap
-      share (decoder time on 4 cores, 15-16 ms/frame) scales it. **Next: DL-4 = res1/conv
-      kernel efficiency on the lane (fewer weight re-reads, no separate f32 panel),
-      metric = decoder unit ms on 4 threads and overlap share.** DL-4 built
-      (`QWEN_SD_RES1_V2=1`, direct dilated conv, per-position quant, 4x4 register tile,
-      weights read once per time block): res1 1.72x, unit 64 -> 50 ms, overlap share
-      48 -> 39 %, lane B4 long 0.869 / fixed 0.918 (gate met); **4x8 host screen: C12
-      STREAM p95 0.80-0.81 prebuffer 247 ms stall@250 0 %, C16 0.88 long / 0.92 short
-      prebuffer 360 ms stall@250 0 % — twice the inline C8. Screen only: next = SOAK
-      C12/C16 with a qualified profile and the V2 numerics ear/mel-qualified.** Detail:
-      `.work/dl1-decoder-lane-split-20260909.md`. **Qualification sprint 2026-09-09
-      (revision 28d6436, frozen `turin-c8a-32c-vnni-product`, control `-control`):** V2
-      quality automated PASS (52 paired files, mel-corr >= 0.9948, ASR CER equal, wav_qc
-      equal; ear verdict pending on the Mac listening set); **C12 QUALIFIED for the
-      mandatory contract** in every class (waves STREAM p95 0.82-0.85, prebuffer p95
-      ~260 ms, safe-start 467 ms, stall@250/@500 0; 30-min SOAK 2205 req 0 errors, pooled
-      STREAM p95 0.912, TTFA p95 170, resources/drift PASS) with the preferred 0.90 gate
-      missed only by the short (0.959) and conversational (0.914) classes under closed-loop
-      soak; Poisson 1.5/2.5 req/s TTFA p95 172/175 ms; overload fail-fast works (per-worker
-      cap). **C16 NOT RUN**: the spot host was reclaimed before Phase D. Handoff:
-      `.work/turin-vnni-final-handoff-20260909.md`.
-- [x] TQ-1 C16 density qualification (2026-09-09, on-demand c8a.8xlarge, revision e1b1ec7):
-      waves STREAM p95 0.91-0.96, 30-min soak FAIL (pooled p95 1.004, short 1.045, 596
-      per-worker rejects, 111 broken-pipe errors) — C16 = hard-capacity boundary, not a
-      product point. Sweep C10-C16 + 10-min soaks C10/C11: knee at C13 (first B4 worker);
-      **preferred C11** (pooled soak 0.886; short class alone 0.917, and 0.905 at C10),
-      **mandatory-qualified C12**, **hard capacity C16**. Handoff §3.
-- [ ] TQ-2 Fail-fast boundary: at a full host rejects surface as TCP resets / broken pipes
-      instead of a 503 (4 of 28 in the C12 Poisson run, 111 of 707 in the C16 soak) — the reject path must drain the
-      request before closing; also record that rejection is per worker (cap 4): C20 sent 8
-      rejects with 16 host slots. Gate: 0 resets over >= 100 rejects, reject count = C-16
-      for a simultaneous wave when the parent balances.
-- [ ] TQ-8 Leading silence before speech: a measured ~0.5 s of dead air ahead of the first
-      voiced frame on a 1.7B-class checkpoint (median 0.50 s over 36 files) against 0.06 s on
-      a 0.6B-class one (52 files), consistent across every text class. It is not covered by
-      any latency metric we gate on: what a caller experiences is TTFA PLUS the lead-in, so
-      ~740 ms against ~186+60 ms. That is larger than anything the C12-WIN decoder ladder was
-      chasing, and the ladder delivered nothing. CAUSE NOT ESTABLISHED -- model-emitted silent
-      frames or an engine/prompt artefact are both open, and checkpoint size is confounded
-      with training data. FIRST STEP is the discriminator, not a fix: run the same
-      energy-envelope pass on the OPEN 1.7B and 0.6B models, same bank and settings; ~10
-      minutes, CLI is enough. Only if it is model-side does a bounded, default-off leading
-      trim make sense, gated on `safe_play_start` rather than TTFA and checked against the
-      streaming decoder's continuity contract. Detail:
-      `.work/leading-silence-perceived-latency-20260910.md`.
-### CUDA parity track — detail: `.work/cuda-parity-track-20260915.md`
-
-Opened 2026-09-15, before renting a GPU box, so instance time goes to verification rather than
-discovery. Owner's order: **fixes first, then the parity analysis, then any CUDA-only flags.**
-
-- [x] CUDA-1 Misleading offload banner. The seam in `qwen_tts_backend.h` carries `matvec_bf16`
-      and `matmat_bf16` only, so `--backend cuda --int8` (or `--int4`) offloads NOTHING while
-      the startup line claimed it did. `main.c` now prints an explicit NOTE naming the resident
-      paths instead. Inside the GPU `#if`; the CPU build does not compile it.
-- [x] CUDA-2 PR #29 (`Da3dalusCode`) — **MERGED 2026-09-16**, merge commit `79ca337`, with
-      `gh pr merge 29 --merge` so `f4b0e5e Da3dalusCode` stays in main's history and in the
-      contributor graph. `sd_pack_convt` (`qwen_tts_speech_decoder.c:229`) writes `[k][ic][oc]`
-      and overwrites the weight pointer **in place**, so CUDA always received the packed tensor
-      while `kd_convT` read it as `[ic][oc][k]` — unconditional on the GPU decoder path.
-      Verified before merging on an RTX PRO 6000 Blackwell (CUDA 12.8, 0.6B, ryan/English,
-      seed 42, temperature 0, `QWEN_CUDA_CONVDEC=1`), generating the same text from a clean
-      clone with and without it: the PR's own `decoder_convT_packed` self-test passes at
-      `rel = 6.278e-08` on both the naive and gemm paths; duration is 7.12 s either way, so the
-      codec tokens are identical and only the decoded waveform changes; `pearson -0.005`; and
-      the level goes from **rms 137 to rms 1254** — attenuated noise to ordinary speech on the
-      int16 scale. Confirmed by ear.
-- [x] CUDA-8 **Batched GPU Talker: wrong results, illegal memory accesses and 0.12x
-      throughput — FIXED.** `--gpu-batch-bench` bisected it cleanly: exact at B<=2, broken at
-      B>=4, with correctness and speed failing at the same threshold. The three batched matmat
-      kernels accumulated into `float s[QB_MAX]` through loops bounded by the runtime batch
-      size; with a runtime bound the compiler spilled the accumulator to local memory, which on
-      a GPU is backed by global memory. That one detail produced `max|batched-single| = 2.93e+01`
-      (the engine's own gate printed FAIL), ~11k illegal accesses per run, and a collapse to
-      0.06x. compute-sanitizer's "Invalid __global__ write" inside `k_matmat_bf16` at an address
-      far outside every allocation was the spilled accumulator, not the `Y` it appeared to
-      target — which is why every pointer in the batch state dumped as valid.
-      Fixed in `c55d298` by unrolling the per-sequence loops over the compile-time `QB_MAX`.
-      After: exact at every B, **5.03x at B=8** (33x better), zero illegal accesses, and the
-      server case that used to crash now runs with the GPU at 51-71% instead of 0%.
-      NOTE the new trade-off: `s[QB_MAX]` now lives in registers, so raising `QB_MAX` above 8
-      costs registers and occupancy. It is no longer a free constant.
-- [x] CUDA-9 **Best measured serving configuration: all three CUDA paths on together.**
-      `QWEN_CUDA_FUSED_TALKER=1 QWEN_CUDA_BATCH=1 QWEN_CUDA_CONVDEC=1` with `--backend cuda`,
-      single process, had never been run in combination — every earlier arm enabled a subset.
-      At C4, 3-minute soaks: stall@100 1%, **stall@250 0%**, safe_play_start 93/236 ms,
-      max_gap p95 0.502 s, zero illegal accesses — against 100% / 95% / 532/681 ms for the
-      plain seam. Owner confirmed by ear that the audio captured **under load** at C4 is good.
-      Not yet a qualification: these are 3-minute screens, and `--precision default` is
-      mandatory (see CUDA-11).
-- [x] CUDA-10 **The code predictor, opened up (A6000, 2026-09-16).** `QWEN_CP_PROFILE` split
-      it almost evenly: GPU transformer passes 54.7%, head 45.1%, seed 0.1%. Three changes,
-      all bit-identical (`0.00e+00` on batched-vs-single, CP, and partial occupancy):
-      **(a)** CUDA graphs for the **batched** bodies — the ones the server runs had none, only
-      the single-stream ones did, so a frame issued ~1950 launches (-5.0% talker, -8.2% CP);
-      **(b)** the head — final norm, lm_head, argmax — moved to the GPU, where a weight row is
-      read once for all lanes instead of once per lane: **11.61 -> 1.35 ms/frame**, stall@250
-      84% -> 57%, 82 -> 96 requests in the same four minutes;
-      **(c)** four weight loads in flight in `k_matmat_bf16`, which was latency-bound at
-      180 GB/s on a 768 GB/s card (talker -14.4%, CP -22.4% overall for the session).
-- [ ] CUDA-12 **Retired: fusing the CP loop onto the device buys nothing.** The plan behind
-      CUDA-10 was that the fifteen per-frame host round trips — upload, launch, full sync,
-      download — were the cost, and that the cure was a device-resident loop (vLLM-Omni's
-      "fuse ~60 kernels"). `qwen_cuda_cp_batch_bench_fused` replays the same fifteen bodies
-      with **one** sync and no copies: 11.62 vs 11.53 ms/f at B=4, 13.21 vs 13.17 at B=8.
-      **Zero.** The GPU is busy for the whole pass; the host is never the critical path. Do
-      not re-open without a measurement that contradicts this one.
-- [x] CUDA-15 **safe_play_start is not a GPU problem (A6000, 2026-09-16).** 43% of server wall
-      time is admission; 2.9% of iterations hold 45% of it and 95% of that is the prefill, which
-      stalls the batch up to 1977 ms — exactly the 2.0 s max_gap behind a 1.9 s safe_play_start.
-      `QWEN_CUDA_SEAM_STATS=1` priced the GPU share: **seam 278 ms against a prefill of 53,200 ms,
-      i.e. 0.5%**. Nothing to move to the resident path. The levers are the CPU prefill (out of
-      scope, invalidates CPU baselines) or a real GPU prefill behind `#ifdef` — a new kernel of a
-      different shape, a project not a refinement.
-- [x] CUDA-18 **Serving envelope on a strong GPU (RTX PRO 6000 Blackwell, 2026-09-16) — WIP.**
-      Eight 2-minute screens, 0.6B, all resident paths, length-varied corpus (21 texts, 5 classes,
-      4 to 59 words). **C11 is the highest clean rung**: stalls 0% from 250 ms upward (2% at the
-      tightest 100 ms from C9), safe_play_start ~104/237 ms, TTFB 20 ms, TTFA 93 ms, RTF p50 0.47,
-      238 requests in two minutes. C8 to C11 is a plateau; the break to C12 is a cliff — 12%
-      stalls at 250 ms where there were none, safe_play_start p95 237 -> 564 ms, throughput
-      238 -> 178 requests. Audio-seconds per wall-second peak at 24.1 near C10 and fall to 17.4 at
-      C12. Judged on the envelope, never on RTF: C12 would pass both an RTF and a
-      safe_play_start test while stalling 22% at 100 ms.
-      **Correction worth keeping:** a first pass ran C2/C4/C8/C12/C16 and concluded C8 was the
-      last clean rung, with throughput peaking there in apparent agreement with the batched
-      kernel's own B=8 optimum. Filling in C9-C11 dissolved both claims. A doubling ladder
-      establishes "the highest rung measured clean", never "the highest rung that is clean", and
-      an elegant coincidence is not evidence. Detail: `docs/cuda-performance.md`, "RTX PRO 6000
-      Blackwell".
-- [ ] CUDA-17 **NEXT PHASE: a native GPU prefill, separate from decode.** `qwen_cuda_talker_prefill()`
-      — RMSNorm/RoPE, causal N x N attention, SwiGLU/MLP, KV written straight into the slot's
-      device cache, then hand back to the batched decode. This is the only thing that can move
-      `safe_play_start`, since admission is 43% of server time and only 0.5% of a prefill is GPU
-      today (CUDA-15). It also deletes the `qwen_cuda_talker_batch_upload_slot()` transfer as a
-      side effect. **A project, not a micro-optimisation**: the decode kernels do not transfer
-      (B lanes at one position vs one sequence at N positions). Rules: everything new in the .cu,
-      the call site an `#ifdef QWEN_HAVE_CUDA` with the CPU body byte-identical, and an estimate
-      + standalone PoC BEFORE implementing — split the host 2.8 s first with `make cost-map` or
-      `perf` (zero code change), and only proceed if the GPU floor is ~100x under, not ~5x.
-      Design note: `.work/cuda-parity-track-20260915.md` §15.
-- [ ] CUDA-16 **Do not enable `QWEN_PREFILL_SLICE` on CUDA.** It is a CPU mechanism. It cuts the
-      admission peak 1976 -> 569 ms exactly as designed, and costs 38% of throughput while
-      quadrupling safe_play_start, because the CUDA prefill's cost is per-call, not pool
-      contention. Detail: `.work/cuda-parity-track-20260915.md` §14.16.
-- [ ] CUDA-13 **Remaining: `k_matmat_bf16` is still ~2.5x off the memory roof** after the
-      unroll, and the talker is now the largest consumer. This is kernel efficiency, not
-      structure. The int8/q4 batched matmats share the shape but the CUDA seam is bf16-only,
-      so nothing served reaches them.
-- [ ] CUDA-14 **Concurrency ladder on the A6000** (0.6B, all three paths, batch=C): RTF p50
-      0.44 / 0.77 / 1.05 / 1.37 and stall@250 9% / 53% / 90% / 100% at C2 / C4 / C6 / C8.
-      Knee between C4 and C6. Not a qualification — an A6000 behind a 10-core EPYC 7402 is a
-      weaker box than the A100 arm, and every run still fails per-class KPI drift.
-- [ ] CUDA-11 **Measurement traps. Three now, all the same shape: a harness default that
-      quietly disables the thing being measured.**
-      **(a)** `tests/serve_soak.py` defaults `--precision` to int8 (`:561`), and the backend
-      seam is bf16-only, so a CUDA soak without `--precision default` runs with the GPU at 0%
-      while looking healthy.
-      **(b)** It also defaults `--prefork-threads` to **1** (`:563`), which with `--prefork 1`
-      sizes the whole server pool. Every GPU soak we have run — today's A6000 ladder AND
-      yesterday's A100 arm — measured the server with ONE engine thread on a ten-core box.
-      Measured at C4: RTF p50 0.68 -> 0.58, stall@1000 11% -> 4%, 82 -> 91 requests, with the CP
-      step unchanged at 7.3 ms/frame, so the cost is entirely CPU-side. The ENGINE default is
-      `cpus/n` and has always been right; only our measurements were wrong, and every GPU number
-      recorded before 2026-09-16 understates the server by about this much. Four threads
-      captures it all, eight adds nothing.
-      **(c)** Never compare two arms that differ in more than one flag — the
-      "seam beats resident" conclusion recorded earlier was really CONVDEC on versus off, and
-      had to be withdrawn. Detail: `.work/cuda-parity-track-20260915.md` §12.
-- [ ] CUDA-7 **The Metal batched path has the same defect as the CUDA one, unfixed.**
-      `qwen_batch_talker_step_ragged` (`qwen_tts_talker.c`) and `batch_cp_transformer_step`
-      (`qwen_tts_code_predictor.c`) each have a Metal branch a few lines below the CUDA branch
-      that likewise calls `qwen_metal_*_batch_step(...)` without forwarding `active`. The CUDA
-      version of this was an illegal memory access and wrong audio (fixed in `c749ac0`); the
-      Metal shaders must be read to confirm whether they index by per-slot position the same
-      way. NOT fixed here because no Apple GPU was available to verify, and the session was
-      scoped to CUDA. Do not assume it is benign.
-- [ ] CUDA-3 NEEDS-GPU: `QWEN_CUDA_CONVDEC=1` disables the exact streaming decoder
-      (`sd_exact_stream_enabled()` returns 0, `qwen_tts_speech_decoder.c:3062`) and, when not
-      streaming, forces `dt_no_overlap = 1` (`qwen_tts.c:1696`), dropping decoder/talker
-      overlap. Quantify what streaming actually loses before treating the GPU decoder as a win.
-- [ ] CUDA-4 NEEDS-GPU: batched CUDA requires the fused talker AND CP and is capped at `B <= 8`
-      (`qwen_tts.c:2964`). Establish whether the cap is a real limit or an arbitrary one.
-- [ ] CUDA-5 NEEDS-GPU: re-run the REPRO-1 A/B/B probe against the CUDA server with the fused
-      talker on. The fused-GPU delta-prefill guard (`qwen_tts.c:1529-1543`) only forces
-      `delta_start = 0` when steering is active, so the no-steering case may still fork.
-- [ ] CUDA-6 The backend-agnostic serving layer (admission, execution budget, envelope metrics,
-      soak/screen harnesses, KPI contract) should be pointed at the CUDA server unchanged — it
-      measures a server, not a CPU, and is the honest way to compare euro for euro. The Arm
-      decoder cohort work and specs 11A/12 do NOT transfer: a GPU-resident decoder replaces that
-      component rather than tuning it.
-
-- [ ] TQ-7 GPU serving: `--backend cuda --prefork N` is silently broken. **GUARD WRITTEN
-      2026-09-15, NOT YET VERIFIED ON A GPU.** `main.c` now refuses the combination up front
-      (inside `#if defined(QWEN_HAVE_METAL) || defined(QWEN_HAVE_CUDA)`, and only when
-      `gpu_backend_str` is non-NULL, so a CPU-only build does not even compile it and
-      `--prefork` without `--backend` is untouched). Message points the user at
-      `--batch-size`, which raises throughput inside the single process that owns the context.
-      Per-worker GPU contexts (fork first, initialise in each child) remain a possible future
-      design, not a bug fix. Still to do on a GPU box: confirm the refusal fires and that
-      `--backend cuda` without `--prefork` is unaffected. Original analysis: VERIFIED at HEAD:
-      the resident CUDA Talker/CP state is created in `main.c` (~:1665) BEFORE
-      `qwen_tts_serve_prefork` (~:3082) forks; a CUDA context does not survive `fork()`, and
-      no guard exists anywhere (`grep -ci cuda qwen_tts_server.c` = 0, no mutual exclusion in
-      main/qwen_tts/cuda). macOS escapes only via the non-Linux prefork stub. Silent wrong
-      answer, not a crash. Fix: refuse the combination, or fall back to the single-process
-      batched server with a warning. Related: the global GPU seam is bf16-only
-      (`qwen_tts_backend.h` exposes only `matvec_bf16`/`matmat_bf16`), so `--backend cuda`
-      with `--int8` offloads nothing while the startup line still advertises offload.
-      Scoping note: specs 11A/12 and the Arm decoder work carry NO value on a GPU lane, since
-      a GPU-resident decoder replaces that component rather than tuning it; the
-      backend-agnostic layers do carry over. Detail:
-      `.work/arm-linux-v2-parity-track-20260910.md` section 2e.
-- [x] TQ-6 BUILD BREAK, not Arm-specific: the tree does not link when neither
-      `__ARM_FEATURE_DOTPROD` nor `__AVX512VNNI__` is defined — `SIMD=portable` (the default
-      non-VNNI x86 target) and `SIMD=scalar` both fail. Seven symbols are declared and called
-      unconditionally but defined only inside the ISA guard in `qwen_tts_kernels.c`, and the
-      `#else` fallback sits inside that guard, so it is unreachable. VERIFIED at HEAD with
-      `make blas ARCH_FLAGS="-march=armv8-a"`. Partly introduced by C12-WIN: `_ctx` in
-      ddfa5d8, `_pack_stack`/`_stack_epilogue` in edfd3fb. FIXED on `feature/arm-parity-vnni`:
-      the ISA-neutral ConvT stack and the DL-4 packer moved outside the guard, no-op fallbacks
-      for the three ISA-bound entry points, link-only CI jobs. Re-verified with
-      `-march=armv8-a` (links, self-test PASS) and on the native build. Detail:
-      `.work/arm-linux-v2-parity-track-20260910.md` section 1.
-- [x] TQ-5 HTTP JSON string parsing: **ROOT-CAUSED + FIXED** in
-      `cf8dd6b09d6de8abc51cccfa6aa90d3fa062b8c7`. The server now decodes standard JSON
-      escapes, UTF-16 surrogate pairs, and raw UTF-8 correctly; malformed strings are
-      explicit HTTP 400 errors rather than absent optional fields, and JSON responses
-      preserve non-ASCII UTF-8. Causal Turin C1 gate passed: escaped/raw requests converge
-      to `tail_len=24`, 53 codec frames, and the CLI-identical full codec SHA. The Python
-      harness default `json.dumps()` remains the regression oracle; it was not globally
-      changed to `ensure_ascii=False`. Requalification is needed for previous non-ASCII
-      semantic-quality/CER/golden evidence. Paired V2/control comparative performance
-      evidence remains usable; no full C12 performance rerun is required. Detail:
-      `.work/server-cli-italian-correctness-20260910.md`.
-- [x] TQ-4 Server-vs-CLI Italian pronunciation defect: **ROOT-CAUSED + FIXED** by TQ-5.
-      The defect was upstream JSON decoding, not Talker/CP/KV/V2/GEMM, batching, or the
-      decoder. The fixed-tree listening pair is retained privately for human sanity review.
-      Previous absolute Italian semantic-quality claims remain pending requalification;
-      the existing C12-WIN order resumes unchanged after the Spec12/Spec11A gates.
-- [ ] TQ-3 Ear verdict on the paired RES1_V2 bank (`samples/tests/2026-09-09_turin-qualification/`);
-      PASS promotes `turin-c8a-32c-vnni-product` from provisional to qualified for C12.
-- [ ] Reduce structural decoder intercept/rendezvous cost only where measurements justify it;
-      retain fused residual as a qualified pooled candidate and consider a strip executor only for proven
-      small-call/intercept work. Ragged worker scratch reuse was rejected as a serving
-      optimization; claim-first allocation hygiene is retained but KPI-neutral. Details:
-      `.work/p4-rag-panel-scratch-20260907.md`, `.work/p4-rag-claim-first-20260907.md`.
-- [ ] No speculative completed-stage resumability or dedicated core lanes without evidence
-      (DL-1 is the evidence-gated exception: it is an A/B, not a promotion).
-
-### P5 Ownership and batching
-
-- [x] F3 cross-worker cohort coincidence (2026-09-08): in the cap-2 C4 reference,
-      useful natural B>=3 opportunities covered only `2.7%` of steady ready events
-      within ±1 ms, `3.6%` within ±2 ms and `11.7%` within ±8 ms. Global batching is
-      not justified as the next implementation on this 2x6 host; no state consolidation
-      or deliberate batch wait was added. Detail:
-      `.work/f3-cross-worker-cohort-coincidence-20260908.md`.
-- [ ] EO-1/EO-2 Single-engine/global Talker/CP ready set only after P3/P4 coupling is controlled;
-      form deadline-compatible cohorts without waiting solely to create B.
-- [ ] AMX Talker/CP only when real B >= 4 work exists. CP stateless re-prefill remains dropped
-      unless new local evidence invalidates the reviewed cost model.
-- [ ] Later ownership/topology changes only if the bounded overlap evidence justifies them.
-
-### Research-only (not current implementation scope)
-
-- [ ] SL-2 live incremental text / park-not-pad; long-form segmentation with decoder-state
-      carry; bounded Talker memory; own-codes re-prompt negative arm.
-
-### P6 Qualification and backend comparison
-
-- [x] QL-1 1.7B final decision on GCP C4 highcpu-16: known-text SL-1 removes the
-      dominant long-prefill startup term, but full C3 still lacks sufficient sustained
-      tail margin. C2/cap2 is the highest full-envelope GOOD point; C3 is screen-only.
-      Detail: `.work/ql1-gcp-c4-highcpu16-17b-final-20260908.md`.
-- [x] QL-2a Cross-ISA serving parity audit: common server semantics are portable, but
-      AMX Design-D/fused ragged decoder execution is not shared by VNNI or Arm; freeze
-      a common-control lane plus a separately labelled best-per-ISA lane before spend.
-      Detail: `.work/cross-isa-serving-parity-audit-20260908.md`.
-- [x] QL-2b Operational cross-ISA profiles and strict resolved-dispatch gates: AMX,
-      VNNI, Arm and common-control profiles pin the relevant flags, reject invalid
-      fallbacks and embed the resolved preflight in WAVE/SOAK artifacts. No hardware
-      comparison is closed by this task. Detail:
-      `.work/cross-isa-operational-parity-20260908.md`.
-- [x] QL-2c Local AMD/Turin campaign preparation: known-text SL-1 is pinned across the
-  comparable VNNI/Arm/control lanes, the default-off stage-pressure trace has an
-  offline receive-gap overlap helper, and the claim audit/runbook preserve
-  MEASURED/DERIVED/PREDICTED boundaries. No host was benchmarked. Detail:
-  `.work/post-8core-codex-review-20260908.md` and
-  `.work/turin-vnni-campaign-plan-20260908.md`.
-- [x] QL-2d Turin fast screen on AWS c8a.8xlarge (32 Zen5 cores, 4 CCX, 2026-09-08):
-  1.7B holds C8 and not C10 (`2x16` cap 4 STREAM p95 0.79-0.84 at C8, C10 1.05; `4x8`
-  cap 2 0.87; `1x32` collapses at 1.4); 0.6B `4x8` cap 4 holds C12 at 250 ms and C16
-  at 500 ms, `2x16` collapses at C16. Screen only: provisional profile, 1 wave, short
-  texts. Detail: `.work/turin-c8a-32c-fast-screen-20260908.md`.
-- [ ] QL-2e Turin ceiling calibration: the doctor's physics ceiling is C28-32 for 1.7B
-  where the host delivers 8; measure the three named gaps (wide-pool collapse incl. the
-  40 GB/s cross-CCX cache rate, the VNNI decoder term now a ×1.5 GUESS, batch scaling
-  past B2) with the stage trace at C8/C10 on `2x16`, then run the pre-registered Phase 4
-  on `2x16` cap 4 and `4x8` cap 2 only. Same addendum, §5-6.
-- [x] DR-1 Doctor wave plan + ceiling: `wave-plan.json` + `tools/doctor_wave.py`
-  (`make doctor-wave`) run the recommended grid from one file; every candidate K gets its
-  own measured GEMV roof; section 8 CEILING prints physics / model / floor per shape with
-  the measured calibration points of the ISA family. Same addendum, §7.
-- [ ] QL-2 Re-evaluate promising backends (0.6B, AVX-512/VNNI hosts, ARM) under the same
-  playback-aware harness only after QL-1 has one trusted reference and the QL-2a
-  + QL-2b dispatch/quality gates are applied; do not present AMX-only decoder work as
-  parity.
-  Completed slot: GCP C4 highcpu-16 / 8 physical AMX cores. For 1.7B, `1x8`
-  is the best topology and C2 is the final full-envelope point; C3 is screen-only
-  and C4 is NOT GOOD. For 0.6B, C3 is the final full-envelope point and C4 is
-  non-promoted. The next slot is AMD/Turin VNNI, then Axion/Arm. Detail:
-  `.work/ql2-gcp-c4-highcpu16-amx-20260908.md` and
-  `.work/gcp-c4-highcpu16-amx-product-capacity-20260908.md`.
-
-### Retained, demoted or deferred (ids kept for addenda; none is a current priority)
-
-- Multi-precision waits behind P0-P3: AMX-2 shared representation, AMX-5 BF16 serving
-  policy, AMX-10 W4 feasibility; INT8 is the serving reference.
-  PREFILL-Q (calibration-aware prefill quantization) is a deferred research arm behind
-  the architecture work; detail: `.work/post-p2-streaming-research-agenda.md` R9.
-- Superseded by the envelope: AMX-1, AMX-3, AMX-6, AMX-7, AMX-9 (C4 qualification and
-  cross-request decoder aggregation are no longer the next bet; aggregate only for
-  isolation/cadence, never for width).
-- Controls: P0.1/P0.2, P1.1–P1.4, CTRL-1–CTRL-4; deferred X86-2–X86-8 and LATER-1–4.
-- Closed: AMX-4, AMX-5, AMX-8, P3.1, P3.2, P3.6, ragged scheduler review
-  (`.work/amx-ragged-scheduler-review-3f7e0df.md`), and the ids below.
-- [x] P2.1 Runtime parity — `.work/p2-cross-backend-runtime.md`
-- [x] P2.2 CP/Talker region parity — same addendum
-- [x] P2.3 Batched-head/budget parity — same addendum
-- [x] P2.4 Hot-path allocation fixes — same addendum
-- [x] P2.5 One engine-owned budget — same addendum
-- [x] P2.6 Pool reentrancy reporting — same addendum
-- [x] P3.3a Pool capability parity — `.work/p3-runtime-knob-parity.md`
-- [x] P3.4 Decoder capability/policy split — same addendum
-- [x] P3.5 Effective AMX/x86 decoder knobs — same addendum
-
-## Qualification gates (provisional, become hard only after MT-1)
-
-| dimension | mandatory | preferred |
-|---|---|---|
-| correctness | parity PASS; errors = rejects = timeouts = 0 | |
-| TTFB / TTFA p95 | measured independently | < 100 ms / < 500 ms (<= 700 ms only for better continuity) |
-| STREAM_RTF p95 | < 1 | <= 0.90 (<= 0.85 strong) |
-| required_prebuffer p95 | reported | <= 500 ms (<= 250-300 ms strong) |
-| safe_play_start p95 | reported | <= ~1 s (<= ~800 ms strong) |
-| stall_rate@500ms | -> 0 at the operating point | stall_rate@250ms -> 0 |
-| admission / slow client | no induced stall on established streams | |
-
-Never promote q32 for RTF, trade cadence for TTFA, manufacture AMX work, or reopen
-BF16/W4 as the P1 fix.
-
-## Evidence
-
-`.work/professional-streaming-architecture.md` (cadence law, AMX accounting, candidates, envelope, historical classification); `.work/p2-checkpoint-20260907.md`, `.work/p1-cadence-truth-20260907.md`,
-`.work/p2-sq2-direct-convt-20260907.md`, `.work/p2-sq2-direct-dwconv-20260907.md`, `.work/p2-sq2-direct-input-20260907.md`, `.work/p2-sq2-direct-quant-20260907.md`, `.work/p2-input-length-scaling-20260907.md`, `.work/amx-c4-cross-request-20260907.md`,
-`.work/amx-c4-chunk-sweep-20260906.md`, `.work/amx-c4-ragged-threshold-20260906.md`,
-`.work/amx-native-epic.md`, `docs/reference-gcp-c4-standard-24.md`, `docs/runtime-map-c8a-c4.md`.
+# PLAN.md — Qwen3-TTS C Engine Roadmap
+
+Updated: 2026-06-04
+
+Core engine is **COMPLETE** and producing good audio for both 0.6B and 1.7B.
+INT8 is validated end-to-end. **x86 is no longer Apple-only:** AVX2 hot-path twins +
+cross-OS pthread pool + int4 are **validated on a Ryzen 7 6800H (2026-06-04, RTF ~2.02)**.
+Remaining x86 work = **AVX-512/VNNI** (code written, needs a rented Zen4+/Intel box; the
+6800H has no AVX-512). The current focus is **hybrid mixed-precision quant**, the
+**prosody/roughness knob** (the differentiator), and the test/release backlog. History is
+compacted at the bottom — nothing dropped.
+
+---
+
+## CURRENT FOCUS — Phase 21: Hybrid quant + cross-OS threading + x86
+
+> The thesis (à la antirez's DS4 mixed-quant engine, applied to OUR pipeline): we own
+> the engine, zero deps → assign bits **per-component / per-tensor** by two axes —
+> (1) how much that tensor costs in bandwidth/time, (2) how much quant noise the output
+> tolerates in the flow. Quantize hard where it's *heavy AND tolerant*; keep precision
+> where errors cascade. Not uniform quant — target the bottleneck.
+
+### 21.0 Validated this session (baseline for everything below)
+
+- **INT8 end-to-end** (Talker 1.7B + CP both models, preset + WDELTA `.qvoice`):
+  - 0.6B RTF 1.70 → **1.29 (−24%)** (CP-only int8; Talker stays bf16 on 0.6B, see below)
+  - 1.7B RTF 2.66 → **1.79 (−33%)** (Talker 65.8→49.7, CP ~64→59.2 ms/f)
+  - Quality validated by ear (preset, custom voice, streaming, server). EOS normal.
+  - Fixes that unblocked it: (1) `qwen_ftz_on()` FTZ for int8-induced denormals (FPCR
+    bit24 ARM / MXCSR FTZ+DAZ x86); (2) route `qwen_matvec_int8_qkv` through the fused
+    per-q/k/v path (inline GCD block hung at 4 threads); (3) drop the CP `cp_h>=2048`
+    gate; (4) re-quantize after a WDELTA voice override (was using stale CV weights);
+    (5) batched int8 prefill (was forced sequential).
+- **Streaming TTFA 1571 → 560 ms (−64%)**: wired `--stream-chunk` (was ignored), ramped
+  first chunk (2 frames then configured size), batched int8 prefill (477→226 ms).
+- **Facts corrected (believed wrong for months):**
+  - The Code Predictor is **hidden=1024 on BOTH 0.6B and 1.7B** (verified via tensor
+    shapes). Only the Talker differs (0.6B 1024 / 1.7B 2048). → CP quant helps both equally.
+  - **INT4 is slower than INT8 on the Talker** (64.3 vs 45.9 ms/f, 1.7B) — but that test was
+    on the *compute-bound* Talker. The *bandwidth-bound* CP is untested (see 21.1).
+  - Run-to-run non-determinism is **benign** (±1 LSB / −90 dB, FP rounding, not a bug).
+
+### 21.1 Hybrid mixed-precision quant map — THE plan
+
+**What's quantized TODAY (ground truth from the quantize fns):**
+
+| Component | Output | INT8 today | Kept bf16/f32 |
+|---|---|---|---|
+| **Talker** (28 layers) | **sampled** (temp 0.5) | wq/wk/wv/wo, gate_up, down — **only if hidden≥2048** (`talker.c:188`) → **1.7B only**; **0.6B Talker stays bf16** | norms (f32), text_embedding, text_projection, codec_head, codec_embedding |
+| **Code Predictor** (5 layers, hidden=1024 both) | **greedy/argmax** (temp 0) | wq/wk/wv/wo, gate_up, down **+ 15 lm_heads** — **both models** | 15 codec_embedding (lookup), norms, mtp_projection |
+| **Speech decoder** (ConvNet) | deterministic | **nothing** | all f32; runs on overlapped pthread → **off critical path** |
+
+Two structural facts drive the map:
+- **CP is greedy** → far more quant-tolerant than the sampled Talker (argmax must flip to
+  change output; the Talker has a sampling butterfly effect). AND it's the bottleneck
+  (74–90% of frame time) AND bandwidth-bound (re-reads ~120 MB of weights 16×/frame).
+  → **most aggressive quant target.**
+- **Decoder is off the critical path and f32** → quantizing gives no latency win and can
+  only hurt audio. **Leave it.** (This is the "not everything, only where it helps" of DS4.)
+
+**Proposed hybrid bit assignment:**
+
+| Comp. | Tensor | Today | **Hybrid** | Rationale |
+|---|---|---|---|---|
+| **CP** | FFN gate_up + down | int8 | **int4 group-wise (Q4_0, 32-blocks)** | biggest bytes + greedy-tolerant + bw-bound → int4 should finally WIN here |
+| | q/k/v/o | int8 | **int4↔int8 (measure)** | smaller, Q/K→RoPE→KV slightly more sensitive |
+| | 15 lm_heads | int8 | **int8 (try int4)** | logits but greedy |
+| | codec_embedding ×15 | bf16 | **bf16** | sparse lookup, ~0 bandwidth |
+| | norms | f32 | **f32** | 1-D, scales everything |
+| **Talker** | FFN gate_up + down | int8 (1.7B) / bf16 (0.6B) | **int8** (measure 0.6B: was compute-bound → 0%) | sampled → **int8 ceiling**, no global int4 |
+| | q/k/v/o | int8 (1.7B) | **int8** | feeds KV → persists across all future tokens |
+| | codec_head (output) | bf16 | **bf16** | **sampled** output = most sensitive of all |
+| | text_embedding | bf16 | **bf16** | huge but sparse lookup |
+| **Decoder** | conv | f32 | **f32** | off critical path + audio quality |
+
+- [x] **EXPERIMENT #1 — int4 on the CP FFN: REFUTED (2026-06-01, `feat/int4-cp-ffn`).** Wired
+  Q4_0 on CP gate_up+down (forward prefers q4 > int8 > bf16), measured via `make cp-microbench`
+  (0.6B, seed 42, ryan, IT, vs `--int8` baseline). int4 **LOSES on both axes**:
+  - Speed: FFN gate_up 17.2→**24.8 ms/f (+40%)**, FFN down 10.2→**13.7 (+30%)**, CP TOTAL
+    57→**67 ms/f (+14-18%)**. (microbench stable ~4%; single-shot wall RTF is noisy — trust the
+    per-op slots, not RTF.)
+  - Quality: audio rms 0.085→**0.063 (−26%)**, peak 0.72→0.53, greedy codes flipped (119→123 frames).
+  - Two causes: (1) `q4_0_matvec_inner` is **1-row, not 2-row-fused** like int8 → 2× the x-loads +
+    nibble-unpack overhead masks the 30MB-vs-60MB bandwidth saving; (2) per-block-32 absmax int4 is
+    **too coarse for the CP** — quality loss is *independent of kernel maturity*. Even a perfect
+    2-row q4_0 kernel would not fix the −26% rms. **This is NOT a DS4-style "no quality loss" win.**
+  - **Decision: drop int4 on the CP.** int8 is the quality floor; the speed lever is making the
+    *already-winning* int8 FASTER (SDOT native dot), not going lower-bit. → Experiment #2 below.
+- [x] **EXPERIMENT #2 — SDOT native int8 dot: WON (2026-06-01, `feat/int8-sdot`).** Replaced int8
+  dequant→f32→FMA with `vdotq_s32` (4 int8×int8 MACs/instr, 2-row fused) + dynamic per-vector int8
+  quant of activation `x` (`quantize_act_int8`). Apple clang defines `__ARM_FEATURE_DOTPROD` by
+  default on Apple Silicon (no flag; `make` CC=gcc → /usr/bin/gcc = Apple clang). Runtime opt-out
+  `QWEN_NO_SDOT=1` kept as safety fallback + A/B knob. Validated across the matrix (seed 42, IT,
+  cp-microbench, A/B via the env toggle):
+  | Model / voice | speed | quality |
+  |---|---|---|
+  | 0.6B preset (CP int8) | FFN gate_up −25%, down −28%, **CP TOTAL −24%**, **RTF→0.98** | clean (listened) |
+  | 0.6B Silvio `.qvoice` short | CP −30% | same duration+peak, clean |
+  | 0.6B Silvio `.qvoice` long 30s | CP −19% | clean, rms +23% |
+  | 1.7B preset (Talker+CP int8) | **Talker −23%, CP −21%** (−22%/frame) | clean (listened) |
+  - **Key: weights stay int8** (the validated precision) — SDOT only changes *how* the dot is
+    computed. The only new approximation is mild int8 activation quant. rms drifts both directions
+    by utterance (sampling/trajectory variance, NOT systematic degradation). **This IS the DS4-style
+    clean win** — speed with no quality loss, unlike int4 which lowered weight precision.
+  - **0.6B broke the RTF 1.0 barrier** (preset short, RTF 0.98) — the Phase 18 target.
+  - Activation quant is per-vector absmax; outlier worry did not materialize — listening confirmed
+    fine on the greedy CP AND the sampled 1.7B Talker. Selective-SDOT (down_proj legacy) NOT needed.
+- [x] `[REFUTED 2026-06-04]` **SDOT on CP lm_heads — DON'T.** Tried routing `qwen_argmax_matvec_int8`
+  through the SDOT path (quantize x to int8, vdotq_s32). It is NOT free: quantizing the lm_head
+  activation flips enough near-tie argmaxes that — via the CP→Talker code feedback — the int8
+  trajectory FORKS (int8 golden mel-corr 1.0 → **0.51**, duration +11%). The f32-precision activation
+  on this one final matvec is what STABILISES the int8 trajectory. ~0.9% overall speed (4.3%-of-CP ×
+  ~20%) is not worth changing the validated int8 output. Kept on the f32 path; documented in-kernel.
+- [x] `[NO-WIN 2026-06-04]` **q4_0 2-row fuse — reverted.** 2-row-fused the q4 kernel to share x-vector
+  loads across two output rows (bit-identical, verified). Measured on M1 NEON (-j1, 0.6B int4): CP
+  ~167.7 vs ~164.7 ms/f = **no gain, within noise / slightly worse**. The q4 nibble DECODE (unpack +
+  cvt-f32 + scale) dominates; x-loads were never the bottleneck on NEON (the workflow's "+40% x-loads"
+  applied to an older kernel state). Added register pressure (8 x-vectors + 2 accumulator sets) didn't
+  help. Reverted per "no complexity for tiny wins." Re-try only if x86/AVX2 measurement shows x-loads
+  matter there (the AVX2 twin would need the rented box). The real q4 lever, if any, is a DECODE
+  rework (e.g. int8-x + SDOT on decoded nibbles), not x-load sharing.
+
+> ⚠️ **SDOT is ARM-only (`vdotq_s32`).** Its x86 equivalents are now WRITTEN (2026-06-04):
+> the **AVX2 int8/bf16 matvec twins** (`#elif __AVX2__`, validated on the Ryzen box — see 21.3)
+> and the **AVX-512 VNNI** native int8 dot (`_mm512_dpbusd_epi32`, `SIMD=avx512vnni`, commit
+> d67648a — **UNVALIDATED**, needs a Zen4+/Intel AVX-512 VPS; the Ryzen 6800H is AVX2-only).
+> `quantize_act_int8` is portable C, reused as-is by the VNNI path. **x86 reality now (Ryzen
+> 6800H, validated): AVX2 + pthread pool + int4 → RTF ~2.02 on 0.6B** (memory-bound, AVX2 only
+> ~6% over scalar; int4 multi-threaded is the real lever). The "x86 is all scalar / AVX file
+> empty" claim is OBSOLETE.
+- [ ] `[LOW]` No `silvio_17b.qvoice` to test custom voice on 1.7B (needs `qwen3-tts-1.7b-base` to
+  create). 1.7B preset already validates the Talker int8+SDOT critical path.
+
+> **Gate status (updated 2026-06-04):** ① x86 re-audit DONE (deep re-read, not a grep — confirmed
+> AVX2 existed only on 5 aux ops; now AVX2 twins written for all hot ops). ② `silvio_17b.qvoice`
+> created + 1.7B custom voice validated. ③ `feat/int8-sdot` already MERGED → `feat/labs` (14a0239).
+> Branch `feat/avx2-xos-threading` carries the AVX2/threading/int4/VNNI work, NOT yet merged.
+> **Still owed before a release:** the test backlog in 21.6 (qvoice×quant matrix, TSan race,
+> server RTF re-run) + AVX-512/VNNI validation on a rented box.
+- [ ] `[HIGH]` **Group-wise scales for int4** (not per-row absmax like int8). Q4_0 already does
+  per-32-block scales — that's the "no big quality loss" enabler. Per-row int4 = quality death.
+- [ ] `[HIGH]` **Native int8 dot (ARM SDOT)** — M1 has `__ARM_FEATURE_DOTPROD`. Today int8 does
+  dequant→f32→FMA (~10-14 SIMD ops / 16 weights, mostly conversion). SDOT = 4 int8×int8 MACs
+  in ONE instr. For int4: unpack nibble→int8 in-register THEN sdot (cheaper than →f32).
+  Requires dynamic int8 quant of the activation `x` (per-vector absmax, cheap). (folds in
+  old Phase 15.)
+- [ ] `[MED]` **Fuse dequant + matvec + activation** where adjacent (CP gate_up→SwiGLU).
+- [ ] **int2/int1 verdict: research only.** Only the greedy CP could plausibly survive, but
+  with simple absmax/group (no QAT — we're inference-only) quality dies, and ~15 MB CP at int2
+  is still out of L2 → modest bandwidth gain over int4. Realistic floor = **int4-CP / int8-Talker**.
+
+> Cache math (why low-bit only helps the CP): CP weights don't fit L2 (~12 MB M1) at any
+> precision — bf16 120 MB, int8 60, int4 30, int2 15. So the win is purely bytes-from-DRAM,
+> **linear in bits**, no residency threshold. The Talker is compute-bound, so fewer bytes
+> don't help it (proven: int4 lost on Talker). This is why int4 belongs on the CP, not globally.
+
+### 21.2 Cross-OS threading (Win + Linux + Mac)
+
+Today the matvec dispatch is **Apple/GCD ONLY** (`#if defined(__APPLE__) && defined(__BLOCKS__)`
+at `kernels.c:422/444/744/762/936/958` — verified 2026-06-03). Off macOS the block compiles out
+→ **single-thread** decode. So every quant win currently exists **only on Apple Silicon**. The
+ONLY `pthread_create` in the whole repo is `qwen_tts.c:1184` (the decoder-overlap background
+thread, a single thread — NOT parallel matvec). No `#pragma omp`, no pthread pool, no Win32.
+**User requirement (2026-06-03): threading must be offered on Linux/Windows too, not just Mac
+ARM.** This is the single biggest cross-OS gap — even with NEON, Linux ARM is ~3–4× slower than
+the bench numbers purely from running 1 core.
+
+- [x] `[HIGH]` **`qwen_parallel(nt, fn, ctx)` abstraction** — DONE 2026-06-03 (branch
+  `feat/avx2-xos-threading`, `qwen_tts_thread.{c,h}`). One API, 3 backends, all **persistent
+  pool** (workers spawned once via `qwen_threadpool_start`, parked on condvar, chunks claimed
+  by an atomic counter; main participates). The 6 GCD-only `dispatch_apply` sites in
+  `qwen_tts_kernels.c` now route through it:
+  - **macOS** → `dispatch_apply` (GCD), the fast path — unchanged.
+  - **Linux / WSL / POSIX** → pthread persistent pool. Was single-thread before.
+  - **Windows native** → Win32 threads + condition vars (structural; untested — no Win box).
+  - **Validated on M1**: GCD golden mel_corr=1.0; forced-pthread build (`-DQWEN_FORCE_PTHREAD`)
+    mel_corr=1.0 & pool-count-invariant; **full x86_64 scalar+pthread binary under Rosetta →
+    mel_corr=1.0 at 249% CPU** (real cross-ISA + pthread-pool end-to-end proof). `--caps` now
+    reports the active pool (GCD/pthread/Win32), never SINGLE-THREAD.
+
+### 21.3 x86 enablement (logic/ops we support there too)
+
+**STEP 0 deep re-audit DONE (2026-06-03, verified by reading every guard + the AVX2
+intrinsic tally, not a single grep).** The prior "x86 is all scalar" was *substantively*
+correct but mis-framed — the truth is sharper:
+
+**AVX2 exists, but ONLY on 5 auxiliary/elementwise ops** (the `<3%`-of-time overhead):
+`qwen_rms_norm`, `qwen_rms_norm_residual`, `qwen_rms_norm_per_head`, `qwen_bf16_accum_f32`,
+`qwen_bf16_to_f32_vec`. All 56 `_mm256_*` intrinsics in the repo live in these 5 (all in
+`qwen_tts_kernels.c`; `qwen_tts_kernels_avx.c` is genuinely 0 lines of code).
+
+**Everything on the HOT path falls to scalar on x86** (2-way `#ifdef __ARM_NEON … #else`
+blocks, NO `#elif __AVX2__`):
+- matvecs: `bf16_matvec_fused` (314), `int8_matvec_fused` (584), `q4_0_matvec_inner` (869),
+  `qwen_argmax_matvec_bf16` (1624) / `_int8` — **the 90.7% of decode per the microbench**
+- `int8_matvec_sdot` + `quantize_act_int8` are `#if __ARM_FEATURE_DOTPROD` → **don't exist
+  at all on x86** (no scalar equiv either; callers fall back to `int8_matvec_fused` scalar)
+- attention: `qwen_causal_attention` / `_windowed` / `_bf16kv`
+- inline NEON-only (no AVX2) elsewhere: f32→bf16 pack + bf16→f32 + NeoX RoPE in
+  `talker.c`/`code_predictor.c`/`speech_decoder.c`, `qwen_apply_rope_interleaved`,
+  `qwen_swiglu`/`silu`/`add`/`mul`/`vec_scale`, `qwen_snake_activation` (decoder)
+- decode-step calls the hand matvecs (`qwen_matvec_*`), NOT BLAS → scalar; only **prefill**
+  uses `cblas_sgemm` (OpenBLAS) so prefill is the one fast thing on x86.
+
+> ⚠️ **The comments in `qwen_tts_kernels_avx.c` are FALSE/stale** — they list "bf16_matvec_fused:
+> AVX2", "int8_matvec_fused: AVX2", "qwen_causal_attention: AVX2", "qwen_snake_activation: AVX2"
+> as "Active AVX optimizations". NONE of those have AVX2. This stale doc is very likely what made
+> us believe x86 was covered. **Fix the comments (and `_neon.c`'s, which over-claim too).**
+
+**Goal (user, 2026-06-03): every NEON-accelerated op must have at least an AVX2 twin + a
+scalar fallback ALWAYS; AVX512/VNNI optional on top.** Plan:
+
+- [x] `[HIGH]` **AVX2 twin for every hot op** — DONE 2026-06-03 (`feat/avx2-xos-threading`).
+  All 4 matvecs (bf16/int8/q4_0 + argmax bf16/int8) + all 3 attention variants (score dot +
+  online-softmax accumulators + bf16-KV) now have a `#elif defined(__AVX2__)` branch, 2-row
+  fused / FMA, scalar fallback preserved. `qwen_quantize_bf16_to_int8` (load-time) too. Simple
+  elementwise (silu/add/mul/scale, swiglu) auto-vectorize under `-ffast-math` — left as-is.
+  **Still scalar on x86 (follow-up, correctness-safe):** the NEON-only inline f32<->bf16 pack +
+  NeoX RoPE in talker/code_predictor/speech_decoder, and snake. **✅ RUNTIME-VALIDATED 2026-06-04
+  on the Ryzen 7 6800H** (Zen3+, WSL2): `make blas` builds clean with portable `-mavx2`, `--caps`
+  reports `AVX2 (2-row fused, FMA)` + pthread pool, output coherent by ear. **Measured (0.6B,
+  4-thread): AVX2 only ~6% over `SIMD=scalar`** (hot path is DRAM-bandwidth-bound, not compute) —
+  so the SIMD twin is correct but not a miracle; **int4 multi-threaded is the real x86 lever: RTF
+  2.81→2.02 (−28%)**. Full numbers in `docs/building.md` "Performance notes (x86 / WSL2)".
+- [~] `[HIGH]` **Drop `-march=native` off-Mac + runtime ISA guard** — DONE (the SIGILL bug).
+  Makefile now: Linux x86 default `-mavx2 -mfma` (portable Haswell+), `SIMD=scalar` for
+  pre-AVX2, `SIMD=avx512` opt-in; macOS/ARM keep `-march=native`. `qwen_check_runtime_isa()`
+  aborts with a clear message if an `-mavx2` binary runs on a non-AVX2 CPU (verified under
+  Rosetta: FATAL + exit, **no SIGILL**); `--caps` prints `runtime cpu:` + a warning. **Still
+  open:** true per-CPU function-multiversioning (one fat binary auto-stepping
+  SSE→AVX2→AVX512) — today it's one ISA per build. AVX-VNNI/AVX512-BF16 below.
+  - **PRINCIPLE (user, 2026-06-03): at runtime ALWAYS pick the BEST extension the CPU supports,
+    else step down — AVX512 → AVX2 → SSE → scalar (and on ARM: i8mm/bf16 → SDOT → NEON → scalar).
+    Never compile-time-lock to the build machine's ISA.**
+  - **Real-world evidence:** a user on a brand-new Ryzen (should have AVX-512) reported SLOW perf.
+    Cause = exactly this gap — we have ZERO AVX2/AVX512 on the hot path AND no runtime dispatch, so
+    his AVX-512 silicon ran our scalar single-thread decode. This is the bug to kill.
+- [~] `[MED]` **VNNI** = x86 SDOT twin for int8 — **WRITTEN 2026-06-04 (commit d67648a),
+  UNVALIDATED.** `_mm512_dpbusd_epi32` AVX-512-VNNI path, `SIMD=avx512vnni` build
+  (`-mavx512f -mavx512bw -mavx512vl -mavx512vnni`), `--caps` reports `int8 dot: VNNI (native)`.
+  `quantize_act_int8` reused as-is. **Can't run on the Ryzen 6800H (AVX2-only, no AVX-512)** →
+  next x86 step is to **rent a Zen4+/Intel AVX-512 VPS**. **VALIDATION TOOLING READY (2026-06-05):**
+  `./qwen_tts --self-test` + `make test-selftest` = a model-free kernel numeric gate (matvec
+  bf16/int8/argmax vs f32 reference, `qwen_kernel_selftest` in kernels.c) — **immune to the greedy
+  trajectory fork that makes cross-ISA `test-golden` a false alarm** (the right way to prove VNNI:
+  correct → int8 rel_L2 ~4e-3, broken offset → blows up). One-shot `bash tests/vps_validate.sh
+  [model]` drives the whole VPS run (cpuinfo check, build avx512vnni, `--caps` asserts VNNI,
+  self-test, int8/int4 ×{-j1,-j4} RTF, VNNI-on-vs-off A/B). Validated on M1 (SDOT path rel_L2
+  3.8e-3, fallback 1.8e-7, both PASS). Verify ISA with Intel SDE in CI before trusting perf on HW.
+- [~] `[LOW]` **AVX-512 bf16 matvec** (`__m512` 16-wide) — **WRITTEN 2026-06-04 (commit b89f30e),
+  UNVALIDATED**, `SIMD=avx512` build. Same rented-box gate. (Note: this is the `__m512` widen-FMA
+  path, not yet the native `_mm512_dpbf16_ps` AVX512-BF16 dot — that's a further upgrade.)
+- **Order**: ARM NEON headroom (21.3b, dev HW measurable now); x86 AVX2+threading+int4 ✅ DONE on
+  the Ryzen box; **only AVX-512/VNNI remains → rented Zen4+/Intel VPS** (can't run AVX-512 on M1
+  or the 6800H).
+
+### 21.3b ARM NEON is NOT at peak either (the SDOT lesson, generalized)
+
+Just like SDOT was *missing on NEON* until 2026-06-01, the NEON matvecs still leave perf on the
+table on **post-M1 ARM** (M2/M3/M4, Graviton3/4) — all behind `#if __ARM_FEATURE_*` with a
+NEON→scalar fallback, so M1 and x86 are unaffected:
+
+- [ ] `[MED]` **bf16 native dot** — `bf16_matvec_fused` does dequant(`vshll`)→FMA. ARMv8.6
+  (`__ARM_FEATURE_BF16`: M2+) has `vbfdot`/`vbfmmla` for native bf16 MACs → skips the widen.
+- [ ] `[MED]` **int8 i8mm** — SDOT (`vdotq_s32`) is 1×vector; `smmla` (`__ARM_FEATURE_MATMUL_INT8`:
+  M2+, Graviton3+) does a 2×2 int8 matmul per instr → ~2× on the int8 matvecs. The 2-row-fused
+  layout already half-fits smmla's shape.
+- [ ] `[LOW]` **SVE/SVE2** — Graviton3/4 + ARM servers: vector-length-agnostic loops. Research only.
+- [ ] `[LOW/RESEARCH]` **SME/SME2** (Apple M4, ARMv9.2) — scalable matrix extension; the GEMV→GEMM
+  batching path (track B) could map onto it. Only on M4+; research after bf16/i8mm.
+
+> 💡 **Scaleway rents Apple Silicon Mac mini (M1/M2/M3/M4) by the hour** (account already set up).
+> This is the **ARM twin of the x86-VPS workflow** we just used for AVX-512/VNNI: rent a newer Mac
+> mini for a few hours, implement+validate the post-M1 NEON twins on real silicon, then shut down.
+> - **M2/M3** (ARMv8.6: `__ARM_FEATURE_BF16` + `__ARM_FEATURE_MATMUL_INT8`) → validate `vbfdot`
+>   (bf16 dot) and `smmla` (i8mm, ~2× on int8 matvecs) — the two `[MED]` items above. Dev M1 can't
+>   test these (lacks the features); they're written behind `#if __ARM_FEATURE_*` with NEON fallback.
+> - **M4** (ARMv9.2) → also SME/SME2. Likely back-compatible (runs the M1 NEON+SDOT path unchanged),
+>   so it doubles as a "does v0.9.0 still scream on the newest Apple chip" RTF check.
+> - Reuse `tests/x86_bench.sh`'s spirit: a small `bash tests/arm_bench.sh` (TODO) + `--caps` +
+>   `--self-test` (the self-test is ISA-agnostic → it already gates a new ARM kernel for correctness).
+> - Validate each new ARM kernel with `make test-golden` (same-ISA) + `--self-test` before trusting.
+
+### 21.3c Non-Apple ARM — are we safe? (the same question x86 answered)
+
+**Short answer: the code is SAFE and should run correctly on any aarch64, but it's UNVALIDATED on
+non-Apple ARM and leaves the newer SIMD on the table** — exactly the position x86 was in before the
+Ryzen/EPYC runs.
+
+- **Baseline NEON is universal on aarch64** (`#ifdef __ARM_NEON`, present on every ARMv8) → the
+  matvec/attention hot path runs on Graviton, Ampere Altra, Snapdragon, NVIDIA Grace/GB10, etc.
+- **SDOT** is `#if __ARM_FEATURE_DOTPROD` with a NEON fallback → present on Graviton2+/Ampere/
+  ARMv8.2+ (graceful step-down if absent). **Threading**: the cross-OS pthread pool (21.2) already
+  gives Linux ARM multi-thread (was single before). So nothing *breaks* off-Apple.
+- **GAP 1 — never benchmarked on non-Apple ARM** (same gap x86 had). The RTF numbers are Apple-M1-only.
+- **GAP 2 — `-march=native` build portability** (the ARM mirror of the x86 SIGILL fix): a binary
+  built with `-march=native` on a DOTPROD/i8mm-capable host SIGILLs on an older ARM core. We added the
+  x86 runtime ISA guard + portable `-mavx2` default; **ARM needs the same** (portable baseline +
+  `qwen_check_runtime_isa()` for ARM features + runtime step-down i8mm/bf16→SDOT→NEON→scalar).
+- [ ] `[MED]` **Validate the NEON+SDOT path on a non-Apple ARM box.** Scaleway has **COPARM = Ampere
+  Altra** (Neoverse-N1, ARMv8.2, has DOTPROD) — rent it, `--caps`/`--self-test`/`test-golden` + RTF,
+  same flow as the EPYC run. Confirms "ARM-everywhere" the way the EPYC confirmed "x86-everywhere".
+- [ ] `[LOW]` **ARM runtime ISA guard + portable build** (GAP 2 above) for a shippable non-native ARM binary.
+- **NVIDIA DGX Spark (GB10)** is a concrete future target: 20× Arm Neoverse (ARMv9.2 → NEON+SDOT+**i8mm+
+  bf16+SVE2** all present) + 128 GB unified LPDDR5X. Our **CPU path runs correctly today** (NEON+SDOT+
+  pthread) but leaves i8mm/bf16/SVE2 unused; the unified memory is M1-like (good for the 16×-reread →
+  possibly strong RTF). The GB10 **Blackwell GPU is out of scope** (would need a CUDA backend — separate
+  large effort). So on a DGX Spark we're "safe + correct on CPU, with headroom", not "optimal".
+
+### 21.4 INT8 productization
+
+- [ ] `[MED]` Evaluate making `--int8` the **default** — 0.6B validated good on Apple; **must
+  measure x86/Linux first** (scalar+single-thread there → int8 could regress vs bf16). Don't
+  flip blind.
+- [ ] `[MED]` **On-disk int8 converter**: ship pre-quantized model files (~half size), no runtime
+  quant, faster load. Add a load path for pre-quantized weights. Keep the download-originals path.
+- [ ] `[MED]` **int8 deltas in `.qvoice`/WDELTA** (currently int16 → ~half the file).
+- [ ] `[LOW]` `download_model.sh --int8`: pull pre-quantized models from our HF repo.
+- **LEGAL ✅**: Qwen3-TTS-12Hz CustomVoice is **Apache-2.0** → quantize + redistribute on our HF
+  account is allowed (keep LICENSE/NOTICE, attribute Qwen, state changes; `Naumius/` precedent).
+
+### 21.5 Cross-CPU coverage — VERIFIED reality (2026-06-03 deep re-audit)
+
+| Platform | Hot-path SIMD (matvec+attn = 90%) | Aux SIMD (rms/bf16, <3%) | Decode threading | Reality |
+|---|---|---|---|---|
+| **macOS ARM (M1)** | NEON ✅ (+SDOT int8) | NEON ✅ | GCD 4-thread ✅ | the only truly optimized target (= all benchmarks) |
+| **macOS/Linux ARM (M2+/Graviton)** | NEON ✅ but **bf16/i8mm headroom** (21.3b) | NEON ✅ | GCD ✅ Mac / **single ❌** Linux | works, leaves ~2× on the table on the matvecs |
+| **Linux ARM (aarch64, M1-class)** | NEON ✅ | NEON ✅ | pthread pool ✅ (2026-06-03) | correct + multi-thread; bf16/i8mm NEON headroom remains |
+| **Linux/WSL/Win x86-64** | **AVX2 ✅** (all matvec/attn, 2026-06-04) + VNNI written/unvalidated | **AVX2 ✅** | pthread pool ✅ | **Ryzen-validated: RTF ~2.02 (int4, 4-thread); bandwidth-bound so AVX2 only +6% vs scalar** |
+
+**Coverage matrix we OWE users** (goal: NEON-equivalent everywhere SIMD exists, scalar always):
+| Op family | NEON | AVX2 | AVX512/VNNI | scalar | Gap |
+|---|---|---|---|---|---|
+| matvec bf16/int8/q4_0 + argmax | ✅ | ✅ (2026-06-04) | written, **unvalidated** (rented box) | ✅ | bf16/i8mm NEON (21.3b); AVX-512 run on a real box |
+| attention (3 variants) | ✅ | ✅ (2026-06-04) | n/a | ✅ | — |
+| RoPE / bf16 pack / swiglu / add·mul·scale / snake | ✅ | swiglu/add·mul·scale ✅; RoPE/bf16-pack/snake still scalar | n/a | ✅ | AVX2 the remaining inline NEON-only ops (low priority, off hot path) |
+| rms_norm ×3 / bf16_accum / bf16_to_f32 | ✅ | ✅ | ❌ | ✅ | AVX512 optional |
+
+Status: 21.2 (threading) ✅ all platforms · 21.3 (AVX2 on all hot ops) ✅ validated on Ryzen ·
+AVX-512/VNNI written but needs a Zen4+/Intel box · 21.3b (post-M1 NEON) still open.
+**RTF numbers now exist for x86 too** (Ryzen 6800H: int4/4-thread ~2.02), not Apple-M1-only.
+
+---
+
+## 21.6 VERIFIED full-codebase audit (2026-06-03) — master fix backlog
+
+5 parallel audit agents + my own code verification (the lesson: don't trust agent claims either —
+one falsely said "int4 is loaded but never used"; DEBUNKED, `talker.c:397-450` do call
+`qwen_matvec_q4_0*`). Findings below are **verified**; "needs-verify" tagged where not yet confirmed.
+
+**CORRECTNESS (fix first — testable on M1 now):**
+- [x] **Server cross-request reproducibility — FIXED 2026-06-03 (commit cbfa979).** Root cause was NOT
+  "kv_len not reset" but: on a FULL prefix match (`delta_start==prefill_len`, identical consecutive
+  request) the prefill block at `qwen_tts.c:1108` was skipped entirely, leaving `ctx->dec_x` (read to
+  seed the first generated frame) STALE from the previous request's last token step. Fix: on full
+  match force `delta_start=0` (full fresh prefill = bit-identical to cold). Partial matches (real
+  server case: shared prefix, different text) untouched → delta-prefill optimization preserved.
+  Verified: 3 identical reqs now bit-identical AND == CLI (327ec448); `test-serve-bench` PASSES (was
+  FAIL); test-small 5/5. Remaining server hardening (below) still open.
+- [x] **Server thread-safety — single-threaded by design; mutex added as foundation (2026-06-04,
+  commit a3819a2).** The server is genuinely single-threaded: one `while(server_running)` loop,
+  `accept()` → `handle_*()` inline → close, NO `pthread_create`/fork. Requests are serialized; a 2nd
+  concurrent curl waits in the listen backlog → no live race. Added `g_synth_lock` around the 3
+  synthesis handlers anyway: UNCONTENDED today, but the correct foundation for the future
+  concurrent-serving throughput feature (synthesis mutates the shared ctx).
+- [x] **Server input validation — HARDENED (2026-06-04, commit a3819a2).** Added: text length cap
+  (`MAX_TTS_TEXT` 8192 chars → clean 400, finer than the existing 1 MB raw-body cap) + empty-text 400;
+  **sampling-param clamping** (temperature [0,**2.0**], top_k [0,vocab], top_p [0,1], rep_penalty
+  [0.5,2]). The clamp is NOT cosmetic: a degenerate `temperature:99`+`top_k:0`+`top_p:1` makes
+  sampling so flat the model never emits EOS and runs to `max_frames` (caught a 43-min orphaned-server
+  runaway during testing). Invalid speaker/language still safely ignored; `max_frames` is the hard cap.
+  ⚠ TEST-HARNESS LESSON: always `timeout` server curls + `pkill -f qwen_tts.*--serve` by name (never
+  rely on `$!`/`wait` — a blocked curl hangs the script and orphans the server).
+- [x] **Voice-clone 24kHz ref audio — RESOLVED as documented-by-design 2026-06-03 (commit 33c11a0).**
+  Decision (user): do NOT bundle a resampler (ffmpeg does it better, keeps zero-dep; mel features need
+  24kHz). The requirement is now documented in docs/voice-cloning.md + `--help` + a clear runtime error
+  (`ffmpeg -i in -ar 24000 -ac 1 out.wav`). The misleading "TODO: resample" comment was rewritten.
+- [x] **Robustness: tokenizer `fread()` — FIXED 2026-06-03 (commit 33c11a0).** Both vocab.json +
+  merges.txt loads now check the read length (short read → error + free, was silently ignored).
+  `(size_t)rows*cols` overflow: low risk, cast present; left as-is (would need absurd config dims).
+
+- [x] **Concurrent server worker pool — IMPLEMENTED (2026-06-04, branch feat/avx2-xos-threading).**
+  The first real step of the "batching" feature: request-level parallelism (NOT yet continuous
+  batching of matvecs — see §B). `--workers N` (default 1 = unchanged behavior). For N≥2:
+  acceptor thread + bounded connection queue (256) + N worker threads; worker 0 reuses the base
+  ctx, the rest are **`qwen_tts_clone_for_worker()`** clones that SHARE the read-only weights +
+  loaded voice + RoPE (weight memory paid once) but own FRESH per-request mutable buffers (KV
+  caches, dec_*/cp_dec_*/pref_*, emb LRU cache, delta-prefill cache). Freed with
+  `qwen_tts_free_clone` (never `qwen_tts_unload` — that would free the shared weights).
+  THREE shared-mutable hazards found + fixed: (1) the synthesis ctx → per-worker clones;
+  (2) the kernel thread pool has a single global job slot → added `qwen_parallel_is_reentrant()`
+  (**GCD = safe** for concurrent `dispatch_apply`; **pthread/Win32 = NOT** — one `P.job`), so the
+  server serializes synthesis under `g_synth_lock` ONLY when the pool is non-reentrant
+  (`g_serialize_synth`); on GCD it runs fully parallel; (3) the RNG `g_seed` was a global →
+  made `__thread` (was a cross-request race + broke per-request seed reproducibility). Also
+  `inet_ntop` replaces thread-unsafe `inet_ntoa`. **VALIDATED on M1 (GCD): 2 workers, 2 concurrent
+  requests, both bit-identical to the single-worker reference (mel-corr 1.00000) across
+  {bf16, int8, int4, voice silvio_06b+int8}; concurrent timing ~equal (true overlap, not
+  serialized); clean kill-by-name teardown, no orphans.** `make test-serve-concurrent` +
+  `tests/test_parallel.sh`. ⚠ On the pthread/Win32 backend (the VPS) concurrent synthesis is
+  CORRECT but serialized (no overlap) until the pool is made reentrant — tracked below.
+  ⚠ Memory: clones share weights, so extra cost ≈ N×(KV + work buffers), NOT N×model.
+
+**TEST & VALIDATION BACKLOG (added 2026-06-04 — quant × voice × delivery cross-product + concurrency):**
+- [ ] **Re-run the FULL test matrix with `.qvoice` AFTER clone, crossed with quants.** The 0.6B-Talker
+  int8 change (commit 12b73d7) + WDELTA re-quant path means voice-clone × {bf16, int8, int4} must all be
+  re-validated: create a `.qvoice`, then load it under each quant and check EOS/coherence/RTF + golden-
+  style mel-corr. Today's goldens cover preset voices only — NO `.qvoice`×quant golden exists.
+- [ ] **DESIGN DECISION: should `.qvoice` store quantized weights?** Option A (today): `.qvoice` is bf16
+  WDELTA, quantized at load if `--int8/--int4` (re-quant after WDELTA override). Option B: at voice-CREATE
+  time let the user choose to quantize, SAVE the quantized weights in the `.qvoice`, and load them
+  pre-quantized (faster load, smaller file, fixed precision per voice). Trade-off: B locks the precision
+  into the file (can't switch), A stays flexible. Decide after the int8-default question below. If int8
+  becomes the default, B (save-quantized) gets more attractive.
+- [ ] **Re-run ALL server RTF benchmarks** (cold/warm, bf16/int8/int4, `.qvoice`) now that the 0.6B Talker
+  is int8 under `--int8` — the README server RTF table (1.33/1.34) predates this and is stale.
+- **NEW concurrency tests (for the batching work):**
+  - [x] (a) **parallel-request test — DONE** (`make test-serve-concurrent`, `tests/test_parallel.sh`):
+    2 concurrent curls at a `--workers 2` server, each output compared to a single-worker reference via
+    mel-corr (≥0.98), across {bf16, int8, int4, voice+int8}. All corr=1.00000 on M1. Timeout+pkill harness.
+  - [ ] (b) **race detector — `make test-serve-race` under TSan** (`-fsanitize=thread`) + concurrent load.
+    Now MORE valuable: with the worker pool live there IS real concurrency to instrument. Must confirm
+    (i) per-worker clones never alias, (ii) on GCD the no-lock path is genuinely race-free, (iii) the
+    `g_serialize_synth` lock path is correct on the pthread backend. Build a TSan target (ASan/TSan are
+    mutually exclusive — separate build).
+  - [ ] (c) **streaming RTF + verify under int8/int4** (TTFA + RTF per quant), AND streaming under
+    `--workers ≥2` (the chunked-stream path holds the connection open longer → exercises the queue/worker
+    lifecycle differently than full-WAV). All must use the timeout+pkill harness (runaway lesson).
+- [ ] **Make the pthread/Win32 kernel pool reentrant** so off-Mac servers get TRUE `--workers` parallelism
+  (today serialized via `g_serialize_synth`). Options: per-submitter job slots, or a pool-of-pools. Verify
+  on the Ryzen VPS. Until then x86 concurrent serving is correct-but-serial.
+
+**PERFORMANCE / PORTABILITY (largely CLOSED 2026-06-04 — see 21.2/21.3/21.3b):**
+- [x] **All 8 hot matvec/attention kernels now have AVX2 twins** + cross-OS pthread pool (was
+  scalar+GCD-only). ✅ Ryzen-validated. Remaining scalar-on-x86: SwiGLU `expf` (`kernels.c:1433`,
+  macOS uses Accelerate `vvexpf`), inline RoPE/bf16-pack/snake — all low-priority/off hot path.
+- [ ] `[LOW]` post-M1 NEON headroom (bf16 vbfdot / i8mm smmla — 21.3b).
+- [x] **Makefile `-march=native` off-Mac → portable `-mavx2` + runtime ISA guard** (no SIGILL).
+  Still missing: true per-CPU function-multiversioning (one fat binary stepping SSE→AVX2→AVX512).
+- [ ] **CI is build-only off-Mac** — `.github/workflows` build Linux x86/ARM + macOS-ARM but run only
+  `./qwen_tts --help`; **no inference is ever executed off Apple Silicon, and x86 has NEVER been
+  benchmarked.** No macOS-x86, no Windows. Add a real inference smoke (small model) + SDE for ISA.
+- [ ] **Windows native won't compile** (`mmap`/`pthread`/`gettimeofday`, no Win32 fallback) — WSL2 only.
+
+> ✅ **x86 AVX2 + threading VALIDATED on the Ryzen 7 6800H (2026-06-04)** — the test that "never
+> happened before". Built under WSL2 with portable `-mavx2`, `--caps` confirms AVX2 + pthread pool,
+> output coherent. Findings: hot path is DRAM-bandwidth-bound → AVX2 only +6% over scalar; **int4
+> multi-threaded is the x86 lever (RTF 2.81→2.02, −28%)**; 4 threads sweet spot (8 regresses); High-
+> performance Windows power plan matters. Full writeup in `docs/building.md`. **STILL OWED: AVX-512/
+> VNNI** (code written, 6800H is AVX-512-less) → **rent a Zen4+/Intel VPS** more powerful than the
+> mini PC, build `SIMD=avx512vnni`, validate golden mel-corr + measure RTF (Intel SDE in CI first).
+
+**DEBUNKED agent claims (do NOT propagate):** "int4 loaded but never used" (FALSE — int4 wired in
+talker.c forward). "x86 FTZ incomplete" and ".qvoice v1 enc_dim hardcoded" — `needs-verify` before acting.
+
+### 21.7 Test coverage — hardened 2026-06-03 (safety net BEFORE the AVX2 work)
+
+The old suite only proved the pipeline RUNS (`validate_wav` = non-empty WAV + ≥1 frame + no MISSING
+weights) — it never checked the audio was CORRECT. A numerically-broken kernel that still emits audio
+PASSED. Closed the worst gaps:
+- [x] **`test-golden`** (commit d987c4b/d987... + gitignore fix) — regen deterministically (`-j1
+  temp0 seed42`) and compare to committed `tests/golden/*.wav` via **mel-spectrogram correlation
+  (≥0.99) + duration (≤5%)** (`tests/compare_audio.py`, librosa). Covers 0.6B en/it/int8 + 1.7B en.
+  Wired into `test-all`. `make golden-update` regenerates after an intended change. **mel-corr (not
+  md5)**: md5 flakes even at `-j1 temp0` (±1 LSB decoder noise, verified). **⚠ CORRECTION (Ryzen
+  2026-06-04): mel-corr is NOT a valid CROSS-ISA gate.** Greedy `-j1 temp0` decode forks the whole
+  trajectory on a single epsilon-different logit across ISAs → x86 golden scored mel 0.55–0.85 vs the
+  ARM golden despite producing perfectly coherent speech (confirmed by ear). The old "must stay 0.99+
+  cross-ISA" assumption is NAIVE for greedy autoregression — retracted. Same-ISA it's still the safety
+  net. **The real cross-ISA correctness gate is now `make test-selftest`** (kernel numeric, below).
+- [x] **`test-selftest`** (2026-06-05, `qwen_kernel_selftest` + `--self-test`) — **the cross-ISA gate
+  that test-golden can't be.** Compares the dispatched matvecs (bf16/int8/argmax-int8) to an f32
+  reference on deterministic random data → catches a broken SIMD kernel (esp. the AVX-512/VNNI int8
+  dot + `__m512` bf16 matvec) WITHOUT running the pipeline, so the greedy trajectory fork can't mask
+  it. Runs the dispatched path AND the scalar/widen fallback (`QWEN_NO_SDOT/QWEN_NO_VNNI`). int8 uses
+  a near-zero-robust L2-relative metric (act-quant → ~4e-3 correct, blows up if broken). Wired into
+  `test-all`; `tests/vps_validate.sh` drives the full AVX-512 VPS run around it.
+- [x] **`test-serve-repro`** — 3 identical requests bit-identical (catches cross-request state leaks).
+- [x] **`test-voice-design`** now SKIPs cleanly (was failing on absent model — double bug: dir-only
+  check + per-line `exit 0` that didn't stop the recipe).
+- [x] **`--caps` + `test-caps`** — the binary reports its ACTUAL compiled SIMD/threading (NEON/AVX2/
+  scalar, SDOT, GCD/single, BLAS), and the test asserts arch↔caps consistency. **This is the
+  "would-have-caught-we-thought-AVX-existed" guard**: on x86 it reports `matvec+attn: SCALAR` +
+  `SINGLE-THREAD`, impossible to hide behind docs. When AVX2 lands, flip the x86 assertion.
+- [x] **`test-errors`** — bad invocations (no --text/--serve, nonexistent model, missing .qvoice)
+  must fail cleanly (non-zero + clear message). Fast, no model.
+- [x] **Variance characterized** — quiet machine + fixed seed → mel_corr 1.00000 across det/-j1-temp0
+  AND default-4thread-temp0.5 (18 runs). So Qwen3-TTS is NOT audibly non-deterministic with a fixed
+  seed on a quiet box ("poco" = ≤±1 LSB). Golden threshold set to 0.98 (margin), cross-ISA 0.95.
+- [ ] `[LOW]` **Remaining smaller gaps:** SDOT on/off A/B not in suite, `.qvoice` load (local-only,
+  voices/ gitignored → skip-if-absent), int4 not in golden, truncated-file fread path (no test), **no
+  x86/Linux inference in CI** (build-only — add once the Ryzen/WSL2 flow is set up).
+- [ ] `[LOW]` **`test-clone` has the same latent per-line `exit 0` skip bug** as voice-design had — not
+  currently broken (base-small model present) but would FAIL instead of SKIP if absent. Same one-shell fix.
+- [x] **RESOLVED — there is NO engine non-determinism bug (2026-06-03).** On a clean, confirmed
+  `-O3` binary (0 ASan symbols) on a non-saturated machine, `-j1 --temperature 0` is FULLY
+  deterministic: 5/5 runs byte-identical TOKENS (82505ec4) AND audio (327ec448 = golden). The entire
+  "non-determinism" hunt was a MEASUREMENT ARTIFACT of my own making: (1) **binary mixing** — after
+  `make debug` the binary was ASan **-O0** (different FP rounding/order than `-O3 -ffast-math` → a
+  legitimately different trajectory), and `make blas` did NOT rebuild it (timestamps), so I compared
+  -O0 vs -O3 outputs and called the difference "drift"; (2) **my own runaway busy-loops + leftover
+  processes** saturating the 4-core box during other measurements. Lesson (again): verify the binary
+  + a quiet machine before trusting an A/B; `make debug` then `make blas` needs a `make clean` between
+  (timestamp trap). The QWEN_NO_OVERLAP knob (added during the hunt) is harmless + kept as a
+  decode-overlap diagnostic. **NOTE for product:** at DEFAULT (multi-thread, temp>0) output is
+  legitimately "similar not identical" (FP reduction-order across threads + sampling) — that's why the
+  golden test uses mel-corr, and that benign variation is expected, not a bug.
+- ~~`-j1 --temperature 0` intermittently non-deterministic / likely UB~~ — **WRONG, fully retracted**
+  (see the RESOLVED entry above). It was binary-mixing (ASan-O0 vs -O3) + my runaway processes, not an
+  engine bug. Kept here only as a record of the false trail so it isn't re-opened.
+
+---
+
+## OPEN FUTURE TASKS (compact — nothing dropped)
+
+- [ ] `[LOW, AFTER fixes]` **Correct the BLOG docs' false x86/AVX claims.** `blog/optimization-notes.md`
+  (and related) repeat "NEON on ARM, AVX on x86" for matvecs/attention — FALSE (only rms_norm +
+  bf16_accum have AVX2). Authoritative docs (README/CLAUDE/docs/*) fixed 2026-06-03 (commit 7aa0f9b);
+  the blog narrative is deferred until AFTER the real fixes + fresh measurements land, so it's
+  rewritten once against true numbers rather than patched twice.
+- [x] **Server warm-request reproducibility bug — FIXED 2026-06-03 (commit cbfa979).** See 21.6 for
+  the verified root cause (stale `ctx->dec_x` on full prefix match) + fix (full match → `delta_start=0`).
+  `test-serve-bench` now PASSES. (The md5-bit-identical assertion turned out fine once the bug was
+  fixed — it was the bug, not the test, that was wrong.)
+- **CP sliding window attention** (old 18.3): config has `sliding_window=72`; verify CP attention
+  caps at it. `[MED]`, only matters for 200+ frame sequences.
+- **Long-form / audiobook mode** (old Phase 19): chapter/batch mode, progress indicator + ETA/RTF,
+  long-run telemetry (RSS, RTF drift, thermal), resumability, `make test-longform`. Plus a
+  lightweight bracket markup (`[pause:500]`, `[emph]…[/emph]`, `[voice:…]`, `[instruct:…]`) parsed
+  by a tiny hand-written tokenizer in a new `qwen_tts_script.c` (no XML, zero deps). `[MED/LOW]`
+- **AVX512 hand-kernels** (old 20.5): defer. BLAS already dispatches AVX512 at runtime; our hand
+  kernels are memory-bound. Only add `#ifdef __AVX512F__` paths (fallback + SDE-verified in CI) if
+  profiling on real HW shows the aux kernels hot. `[LOW]`
+- **Metal GPU / MLX** (old Phase 16): was 1.3× slower on M1 (unified-memory bandwidth ceiling).
+  Revisit only on M3/M4 (higher bandwidth + Metal 4 tensor support). `[LOW]`
+- **Windows native** (old Phase 15): mmap→MapViewOfFile, threads (covered by 21.2). WSL2 works
+  today and is the recommended path. Only if real demand. `[LOW]`
+- **Server per-request voice switching**: accept voice path in JSON (WDELTA too heavy for hot-swap
+  today; needs a lighter per-request mechanism). `[LOW]`
+- **KV cache prefix caching eval** (old Phase 12): is a ~50MB KV prefix dump worth it vs WDELTA?
+  Likely no (WDELTA is bit-identical + portable), but un-evaluated. `[LOW]`
+- **CUDA/HIP backend stubs**, **top-p partial sort with early exit** (only when top_p<1.0). `[LOW]`
+
+---
+
+## DONE — history (compacted)
+
+### Core engine & features
+Full pipeline (Talker → Code Predictor → Speech Decoder → WAV), both model sizes (auto-detected),
+HF safetensors loader (mmap), 9 preset speakers / 10 languages, instruct/style control (1.7B),
+streaming (`--stream`/`--stdout`/callback), HTTP server (OpenAI-compatible), voice cloning (Base:
+ICL + x-vector), VoiceDesign (1.7B), `--max-duration`/`--seed`/EOS boosting, `download_model.sh`,
+Makefile test suite, WSL2 build docs. CI/CD: GitHub Actions build matrix (Linux x86/ARM, macOS
+ARM/x86), CodeQL, clang-tidy, ASan/UBSan, release artifacts on tag.
+
+### Performance optimizations (landed)
+BLAS (Accelerate/OpenBLAS), NEON SIMD kernels (rms_norm, attention, RoPE, bf16↔f32, add/mul/scale),
+cache-line-aligned buffers (+24%), LRU text-embedding cache, **decoder thread overlap** (pipeline
+parallelism), multi-row bf16 matvec (2-row fused), unified QKV dispatch, fused gate+up, top-k
+quickselect (4× sampling), batch vvexpf SwiGLU, delta prefill / KV reuse (server, ~50% prefill),
+persistent prefill buffers, BF16 KV cache, **fused residual+RMSNorm** (−21% short), software
+prefetch (~1-2%). INT8 + streaming TTFA: see 21.0.
+
+### CP micro-bench (June 2026, `make cp-microbench`, 0.6B, 114 frames)
+CP = **90.7% matvec/GEMV** (FFN gate_up 34% + down 19% = 53%; QKV 24.5% + O 13.3% = 38%; lm_head
+4.3%). All "overhead" (attention 0.7%, RoPE/norm/KV-store/dispatch) = **<3% combined**. → CP is
+matvec/**bandwidth**-bound, NOT overhead-bound. `matvec_bf16` is hand NEON, not BLAS. This refuted
+the old "CP is overhead-bound" hypothesis (the 18.1 micro-opts targeting <3% were dropped).
+Baseline: CP 86.6 ms/f (74%), Talker 30.6 (26%), sampling 0.35 (negligible), prefill 1.65s (TTFA),
+decoder overlapped. RTF 1.76.
+
+### Experiments that DID NOT work (don't re-litigate)
+- **Metal GPU**: 1.3× slower on M1 (unified-memory bandwidth ceiling). Removed.
+- **pthread thread pool vs GCD on macOS**: −8% (GCD is kernel-optimized). → keep GCD on Mac, but
+  pthread is the right call OFF Mac (see 21.2).
+- **4-row fused matvec**: −7% vs 2-row (register spill). Threading threshold 2048: −3%.
+- **INT4 Q4_0 on the Talker**: slower than int8 (compute-bound; nibble unpack > bandwidth saved).
+  Kept opt-in. **Untested on the CP** → see 21.1.
+- **INT8 on the 0.6B Talker**: 0% (hidden=1024 too small / compute-bound). The 0.6B win is CP-only.
+- **Speculative CP decoding**: abandoned (codebook feedback loop is structurally unsafe → also why
+  the 16 CP passes can't be batched).
+- Batch text-embedding sgemm (0.13%), softmax SIMD (post-quickselect), depthwise-conv/LayerNorm
+  SIMD (decoder overlapped), NEON SiLU (<1%): all skipped as non-bottlenecks.
+- **CP↔Talker pipeline overlap**: infeasible (sequential dependency).
+
+### Non-determinism — investigated, BENIGN
+Output not always bit-reproducible run-to-run, but diff = **±1 LSB of 16-bit PCM (~3e-5, −90 dB,
+corr 1.0000000)** = FP rounding, not audible, not a bug. Two causes: (1) temp>0 sampling + threaded-
+matvec FP noise → occasional token flip (vanishes at `--temperature 0`); (2) overlapped decoder
+variable chunk timing → ±1 LSB (load-dependent; quiet machine → bit-identical). NOT uninitialized
+memory, NOT seam artifacts (both disproven). Decision: chunk-invariant decoder NOT pursued (would
+add overhead to fix a −90 dB diff). For bit-stable A/B: `-j1 --temperature 0`, else compare by
+RTF + mel-corr, not md5.
+
+### Cross-model voice / `.qvoice` saga (Phases 12–13, March 2026)
+Goal: reusable custom voices + cross-model injection (clone on Base → use on CustomVoice w/ instruct).
+Key discovery: Base and CustomVoice transformer weights are **nearly identical** (cosine
+0.9998–1.0000); the only real differences are the codec_embedding speaker presets + Base's 76
+ECAPA-TDNN tensors. Cross-model divergence ≈ same-model seed variance (butterfly effect from
+`tts_pad_embed` micro-diff + autoregressive sampling), NOT a fixable bug. Progression of formats:
+`.bin` x-vector (~60-70% fidelity) → full KV dump (~90%, but text-locked) → **WDELTA `.qvoice`**
+(the shipping HQ format): int16 weight deltas + LZ4, **bit-identical** cross-model, works with
+`--instruct`, +7% load overhead, target CV size validated in header. `--save-voice` needs Base+CV
+present; usage needs only CV + the `.qvoice`. Server preload supported. (WFULL 1.7GB proved
+bit-identical is possible; WDELTA compressed it to ~785MB LZ4.) `.qvkv` KV-prefix approach abandoned
+(WDELTA superior in every dimension). Long tail of fidelity experiments (lower temp, longer ref,
+greedy warmup, partial-layer replacement) all WORSE — 30s ref is the sweet spot, it's all-or-nothing.
+
+---
+
+## Future research (discovered 2026-06-04, to re-analyze)
+
+### A. Prosody/emotion control on the Code Predictor — BUILT v1 (`feat/expressivity`), NOT YET AT THE TOP
+
+> **▶▶ SESSION 2026-06-07 WRAP (read FIRST — 12 commits `3e0cb70`→`c1c4d2b` on `feat/expressivity`, NOT merged).**
+> Turned the half-done emotion manifest into a full expressive-control system, all ear-validated with the user.
+> SHIPPED THIS SESSION:
+> - **Compound-emotion MANIFEST** (`qwen_tts_emotion.{c,h}`): `--emotion <mood>` sets the whole recipe
+>   {vec, steer_weight, roughness, volume, rate}. Explicit flags override. Language-aware resolver (IT→`it_centered/`).
+> - **`--volume` (PCM gain) + `--rate` (in-engine WSOLA, pitch-preserving, no ffmpeg)** in `qwen_tts_audio.c`.
+> - **`--compose` + INLINE `[tag]` MARKUP** (ElevenLabs/Bark style, English tags, auto-detected in `--text`): per-span
+>   emotion switch, `[pause:400ms]`, paralinguistic fillers. `parse_markup`→`render_spans`. docs/markup.md.
+> - **🐛 CROSS-SPAN LEAK FIXED (user-caught by ear):** compose's repeated `generate` calls reused the prev span's KV
+>   via delta-prefill → a `[sad]` rendered differently in a mix vs alone. Fix `ctx->prev_prefill_len=0` per span →
+>   each span bit-identical to standalone (corr 1.0). LESSON: delta-prefill is a SERVER opt, wrong for compose.
+> - **PARALINGUISTIC LIBRARY** (ear-validated macros, no-steer soft prosody): `[sigh]`=Hah…, `[hmm]`=Hmmm…, `[mmm]`=嗯,
+>   `[mah]`,`[uhm]`,`[hmpf]`,`[ahh]`/`[relief]`=Haaa…,`[phew]`=Uao…,`[laugh]`=Eheh…(IT),`[haha]`(EN),`[heh]`,
+>   `[ouch]`(EN)/`[ahi]`(IT). `tests/sound_suite.sh` = the discovery workflow (mass-gen→listen→bake; CLI per line).
+> KEY DISCOVERIES (validated): `Hah...`=sigh / `Hah`=laugh (the "…" makes the breathy sigh; bare = a dry laugh);
+> **Chinese phonetic chars are a clean sound source even under IT**: 哈哈/嘿嘿/呵呵=laughs, 唉=weary sigh, 嗯=mmm;
+> 😂 leaks a faint sigh; "Ahahah 😆"→"AHI!" pain. RULES baked in: macro rate ≥0.90 (slower=metallic WSOLA on a short
+> vowel); a trailing "…" can trigger a 2nd spurious vocalization; same string→different sound per language; **weight is
+> an UP-mood lever only — down-moods (sad/gloomy) go off-manifold ('Chinese tone') at high weight → use LOW steer +
+> prosody** (sad=w1.1/rate1.08/vol0.86). Golden mel-corr still 1.0 (default-off untouched); `make test-emotion`/`test-compose` green.
+> NEXT (ranked): (1) reply to Leo (perf, task #3, prepped); (2) run sound_suite + bake more winners (CN laughs, pain
+> 'ahi', `[ha]`=dry laugh); (3) **RE-TEST on a CLONED `.qvoice` (Galatea/Silvio): emotion-MIX (`[happy]/[sad]/[angry]`)
+> + paralinguistic fillers (`[sigh]`/`[laugh]`/`[mmm]`) via `--compose`/markup — all validation so far is on PRESET
+> ryan; verify the macros + mid-text emotion switches survive on a cloned voice (CP is cross-model so it SHOULD, but
+> the no-steer fillers + per-span cold-prefill need ear-checking on a real clone)**; (4) server-side volume/rate/compose
+> (CLI-only today); (5) merge feat/expressivity→feat/labs.
+> KNOWN: server doesn't have volume/rate/compose; true breaths absent (no <breath> token); model occasionally
+> over-elongates short words (intermittent, model-side). Local-only (not git): `samples/` (all audio), `voices/galatea_06b.qvoice`.
+> Stray `analisi_leak*.md` still untracked (NOT ours). BACKLOG below: int2/int3 quant, clone+preset speed/quality bench, emoji map.
+>
+> **▶ RESUME 2026-06-07 (earlier in session — kept for detail; see `docs/expressivity-recipes.md`).**
+> Session 2026-06-06 was long & productive. WHERE WE LANDED:
+> - **Galatea = the IT demo voice** (`voices/galatea_06b.qvoice`, CC LibriVox, better than Silvio). Centered IT
+>   palette (`presets/emotions/it_centered/`) = the one to use (collinearity fixed, +88% contrast).
+> - **Validated recipe doc committed: `docs/expressivity-recipes.md`** (joy=excited NOT happy, sad=slow+pauses,
+>   annoyed=angry+roughness, news=proud; per-language map; dead-ends; emergent-basin map + the ES "eeem"/sbuffo reproducer).
+> - **Settled with proof:** think=language-slot (our RE correct, vs official source); instruct is Chinese-tuned/weak-on-EU
+>   & not exposed for clones → CP-steering is the only emotion path for cloned EU voices. Closed dead-ends: full rage,
+>   paralinguistic tags, relax-identity (`QWEN_SPK_SCALE` knob added, no-op default), real-breath splice, DSP pauses, hesitant-capture.
+> - **`--volume`/`--rate` flags = trivial future add** (volume=pure PCM gain; not yet exposed).
+> NEXT STEPS (ranked): (1) **reply to Leo** (task #3 — perf leads int8-Talker/Windows-SD-single-thread/9P + his 2 forked
+>   params `--emit-tokens`/`--decode-tokens` deduced; re-read his full email first).
+>   (2) ✅ **DONE 2026-06-07 (commit 3e0cb70): compound-emotion MANIFEST as code** — `qwen_tts_emotion.{c,h}`,
+>   13 moods `name → {vec, steer_weight, roughness, volume, rate}`; `--emotion joy/sad/stern/annoyed` sets ALL knobs.
+>   Also shipped: `--volume` (PCM gain) + `--rate` (in-engine WSOLA time-stretch, no ffmpeg) + language-aware
+>   resolver (Italian auto-uses `it_centered/`) + graceful degrade when a mood's vec is missing for a language.
+>   `make test-emotion` (in test-all); golden mel-corr still 1.0 (default-off).
+>   **EAR-VALIDATED + RECALIBRATED 2026-06-07 (ec30e51):** sad@2.0 went off-manifold ('Chinese tone') →
+>   down-moods = LOW steer + strong prosody (sad=w1.1/rate0.80/vol0.86 = 'sad+slight ache', user 'ottimo'; gloomy=w0.5).
+>   (2b) ✅ **DONE 2026-06-07 (bbec95f + 17ca50a): --compose + INLINE MARKUP for audiobooks.** Per-span synthesis
+>   (qwen_apply_emotion re-entrant + render_spans + parse_markup), ElevenLabs/Bark-style English square-bracket tags
+>   auto-detected in --text: `[sad]/[excited]` mid-text emotion, `[sigh]/[huff]/[ugh]/[groan]/[hmm]` paralinguistic
+>   fillers (generated NOT spliced — the slow+sad recipe elongates "Ehh.."/"Uff.." vowels), `[pause:400ms]/[break:1s]`.
+>   Spans model-generated → seamless concat (NOT the dead-end ref-splice). `make test-compose`; docs/markup.md.
+>   KEY SERENDIPITY: slow+sad config = a controllable paralinguistic GENERATOR (user idea). STILL TODO: server-side
+>   volume/rate/compose (CLI-only); true breaths still absent; tune macro recipes; EN/other-lang sigh quality.
+> (3) optional: dedicated ES palette capture (ES inverts everything); retry sbuffo at lower weight; more macros.
+>
+> ## ★ BATCHING ARCHITECTURE — TWO PRODUCTS, ONE ENGINE (vision, user 2026-06-08)
+>
+> The batched compute kernels (ragged Talker step + per-stream sampling/EOS + batched CP + per-seq
+> prefill — **DONE**) power **two distinct, both-wanted products**. Same engine (~90% shared), slightly
+> different use cases. KEEP BOTH.
+>
+> **PRODUCT 1 — `--batch` LONG-FORM (shipped, this branch).** One user, ONE long text (podcast, audiobook,
+> long article). The CLI splits it into sentence-packed chunks, steps them TOGETHER (weight-stationary),
+> and re-stitches one continuous WAV. A **productivity / throughput flow for long content**: a paragraph
+> that took 10 min single-stream finishes in ~half. Decode is post-hoc (whole text), so it does NOT stream
+> — and that's fine, it's a batch-job lever. bf16 1.65–1.74× on M1; int8/int4 supported. THIS IS DONE and we
+> WANT to keep it — its use case (long-form authoring) is real and distinct from serving.
+>
+> **PRODUCT 2 — SERVER REQUEST-BATCHING (the big feature, dedicated branch, vLLM-style).** N DIFFERENT users,
+> N DIFFERENT short requests, served concurrently with **maximum efficiency**. Reuses the SAME batched
+> kernels, but the B sequences are different users' requests (not chunks of one text), and a **continuous-
+> batching scheduler** keeps the in-flight batch full (admit a new request into the slot a finished one frees
+> — not static batching, which wastes utilization on ragged EOS). **Streaming COMPOSES here**: the batch steps
+> one frame at a time → after each batched step every active request has a new frame → emit it to THAT
+> request's SSE while the Talker+CP compute stays batched → **real parallel streaming to N users** (exactly how
+> vLLM streams tokens). Throughput (batched compute, shared) + latency (per-request streaming decoder + SSE)
+> TOGETHER; good per-request TTFA (prefill + admit in-flight). This is the production-serving architecture.
+> What's missing = scheduler + concurrent server + per-request streaming decode (see the SERVER REQUEST-
+> BATCHING task below). Pays most on bandwidth-bound x86 (EPYC/Sapphire) → build correctness on M1, validate
+> perf on a rented VPS.
+>
+> **One-line distinction to repeat everywhere:** `--batch` = split ONE long text for ONE user (audiobook/
+> podcast throughput, no streaming, shipped); SERVER batching = serve N users' DIFFERENT requests at once
+> (max-efficiency serving, real parallel streaming, to build). Same batched-compute foundation.
+>
+> **BACKLOG / IDEAS TO ANALYZE+VALIDATE (user, 2026-06-07):**
+> - **BATCHING (branch `feat/batching` off feat/expressivity, started 2026-06-07):** OPT-IN alternative path
+>   (vLLM-style — default = today's single-stream, untouched, golden bit-identical). Premise TESTED via
+>   `make batching-bench` (`tests/batching_bench.c`, docs/batching.md): batched GEMM(16) vs 16× GEMV →
+>   **~2× on M1 at bf16** (single-stream is compute-bound there, the FLOOR); **batching is worth MORE at lower
+>   precision** (int4/int2 amortize the costly per-token nibble/bit UNPACK) → **pair batching with int4/int8, not bf16**;
+>   could even make int4 viable on M1 (where nibble-unpack is the slowness today). Cross-CPU prediction: every x86 box
+>   ≥ M1 (Ryzen mini-PC >2×+int4 sweet-spot; EPYC Turin VPS ~2-4×/core × core-scaling = the throughput play; Zen5+VNNI
+>   best target). VALIDATION ORDER: M1 → Ryzen mini-PC (Zen2/3, RDP) → Turin VPS (AVX-512) → ONLY THEN discuss w/ Leo.
+>   Full prototype scope in docs/batching.md (B per-seq KV, GEMM step kernels Talker+CP, ragged-EOS, chunk scheduler,
+>   reuse render_spans for concat). Commits on feat/batching: d175eb1, 5027490, 190a8f7, f34766d, +.
+>   **NON-NEGOTIABLE CONSTRAINTS (user 2026-06-07):** (1) ADDITIVE flow — `if(--batch){new}else{exactly as today}`;
+>   NEVER zap/rewrite the working single-stream path; reuse where possible, new code for batched parts; golden bit-identical.
+>   (2) MULTI-ISA always: every batched kernel = NEON + AVX2 + AVX-512 + scalar (not NEON-only). (3) Annotate newer-ISA
+>   leads: ARM bf16 BFDOT/BFMMLA + i8mm SMMLA (M2/M3/M4/M5, Neoverse V1/V2, NVIDIA Grace/DGX Spark), SVE/SVE2, x86
+>   AVX-512-BF16/VNNI; add int8/int4 batched twins (batching pays most at low precision).
+>   DONE so far: (a) `qwen_matmat_bf16` batched step primitive, multi-ISA NEON/AVX2/AVX512/scalar, --self-test PASS
+>   (matmat(B=8) vs B×matvec L2_rel ~6e-7); (b) **`qwen_batch_talker_step` — batched Talker step (opt-in), commit 6851eb0**:
+>   B seqs in lockstep through the full Talker (B per-seq KV + batched attention), REUSES per-vector kernels (rmsnorm/
+>   rope/attn/swiglu looped over B), batches ONLY the matvecs (gather→matmat→scatter). `--batch-test`/`make test-batch`:
+>   **WIRING bit-EXACT vs single-stream** (force_matvec mode L2_rel 0.00) + matmat-kernel probe 6e-7. **KEY FINDING:**
+>   the real matmat path diverges ~1.6% in HIDDEN state purely by fp accumulation ORDER amplified through 28 layers
+>   (1.46×/layer) — a valid alternative kernel LIKE INT8, NOT a bug; validate end-to-end by AUDIO mel-corr, not hidden
+>   bit-match. v1 = bf16, lockstep (no ragged EOS). (c) **`qwen_batch_cp_predict` — batched Code Predictor (the
+>   90%/frame bottleneck), commit 09edb01**: B frames lockstep through the 16-step CP (B per-frame CP KV), reuses
+>   CP layer math, batches matvecs via shared `qwen_batch_proj`; steering supported, v1 bf16 no-roughness.
+>   `--batch-test`: **CP wiring 0/120 codes differ (bit-exact) AND CP matmat 0/120 differ** — greedy argmax absorbs
+>   the fp-order noise → batched CP yields IDENTICAL audio codes. So both batched COMPUTE kernels (Talker+CP) are
+>   built + validated; golden 1.0 (additive).
+>   **⚠️→✅ FINDING REVERSED (2026-06-08): batching WINS ~2× on M1 once the matmat is register-blocked.** The earlier
+>   STOP (b51469c: "4-12× SLOWER, 4T 0.24× / 1T 0.08×, x86-only") was an ARTIFACT of the naive `bf16_matmat_slice`
+>   (scalar decode + `acc[64]` in L1 NOT registers, load/store every k) — exactly the condition it flagged. FIX
+>   (2026-06-08): rewrote it as compile-time-B specializations `bf16_matmat_b1..b8,b16` — BV accumulators register-
+>   resident (unrolled `for(j<BV)` → named scalars), rows blocked 2 at a time, broadcast-FMA auto-vectorized per ISA
+>   under -march=native; naive intrinsic loop kept ONLY as `bf16_matmat_generic` fallback. Self-test still PASS
+>   (matmat(B=8) vs B×matvec L2_rel ~3e-7); golden untouched (opt-in). **Re-bench 0.6B M1 K=50: 4 threads 0.24×→2.10×;
+>   1 thread 0.08×→0.88×.** B-sweep @4T: B=2 1.87×, B=3 2.01×, B=4 2.23× (sweet spot), B=8 2.21× (B=6/16 dip ~1.6× =
+>   noise/reg-pressure). Why it flips: single-stream re-reads weights B× → saturates the shared mem controller across 4
+>   cores (bandwidth-bound); batched reads weights ONCE. ~2× = the bf16 ceiling (premise microbench was right); int4/int8
+>   should push past it, x86 (bandwidth-bound) ≥ this. **DECISION REVERSED: the `--batch` integration IS worth building
+>   on M1** — it's the AUDIOBOOK/long-text lever (split a paragraph into 2–4 chunks, step batched → ~2× wall-clock vs
+>   sequential, reusing weights). **(2) int8/int4 batched twins DONE (2026-06-08, commit 720e939):** `qwen_matmat_int8`
+>   (int8 W + f32 act) + `qwen_matmat_q4_0` (nibble unpack amortized over B), self-test correctness PASS, `make
+>   matmat-bench` (`--matmat-bench`) times REAL kernels. M1 B=8: **int4+batching WINS at 1T AND 4T (1.1–1.4×) = THE M1
+>   lever** (q4_0 single-stream is unpack-bound → batch unpacks once; int4 otherwise slowest single-stream → exactly
+>   where batching earns its keep); bf16 wins 4T (1.4–1.8× kernel / 2.1× pipeline); **int8 loses/break-even because the
+>   int8 SEQUENTIAL uses fast SDOT and the twin accumulates f32 (throws SDOT away) → TODO: integer-dot int8 twin
+>   (SDOT ARM / VNNI x86)**. NEXT: (1) per-stream sampling + ragged-EOS + chunk scheduler (split text / keep batch full /
+>   re-stitch via render_spans) → wire `--batch` (works at bf16 today, pair with int4); (1b) the int8-SDOT twin; (3)
+>   validate on Ryzen/Turin. See docs/batching.md "CORRECTION (2026-06-08)" + "int8/int4 twins MEASURED".
+> - **`--batch` MILESTONE A DONE (2026-06-08, commit after 720e939): long-form chunked synthesis CLI.** Sentence-aware
+>   splitter (top-player practice: segment on `.!?;`/newline with decimal + abbreviation guards — "18.30"/"Sig."/"Ecc."
+>   NOT split — then greedy-pack sentences up to `--batch-words` N (default 16, min N/3), merge sub-min trailing
+>   fragment). `--batch` synthesizes each chunk via the EXISTING single-stream path + concatenates via `render_spans`
+>   (seams land on sentence pauses → inaudible). `--batch-dry` previews the chunking without synth (tune the policy fast).
+>   Milestone A = correct audio + the sequential baseline, and validates chunk-concat QUALITY before investing in batched
+>   compute. Additive (normal/compose untouched, self-test PASS). **MILESTONE B (NEXT, the speedup): swap the inner
+>   per-chunk loop for the batched compute kernels.** Hard parts: (1) RAGGED — each chunk's prompt prefills to a different
+>   length → need per-sequence `kv_len_b` in `qwen_batch_talker_step` (the attention is ALREADY per-sequence; only the
+>   shared `pos` → per-seq `pos_b` in the per-b RoPE/KV-append/attention loops; batched matvecs are position-agnostic →
+>   unchanged); (2) prefill each chunk's prompt into bb's per-seq KV; (3) per-stream sampling (own RNG/rep-penalty per
+>   chunk) + ragged EOS (drop finished chunks, compact batch); (4) feed sampled codes through batched CP + per-chunk
+>   decoder → concat. Pair `--batch` with int4 (the M1 lever). THEN the Promessi-Sposi single-vs-batched timing test.
+> - **`--batch` MILESTONE B DONE (2026-06-08): batched compute wired in = the speedup.** B1 (commit after a6210d3):
+>   `qwen_batch_talker_step_ragged` — per-seq positions (`pos_arr[b]`) + `active[b]` (NULL=lockstep, back-compat). B3:
+>   `qwen_tts_generate_batch` (qwen_tts.c) — groups of ≤8 chunks; per group prefill each via the normal path (new gated
+>   `ctx->prefill_only` early-return captures KV+seed hidden), then ragged batched gen (per-stream sample/EOS + batched
+>   CP), then seam-free per-chunk decode + concat. `--batch` calls it for nc≥2, falls back to sequential on -2/error.
+>   **WIRING PROVEN: `QWEN_BATCH_FORCE_MATVEC=1` (bit-exact proj) → mel_corr 1.00000 vs single-stream.** Real matmat =
+>   valid alternative kernel (greedy fp-order trajectory fork, like int8; mel_corr ~0.68 vs single at temp0 — validate by
+>   EAR). **M1 measured (0.6B bf16 temp0): 3-chunk paragraph 29.3s→19.4s, RTF 1.30→0.74 (sub-realtime); grows with chunk
+>   count.** Additive (prefill_only gated; normal/compose/self-test unchanged). **NEXT: (1) int8/int4 in the batched step
+>   (B2) — the model's mmap-resident bf16 weights make it work today but WITHOUT quant speed; wire qwen_matmat_int8/q4_0
+>   into batch_proj using quantized weight fields → int4 is the M1 lever; (2) optional auto-activate `--batch` on long
+>   text; (3) Promessi-Sposi single-vs-batched A/B across bf16/int8/int4.**
+> - **`--batch` B2 DONE (2026-06-08): int8/int4 inside the batched step.** `qwen_batch_proj_q` (precision-aware batched
+>   proj, dispatches q4>int8>bf16 via the matmat twins) wired into all Talker+CP projections; `cp_lm_argmax` fixes the
+>   batched CP lm_head (was bf16-hardcoded → forked the trajectory in quant mode — the one real bug, found via
+>   force_matvec). **WIRING PROVEN per precision: batched force_matvec == sequential split = mel_corr 1.00000 for bf16 AND
+>   int8 AND int4.** self-test + golden (0.6B/1.7B, bf16+int8) still 1.0. **M1 clean isolated (0.6B, 7-sentence ~36s
+>   audio, temp0): bf16 single 53.5s→batched 30.7s (RTF 1.48→0.78, 1.74× — the big win); int8 single 28.6s→batched 29.3s
+>   (RTF 0.89→0.82, ~break-even — int8-single already SDOT-fast/sub-realtime, little headroom + the int8 twin is f32-accum
+>   not SDOT); int4 slower on M1 (x86 lever).** Diagnostics: QWEN_BATCH_FORCE_MATVEC=1 (bit-exact proj), QWEN_BATCH_SEQ=1
+>   (force sequential ref). **NEXT: (1) int8-SDOT batched twin (qwen_matmat_int8 integer-dot, the matmat-bench TODO) →
+>   makes int8+batch win on M1 too; (2) batched CP lm_head still bf16 in the FORWARD-feed path? no — fixed; (3) Promessi-
+>   Sposi A/B (have the tooling); (4) optional auto-activate --batch on long text; (5) validate batching on x86 (Ryzen/Turin).**
+> - **★ BATCHING #2/#4/#3 DONE + MEASURED (2026-06-08, feat/server-batching, M1 0.6B):**
+>   - **#2 `--batch` × `.qvoice` (galatea_06b IT) + emotion**: batched-vs-sequential force_matvec **mel 1.00000** → cloned
+>     voice FAITHFUL across chunks (WDELTA/KV prefix re-applied per chunk), NO batching bug. `--emotion` flows through the
+>     batched path. BUT emotion-on-`.qvoice` renders WEAKLY even in SINGLE (preset ryan neu-vs-happy mel 0.45 strong; galatea
+>     qvoice 0.81 weak; --steer-weight 3.5 → 0.61 but distorts). NOT a batch bug → separate expressivity task (re-calibrate
+>     emotion vecs on qvoice hidden dist / inject differently; the strong WDELTA voice prefix overpowers the steer).
+>   - **#4 Promessi Sposi single-vs-batch (6 chunks)**: **bf16 batch 1.19× faster wall** (RTF 1.36→1.06, audiobook lever
+>     works); **int8 batch 0.81× SLOWER** (RTF 1.00→1.22) — int8-single SDOT-seq is already near-optimal.
+>   - **#3 int8-SDOT batched twin — DONE, MEASURED, conclusion: DEAD-END on M1.** Built `int8_matmat_sdot_slice`
+>     (weight-stationary, bit-exact: self-test L2=0 vs B×int8-matvec-SDOT). matmat-bench: SDOT-batched 0.40-0.60ms LOSES to
+>     f32-accum-batched 0.33-0.44ms AND to SDOT-seq 0.23-0.46ms. Reason: SDOT contracts over reduction-dim k, batching wants
+>     to parallelize over B → B sequential vdotq per weight block, B not vectorized. **Gated OPT-IN `QWEN_INT8_SDOT_MM=1`,
+>     default stays f32-accum (no regression).** VERDICT: int8+batch on M1 is break-even (SDOT-seq already near-optimal,
+>     int8 weights already halve bandwidth); **batching pays on bf16, not int8, on M1**. The real int8+batch win = **i8mm
+>     SMMLA (M2+) / AVX-512 VNNI (x86)** true int8 GEMM → write those guarded twins on rented hardware (§7 roadmap +
+>     real-HW campaign). The f32-accum batched int8 reading weights ONCE across B should still pay on bandwidth-bound x86.
+> - **TODO (later, this branch) — `--batch` × {server, streaming} interaction. EMPIRICAL STATUS CHECKED 2026-06-08:**
+>   `--batch` + `--serve` → the server **ignores --batch** (serve runs its own serial single-stream request loop; batching
+>   of CONCURRENT requests is NOT implemented). `--batch` + `--stream` → if the text splits to 1 chunk it falls back to
+>   sequential (which DOES stream); if 2+ chunks the batched orchestrator decodes per-chunk **post-hoc** (not via the
+>   streaming decoder thread) → **streaming is silently ignored, whole WAV written at end**. So today they DON'T compose.
+>   Open questions to decide: (a) TTFA — batching prefills ALL chunks before generating → first-audio worse vs single-
+>   stream chunk-1-first (measure); (b) is batched-streaming worth wiring (emit chunk-0's audio as soon as it EOSes while
+>   the rest keep stepping)? (c) server-side request batching = the real throughput play for `--serve` (separate, bigger
+>   feature — see next bullet). Likely doc outcome: **batching = throughput/long-form lever; streaming = latency lever —
+>   pick per use-case.** Test via `bench_matrix.sh --full`. DESIGN DECISION (user 2026-06-08, agreed): **streaming stays
+>   single-stream** (latency lever, one progressive sequence — nothing to batch within one request); batching belongs in
+>   the SERVER as concurrent-request batching (below).
+> - **★★ S1+S2+S3 DONE (2026-06-08, branch feat/server-batching) — SERVER REQUEST-BATCHING, FULL vLLM-style stack
+>   built + correctness-validated on M1.** docs/server-batching.md. Engine + server + per-request streaming, all green.
+>   - **S1 engine** `qwen_tts_generate_batch_multi()`: N independent requests (own text/speaker/language/sampling/seed) →
+>     N SEPARATE outputs, per-slot params + per-slot RNG (swap g_seed in/out per slot per frame via new `qwen_get_seed()`)
+>     → reproduces single-stream bit-for-bit. `--batch-multi-test N` CLI harness.
+>   - **S2 continuous batching** `qwen_tts_serve_continuous(ctx, B, sink)`: persistent frame-stepping loop; admits queued
+>     requests into slots freed by EOS'd ones (compact+refill, vLLM-style) — no waiting for the slowest in a static group.
+>     Host drives it via a callback sink (next_job/on_done/on_chunk/running) over the job queue. `--batch-size N` (N≥2).
+>     ONE scheduler thread owns ctx (sole synthesizer); reader pool parses HTTP read-only on ctx; instruct/voice_design →
+>     single worker on a CLONE ctx (won't stall the batch). Opportunistic, ZERO added latency.
+>   - **S3 streaming composes**: `qwen_speech_decoder_decode_streaming_st()` (per-slot decoder state); streaming slots
+>     decode each frame as produced + emit chunked PCM via on_chunk while Talker+CP stay batched. `/v1/tts/stream` (preset
+>     voice) now routes INTO the batch (batched AND streamed). = vLLM-style throughput + per-request parallel streaming.
+>   - **VALIDATED M1 0.6B**: `make test-serve-batch` (3 diff users force_matvec → each mel 1.0, cross-talk 0.21, real
+>     batching) · `make test-serve-continuous` (N=6 @ width-2: admitted climbs 2→6, 6/6 done) · `make test-serve-stream-batch`
+>     (2 concurrent streams batched+streamed, PCM corr 1.0 + exact sample count). All in test-serve-all. force_matvec =
+>     rigorous gate; temp>0 matmat path forks benignly (fp-order, like int8).
+>   - **NEXT: validate THROUGHPUT on x86 EPYC** (M1 is correctness-only — bandwidth-bound; aggregate RTF already ~0.95 for
+>     a small batch). Per-request `.qvoice`/quant switching out of scope (shared weights). Tune admission linger +
+>     back-pressure; int8/int4 batched-path RTF on rented boxes. Likely merge to feat/labs after x86 numbers.
+> - **TODO (BIG — the real server throughput feature) — SERVER REQUEST-BATCHING (continuous/dynamic batching).** User's
+>   idea (2026-06-08) and the intended use of the batched kernels: N concurrent requests from DIFFERENT users (different
+>   text/voice/params) stepped TOGETHER through Talker+CP (weight-stationary) → ~N× server throughput on bandwidth-bound
+>   boxes (memory §B: 2.3–3.7× at N≥6–8). **The hard part is DONE**: `qwen_batch_talker_step_ragged` (per-seq pos) +
+>   per-stream sampling/EOS + independent per-seq prefill are exactly this — `qwen_tts_generate_batch` is ~90% reusable
+>   (the B sequences come from different requests instead of chunks of one text). **What's missing = the SCHEDULER +
+>   concurrent server** (today `--serve` is serial single-thread): (1) concurrent accept + request queue; (2) batch
+>   scheduler — start with **dynamic batching** (collect a ~10–50ms window or up to B, run to completion, respond all;
+>   simple) then **continuous batching** (admit new requests into slots freed by EOS'd ones — compact+refill, vLLM-style,
+>   max utilization); (3) per-request response routing (+ per-request SSE if streaming). Each request keeps its own
+>   prompt/prefill (incl. its own `.qvoice`/speaker/temp) — bb already has per-seq KV. This is the CORRECT version of the
+>   old `--workers` dead-end (that was N parallel GEMVs re-reading weights N×; this reads once). Pays most on x86 EPYC/
+>   Sapphire — validate there. Likely its own branch off feat/batching.
+>   **KEY INSIGHT (user 2026-06-08): continuous batching + STREAMING COMPOSE** (this resolves the "--batch+--stream don't
+>   compose" finding, which was only about LONG-FORM post-hoc decode). Continuous batching steps the whole batch ONE frame
+>   at a time → after each batched Talker+CP step every active request has a new frame → emit it to THAT request's stream
+>   immediately (per-request SSE), decode incrementally per request. So: **batched Talker+CP (throughput, shared) + per-
+>   request streaming decoder + SSE (latency) TOGETHER** — exactly how vLLM streams tokens to N concurrent users. TTFA is
+>   GOOD (a new request is prefilled + admitted in-flight, starts producing frames at once — the "prefill all first" TTFA
+>   worry was only the single-text long-form path). Cost: N per-request streaming decoder states (cheap vs batched Talker+
+>   CP). This is THE production-serving architecture; continuous (not static) batching is the right target (static wastes
+>   utilization on ragged EOS). Most complex feature of the batching arc → dedicated branch, validate on x86.
+> - **TODO (later, this branch) — `--batch` × `.qvoice` + EMOTION mixing (user's "2 tests in 1", 2026-06-08).** Verify
+>   batched long-form works with a loaded `.qvoice` (e.g. Silvio): the voice is a KV/WDELTA prefix — does each chunk's
+>   cold-prefill (prev_prefill_len=0) correctly RE-APPLY the voice prefix in the batched orchestrator every time (no voice
+>   drift across chunks)? Check fidelity (ear + mel-corr vs sequential `.qvoice`) + RTF, bf16/int8. **AND** test combining
+>   `--batch` with `--emotion`/`--roughness` (the expressivity steering) — does the control-vector/steer apply per chunk
+>   in the batched path, and can we mix emotions cleanly across a long text? (the batched step reuses the same Talker/CP;
+>   steering is applied where? confirm it flows through). A/B: silvio_17b.qvoice on 1.7B + a 0.6B qvoice, single vs --batch,
+>   plain + with emotion. 2-in-1: qvoice-correctness AND emotion-in-batch.
+> - **TODO (perf epic) — REAL-HARDWARE validation campaign (needs rented/borrowed boxes; see docs/hardware-testing.md).**
+>   The cross-CPU/SIMD optimizations (BFMMLA/SMMLA/SME on ARM, VNNI/BF16/AMX on x86) can only be validated off-M1. Run
+>   `make bench-matrix` + `--caps` on each and paste results into docs/hardware-testing.md §5. Target boxes, in order of
+>   access: (1) **user's Ryzen 6800H mini-PC** (Zen3, AVX2 — already on LAN, `tests/x86_bench.sh`); (2) **AMD server VPS**
+>   (Scaleway EPYC Genoa/Turin = AVX-512+VNNI+BF16 — user has used Scaleway 9555P before); (3) **Mac mini M4** (rent/buy —
+>   bf16+i8mm+SME, the biggest untested ARM lever); (4) **a powerful ARM with max SIMD we support** (AWS Graviton3/4 =
+>   bf16+i8mm+SVE, or NVIDIA Grace = SVE2). For each: caps fires? self-test PASS (native+fallback)? RTF single/batch/
+>   stream/server × bf16/int8/int4? Then fill in the §7 newer-ISA twin and re-measure. This is the standing perf loop:
+>   **M1 dev → check-isa → rent → bench-matrix → fix → loop.**
+> - **SPECULATIVE DECODING analysis (TODO, user 2026-06-07) — docs/speculative-decoding-analysis.md.** Model has an
+>   INTRA-frame MTP (the Code Predictor = `small_to_mtp_projection`, 15 RVQ residual passes), NOT a next-frame
+>   speculator. Ideas: (A) cross-model draft 0.6B→1.7B `code0` + batched verify; (B) training-free lookahead/Jacobi on
+>   code0 (Medusa/Eagle OUT — need trained heads); (C) CP residual spec (risky, quality-sensitive); (D) spec-decode ⊂
+>   batching (the parallel-verify IS a batched forward → build batching first). **DECISION NUMBER = 0.6B↔1.7B code0
+>   acceptance rate** — cheap instrument-only experiment (reuse quant-ladder teacher-forcing rails) to run FIRST.
+> - **MTP DEEP-DIVE (TODO, user 2026-06-08) — a dedicated analysis task, NOT this session.** Question to answer
+>   precisely, with code citations: (1) **What MTP is in THIS model and how it works** — the weights contain a
+>   `small_to_mtp_projection` + the Code Predictor (15 RVQ residual passes/frame). Is that a true Multi-Token-Prediction
+>   head (predicts *future frames* à la DeepSeek-V3 / Qwen3 MTP) or only the INTRA-frame residual quantizer (predicts the
+>   15 residual codebooks of the CURRENT frame)? Read the HF config / `MODEL.md` / the projection wiring to settle it —
+>   current belief (line ~712) is INTRA-frame, NOT a next-frame speculator, but verify against the actual tensor graph.
+>   (2) **Do we USE it today, and how?** Trace where `small_to_mtp_projection` feeds in `qwen_tts_code_predictor.c` /
+>   `qwen_tts.c` — confirm it's the CP path we already run every frame (yes/no, with line refs), or dead weight we ignore.
+>   (3) **Would it help SPECULATIVE DECODING / speed?** IF there is any next-frame-predictive capacity in the MTP head,
+>   it could draft the next frame's code0 for a batched verify (spec-decode ⊂ batching — see the bullet above). IF it's
+>   purely the intra-frame residual predictor, it does NOT give free next-frame drafts and the spec-decode lever stays
+>   the cross-model 0.6B→1.7B code0 idea. Deliverable: `docs/mtp-analysis.md` + a verdict line in PLAN. Cheap, instrument-
+>   /read-only; gate the spec-decode work on its conclusion. Don't conflate with the `feat/batching` matmat work.
+> - **Quant:** int2 / int3 where we know it's viable (q2 already exists for the roughness path — extend as a
+>   real quant tier?). Measure quality cliff per codebook (we have the quant-ladder instrument). NOTE: int4+batching
+>   synergy (above) raises the value of a solid int4 path.
+> - **Speed+quality benchmark of voice CLONE and preset voices** (systematic A/B: RTF + mel-corr + ear, per voice).
+> - **Expressivity — EMOJI in the prompt:** what does the model do with 😄 😂 😢 🤔 / "lol"/"ahah"? Does it unlock
+>   laughs/cries? (first quick test 2026-06-07: no error, tokenizer eats them as UTF-8 — needs ear check; samples/emoji/).
+> - **Expressivity — SOUND-DISCOVERY SUITE:** a labeled grid (id → {text, lang, voice, steer/rate/vol}) that mass-
+>   generates onomatopoeia/vowel/emoji combos PER LANGUAGE × PER PRESET VOICE; user listens + annotates the best by id;
+>   bake the winners into a reusable paralinguistic library (macros). Goal: map which strings→sounds (laughs, cries,
+>   gasps, sighs) each voice/language can produce. Faster than the ad-hoc one-off loop we've been doing.
+>   - **VALIDATED SOUND BANK (ryan, ear 2026-06-07):** baked → [sigh]=Hah, [hmm]=Hmmm, [mmm]=嗯, [mah]=Mah,
+>     [uhm]=Uhm, [hmpf]=Hmpf, [ahh]/[relief]=Haaa, [phew]=Uao, [laugh]=Eheh(IT), [haha]=Haha(EN), [heh]=Hehhh,
+>     [ouch]=Ouch(EN)/[ahi]=Ahi(IT). EXTRA leads to bake: CN 哈哈/嘿嘿/呵呵 = 3 clean laughs; CN 唉 = weary sigh;
+>     😂 = faint sigh; "Ahahah 😆" → AHI pain; ouch_ahi/laugh_hihi = sharp-pain "ahi" (reduce metallic). NOT good:
+>     emoji 😢/lol, cry_buaa, sniff, boh, gasp_ah. RULES: macro rate ≥0.90 (metallic else); trailing "..." can add
+>     a 2nd spurious vocalization; "metallic" = WSOLA over-stretch.
+> - **Known model quirk (note):** occasionally elongates the letters of short words intermittently (model-side,
+>   not the sad recipe) — "Che fatica" drew out even at neutral rate 1.0. Investigate if it becomes a problem.
+> Uncommitted at stop: none of the repo (all committed: 52a1cf8→62da9ed→7b60e75→0c8ce04). Local-only: `voices/galatea_06b.qvoice`,
+> `samples/emergent/` (sbuffo audio), `/tmp/qwen3tts_src` (official source, ephemeral). Two stray `analisi_leak*.md` left untracked (not ours — decide later).
+
+> **Status 2026-06-05:** built + ear-validated on branch `feat/expressivity` (6 commits, NOT merged).
+> Two levers ship; the feature WORKS and is a real differentiator, but it is a **v1, not the ceiling** —
+> the control-vector method is crude additive steering and several gaps remain (below). Mechanism
+> (confirmed): RVQ split — Talker codebook 0 = words (intact), CP codebooks 1-15 = fine texture/prosody;
+> perturbing the CP changes delivery without losing intelligibility. `--instruct` alone barely moves
+> delivery (known Qwen3-TTS limit, even full-size on GPU) — these levers amplify it.
+
+**SHIPPED (works):**
+- **`--roughness <0..1>`** — per-frame blend of a q2 copy of CP `down` into the high-prec output
+  (`down` = causal driver of the q2 "death-metal" texture). Continuous grit/anger knob, ear-validated TOP.
+- **`--emotion <name>`** — calibrated control-vector presets (`presets/emotions/` EN + `it/`): 9 tones
+  (happy/excited/eager/proud/sad/gloomy/news/dramatic/calm), weight baked in, **blendable**
+  (`happy:0.5,proud:0.5`), global `--steer-weight` dial. Capture via `QWEN_STEER_CAPTURE` + `tests/steer_make.py`
+  (diff mean(instruct)−mean(neutral) at the single Talker→CP injection point `code_predictor.c:731`).
+  **Cross-model** (CP identical 0.6B/1.7B). Default-off → golden mel-corr 1.0.
+- **Voice-clone auto-trim** (`qwen_trim_trailing_silence`) — drops a faded ref tail so clones don't learn a decrescendo.
+
+**WHY NOT THE TOP YET (open gaps — the honest list):**
+- [ ] **`happy` is a per-voice TIMBRE limit.** Transfers fine on ryan, but on a soft narrator clone (Silvio)
+  it fades at every weight — *even when captured natively on that voice* — because the voice has no bright
+  register to reach. No additive direction creates a register the voice lacks. → some tones are intrinsically
+  voice-bounded; need to detect/flag this, or a non-additive method (pitch/energy contour control?).
+- [ ] **Directions are voice-specific & over-steer differently per voice** (Silvio excited TOP@0.7, voice-drift@1.4;
+  ryan happy needs 1.4). No systematic ryan↔voice calibration map yet — today it's hand-tuned per voice
+  (`presets/emotions/<voice>/`). Want an auto-calibration pass (sweep + pick the clean knee per voice).
+- [ ] **Steering is crude additive `cp_x += w·vec` at ONE point.** Likely better: per-CP-layer injection,
+  normalization to stay on-manifold (over-steer → metallic), contrastive/mean-centered directions captured
+  over MANY sentences+speakers (current = 1 voice, ~100-150 frames), or steering the late codebooks (c11-15 =
+  the measured texture surface) specifically.
+- [ ] **Only ~9 tones mined, EN+IT only.** The "weight = mood crossfade" trick (one capture → 2-3 moods at
+  different weights) is barely scratched; whisper/sarcastic/confidential/ironic/authoritative-variants untouched.
+- [ ] **Mood-blending** (`a:0.5,b:0.5`) implemented but barely explored — could give a continuous 2-D mood space.
+- [ ] **No segmenter/markup yet** (`[pause]`/`[emph]`/`[voice:]`/`[instruct:]`/per-span emotion) — the original
+  long-form/audiobook vision. Per-span emotion switching is the natural next product step.
+- [ ] **Not in the test suite** (no `--emotion` smoke / no steering golden); not merged to feat/labs.
+- **Per-layer & cross-speaker/language sensitivity still largely unmeasured** (validated 0.6B+1.7B / ryan+Silvio / EN+IT).
+
+**NEW LEADS (2026-06-06) — palette decorrelation + prosodic axes:**
+- [x] **ROOT CAUSE of "all tones sound alike" FOUND & FIXED (no re-capture).** Diagnosed the shipped IT
+  palette: vectors are highly collinear — mean off-diagonal cosine **+0.57**, and the somber cluster
+  (gloomy/news/dramatic/calm/sad) is +0.75..+0.91 (≈ the SAME vector). Each preset is ~80-90% a shared
+  "I-am-being-instructed-vs-neutral" common mode; the emotion-specific part is only the residual (happy 86%,
+  but gloomy/news/dramatic only 46-55%). Fix = **mean-center the palette** then renormalize:
+  `vec' = β·mean_all + γ·(vec − mean_all)`, renorm to original per-emotion norm. β=0 γ=2 →
+  **mean pairwise cosine +0.57 → −0.09** (near-orthogonal), same magnitudes. Tooling: `tests/steer_center.py`.
+  → bake this as the shipped palette (or a `--decorrelate` build step); also re-capture over MANY
+  sentences+speakers so the common mode is weaker at the source. Directly closes the "crude additive / not
+  contrastive" gap above. STILL TODO: ear-validate the centered palette is more distinct AND still natural
+  (centering can push off-manifold → metallic); pick β/γ knee; rebuild EN + IT + per-voice.
+- [ ] **Galatea is the better IT base voice** than Silvio (CC/PD LibriVox `it_galatea_fasol.wav`, Riccardo
+  Fasol). Neutral RMS 70 vs Silvio 29 → full/clear vs soft/low; emotions land better on it. New
+  `voices/galatea_06b.qvoice` (823MB, trim only 0.03s = no fade tail). Use as the reference IT clone for
+  expressivity demos. (1.7B + native-Galatea palette = open.)
+- [ ] **Explicit prosodic axes: `--volume`, `--rate`/`--speed`, `--pitch` (user req 2026-06-06).** Same
+  control-vector machinery as `--emotion` — capture "speak louder/softer", "faster/slower", "higher/lower"
+  as instruct-vs-neutral directions on `cp_x` and expose as signed knobs (−1..+1). (This is WHY some emotions
+  already shift Silvio's volume — the captured direction carries projection/energy.) Two implementations to
+  compare: (a) **steering vector** (model-side, changes delivery/register, on-manifold risk) vs (b) **cheap
+  DSP post-step** — `--volume` = PCM gain/normalize (trivial, `qwen_tts_audio.c`); `--rate` = WSOLA/`atempo`
+  time-stretch (pitch-preserving); `--pitch` = pitch-shift. DSP is reliable & decoupled but doesn't change
+  *delivery*; steering changes delivery but can distort. Likely ship: DSP for volume/rate (predictable),
+  steering-vector for "projection/intensity" (the expressive one). Volume/rate are the easy wins — do first.
+- [x] **MEASURED 2026-06-06 (Galatea 0.6B, neutral text, ear-validated):** the per-mood recipes that actually work:
+  - **Steering saturates fast & asymmetrically.** Default `--steer-weight 1.0` is too timid; on the CENTERED
+    palette w≈1.8–2.6 roughly doubles movement and stays clean (no clipping, hi6k flat → on-manifold) for the
+    UP moods. The DOWN moods (sad/gloomy/calm) DON'T respond to more weight — w4.2 is ~= w2.6, gloomy even goes
+    MORE monotone (F0std 17→10). So weight is an UP-mood lever only.
+  - **Down/somber moods = rate↓ + volume↓, NOT steering.** "Sadness" in speech is tempo+energy, which a
+    single-point CP injection can't impose. DSP slowdown (`atempo 0.82–0.85`, pitch-preserving) makes sad/gloomy
+    read as genuinely downcast — ear-confirmed "credibile". This is why `--rate`/`--volume` are REQUIRED, not extra.
+  - **Joy = excited (NOT happy) + rate↑ + volume↑.** The `happy` direction loses energy when pushed (the
+    "neutral is already upbeat" ceiling). The `excited` direction pushed (w2.6) + `atempo 1.10` + `volume 1.10`
+    = RMS +34%, F0 +13Hz, faster → genuine joy. Ear-confirmed. Lesson: for bright/joy use excited, not happy.
+  - **`--roughness` is TIMBRE (raspy/worn/smoker voice), NOT rage.** Ear-confirmed: roughness on a clean qvoice
+    just makes it gravelly/phlegmy, not angry. Rage = a CAPTURED angry steering direction + volume↑ + rate↑
+    (sharp/tense prosody), with NO roughness. Keep `--roughness` as a voice-CHARACTER knob, not an emotion.
+    (Capturing angry directions on 1.7B in progress.)
+  - **Design consequence — preset MANIFEST.** Real emotions are COMPOUND = `{vec, steer_weight, rate, volume,
+    roughness?}`, not a bare vector. Extend the `.vec` palette to a manifest (name → bundle) so `--emotion joy`
+    / `--emotion rage` sets all knobs at once. Bake centered-palette + per-mood weight + rate/volume here.
+  - **FULL RAGE is OUT OF REACH (model limit, ear-confirmed).** Captured 3 "furious/hostile/yell" directions on
+    1.7B, centered them — they land on **proud/authoritative/emphatic**, not angry (the model converts anger into
+    forceful control). Adding low roughness (0.25–0.40) + agitation (atempo 1.12) gets to **"annoyed/stern/light
+    irritation"** ("tired prof telling the class: hey, meeting tomorrow!") — useful and credible, but NOT furious
+    rage. Real anger needs tense/strained phonation + irregular bursts that additive single-point CP steering
+    can't impose. → ship as `annoyed`/`stern`, document rage as a known hard case. Artifacts persisted in
+    `presets/emotions/it_centered/` (decorrelated palette + `angry.vec` + README with the recipe table).
+
+- [ ] **VoiceDesign expressivity — INVESTIGATE (Leo Yu 2026-06-06).** Leo reports CustomVoice/clone "not as
+  emotional/expressive even with good instruct prompting" while **VoiceDesign is very expressive but can't lock a
+  voice identity** — the exact CustomVoice-vs-VoiceDesign tradeoff our steering work bridges. TASK: downloaded
+  `qwen3-tts-voice-design` (1.7B, 4.2GB); generate angry/sad/happy/excited/fearful with RICH official-style prompts
+  (multi-clause, e.g. "incredulous tone with a hint of panic creeping in", "vowels still tighten when nervous" —
+  the official examples are descriptive, NOT bare "speak angrily"), fixed voice-description + varied emotion clause,
+  EN+IT. LISTEN. IF VoiceDesign really renders rage/sadness better → reverse-engineer WHICH levers it has that
+  CustomVoice lacks: hypothesis = (a) no locked speaker identity → full prosody freedom (the identity-conditioning
+  that pins CustomVoice delivery is absent); (b) trained on rich descriptive style prompts. Levers we might port:
+  feed richer instruct, or relax speaker conditioning strength during steering. Official emotion control IS in
+  VoiceDesign per the paper (SOTA on InstructTTSEval); the limit is it doesn't clone.
+  **TESTED 2026-06-06 (downloaded VD 1.7B, EN+IT emotion matrix, user ear-verdict):**
+  - VoiceDesign DOES make bigger acoustic excursions than our CustomVoice (IT: angry F0 **+92Hz** & F0std +150%,
+    happy +29Hz, sad slowed +95%) — confirms the identity-clamp hypothesis: our locked speaker embedding/WDELTA
+    pins the register and blocks the pitch swings strong emotion needs. It also CORROBORATES our recipes (VD does
+    sad by slowing hugely, joy by raising pitch+rate — same directions, just more extreme).
+  - **BUT user verdict = VD's superiority is largely a "different-speaker ILLUSION":** VD synthesizes a NEW voice
+    per prompt, so the listener reads emotion easily because they're literally different people. On ONE consistent
+    recognizable voice the same shift is HARDER to perceive — no "clean break" (sighs/laughs/pauses) a human expects.
+    Our task (emotion on a STABLE identity) is intrinsically harder AND more valuable. Also: **VD Italian is WORSE
+    than ours** ("più orecchiabile noi"); angry/excited rendered with poor Italian — VD has NO base-speaker param
+    (voice is 100% prompt-derived → lands on a base weak in IT, likely a Chinese one), whereas we always use ryan
+    (strong in IT/ES/FR). VD also follows the target language inconsistently. → OUR consistent-voice direction wins.
+  - **Engine note:** `--load-voice` CAN inject an embedding INTO VoiceDesign (cross-model, qwen_tts.c:703, cosine
+    ~0.94) → could pin our identity + use VD's expressive instruct; likely re-clamps, but a cheap experiment.
+  - **NEXT LEADS (readable emotion on a consistent voice):** (A) **relax-identity lever** — scale down speaker
+    conditioning (embedding/WDELTA strength) during emotional spans to unlock pitch excursions while staying
+    recognizably the same voice (THE key reusable engine experiment). (B) **strong contour + onset "stacco"** —
+    sad span STARTS slow+quiet+falling, angry STARTS loud+fast+high, with a short PAUSE before the span = the
+    clean break audiobook voice-actors use. (C) pauses/tempo/volume swings we already have; sighs/laughs we don't
+    (model limit). Fold into the compound-emotion manifest.
+
+- [x] **Hidden-tag / special-token hunt — DEFINITIVE NEGATIVE (2026-06-06, first-hand model analysis).** Goal: find
+  special chars/tokens to pilot the model (sighs/laughs/onomatopoeia/emotion). Result: **Qwen3-TTS has NO
+  paralinguistic or emotion tokens.** Full `added_tokens_decoder` (both 1.7B CustomVoice + VoiceDesign) = only
+  standard Qwen tokens (im_start/end, vision, tool_call, fim, think) + TTS framing (`<|audio_start/end|>`,
+  `<tts_pad>`, `<tts_text_bos>`, `<tts_text_eod>`, `<|audio_pad|>`). NO `<laugh>`/`<sigh>`/`<breath>`/emotion tags.
+  Corroborated: (a) GitHub Discussion #238 is an OPEN request to ADD inline emotion tags (so they don't exist);
+  (b) third-party "TTS-Audio-Suite" gets laughs/sighs NOT from Qwen but by post-processing through a SEPARATE model
+  **Step Audio EditX** (inline tags `<Laughter:2>`/`<emotion:happy>`/`<style:whisper>`; covers ZH/EN/yue/ja/ko only,
+  "distorts" other langs → not for Italian). **The `codec_think_id/nothink/think_bos/think_eos` (2154-2157) = the
+  LANGUAGE-conditioning slot** (`qwen_tts.c:947`, `[THINK,THINK_BOS,language_id,THINK_EOS]` with `-l`, else
+  `[NO_THINK,...]`), already used by our engine — NOT a free-form instruction-following reasoning trace we're
+  missing. **CONCLUSION: emotion control in Qwen3-TTS = the instruct natural-language text ONLY** (no magic tags);
+  real paralinguistics need a 2nd-stage audio-edit model (Step Audio EditX), language-limited. → our steering+recipes
+  + (optional, EN-only) a paralinguistic post-editor is the only path to true sighs/laughs. Style-keyword inspiration
+  from EditX for VoiceDesign instructs: whisper/news/radio/story/shout/warm/gentle/authority/serious/murmur/etc.
+  Still worth a quick check: does OFFICIAL inference place the instruct differently than our `<|im_start|>user\n{instruct}<|im_end|>` (qwen_tts.c:882)?
+- [x] **Relax-identity lever — NEGATIVE (2026-06-06, ear-confirmed).** Added `QWEN_SPK_SCALE` env knob
+  (qwen_tts.c:~1100, default 1.0, scales the speaker-embedding contribution). Scaling DOWN (0.6/0.3) does NOT
+  free pitch excursions — it removes drive (RMS 76→52, F0 range shrinks), and at 0.3 the voice becomes a
+  DIFFERENT voice (lost Galatea); others not angrier. The register clamp lives in the WDELTA **weights**, not the
+  embedding → embedding-scale misses it. Faithful-clone vs VoiceDesign-pitch-range = physical conflict (same clamp).
+  Knob kept as a diagnostic. Deeper WDELTA-blend-toward-base lever = the VoiceDesign tradeoff we want to avoid.
+- [x] **Instruct-by-language test (1.7B ryan, n=1, ear-corrected):** instruct moves CHINESE delivery hugely
+  (angry ΔF0 +45Hz, ear-confirmed angry) but IT/EN by ±1-2Hz → **instruct/emotion is Chinese-tuned, weak on EU**
+  (validates the user's hypothesis; justifies our CP-steering path for EU). CORRECTION: my acoustic proxy claimed
+  "ZH instruct boosts Italian more" (ΔF0 -49) but BY EAR the EN-instruct IT was angrier and ZH-instruct IT less →
+  the "Chinese instruct on EU text" boost is NOT confirmed. (Lesson: ΔF0 magnitude ≠ perceived anger; ear is truth.)
+  Side-obs: `it_neutral` (no instruct) drifted to Chinese-ish PRONUNCIATION while `it_angry` was perfect Italian —
+  possible language re-anchoring by instruct/think → folded into the think re-audit task.
+- [x] **DEEP RE-AUDIT (task #6) — DONE, validated against OFFICIAL SOURCE (cloned QwenLM/Qwen3-TTS, not our code).
+  Our RE was CORRECT; no hidden lever. Hypothesis REFUTED.**
+  - `modeling_qwen3_tts.py:2135-2147`: think is a FIXED prefix — `[codec_think_id, think_bos, language_id, think_eos]`
+    with a language, `[codec_nothink_id, think_bos, think_eos]` without. NOT autoregressive reasoning. EXACTLY our
+    qwen_tts.c:947-955. The paper's "probabilistically activated thinking pattern" is a TRAINING thing; inference uses
+    this minimal fixed slot. No `enable_thinking`, no on/off/levels, no generative CoT we skipped.
+  - `modeling_qwen3_tts.py:2075-2080` + wrapper `qwen3_tts_model.py:269-276`: instruct is prepended as text embeddings,
+    format `<|im_start|>user\n{instruct}<|im_end|>\n` then assistant text — IDENTICAL to ours (qwen_tts.c:882). Placement correct.
+  - **Why instruct is weak (externally validated, NOT our bug):** (a) the official voice-CLONE API has NO instruct param
+    (clone = ref_audio/ref_text only) → our `--load-voice + --instruct` is OFF-DISTRIBUTION; community confirms "instruct
+    on cloned voices does nothing" (Qwen Disc #218/#231/#238, mlx-audio #453, HF #38). (b) instruct is Chinese-tuned, weak
+    on EU even on preset voices (our test: ZH +45Hz vs IT +1.5Hz). (c) 1.7B > 0.6B for emotion control.
+  - **CONCLUSION: the model genuinely offers no more via instruct for cloned EU voices → CP-steering (our control-vectors)
+    is the ONLY path for emotion on a cloned Italian voice. All alt levers (think / hidden tags / relax-identity / ref-breath
+    sighs) are closed with proof. Ship what works: centered palette + tempo + pauses.** Official src at /tmp/qwen3tts_src (ephemeral).
+
+- [x] **Cross-LANGUAGE steering validation (2026-06-06, ear-confirmed, ES/FR/DE/JA/KO, centered palette on preset voices).**
+  The IT/EN-captured steering does NOT transfer uniformly across languages (refines the old "presets are cross-lingual"
+  belief → cross-MODEL yes, cross-LANGUAGE only partial): **JA = best** (angry/sad/happy all credible), **DE = weak**
+  (emotions barely differ by ear — my acoustic proxy OVERSTATED it), **ES = broken** (angry sounds SAD, happy sounds
+  aroused/breathy not happy), **FR = happy→sultry/breathy not happy**, **KO = sad+happy don't work**. **`happy` is the
+  most language-FRAGILE direction** — in several langs it LOWERS pitch or induces breathiness that reads as "sultry"
+  (consistent with happy being intrinsically weak + breathiness=happy correlate; `excited` is our real joy lever).
+  → **emotion palette needs PER-LANGUAGE calibration** (or at least re-capture ES/FR/KO); and prefer `excited` over
+  `happy` for joy cross-language (untested — next quick experiment). Voices used: ryan (ES/FR/DE), ono_anna (JA), sohee (KO).
+  Lesson re-confirmed: acoustic ΔF0 proxy ≠ perceived emotion (proxy said DE clean, ear said weak) — ear is truth.
+- [ ] **`--volume` knob (trivial, not yet exposed):** no `--volume` flag exists; volume is pure PCM gain (qwen_tts_audio.c
+  one-liner) or ffmpeg post — unlike pitch (identity-clamped), volume has no obstacle. Fold into the compound-emotion manifest.
+
+See [[project_expressivity]] for the full build log, the cross-voice map, and the Silvio re-clone saga.
+
+### A2. Cross-CPU PERF — Leo Yu 9950X3D (Zen5 V-Cache) report, 2026-06-06 — VERIFIED LEADS
+> Leo benchmarked pure-C v0.9.0 on a Ryzen 9 9950X3D (CCD0=96MB V-Cache, CCD1=32MB) across Docker/WSL2 +
+> native Windows (first MinGW build). Deep-analyzed against our code. The genuinely-useful, verified takeaways:
+- **int4×CCD insight (CORRECT, matches us):** int4 LOSES on CCD0 (60MB int8 fits the 96MB V-Cache → no bandwidth
+  pressure → nibble-dequant is pure cost) and WINS on CCD1 (32MB<60MB → bandwidth-bound → smaller footprint pays).
+  Refines our "int4 = the x86 lever, not M1" → precisely: int4 helps ONLY when the working set does NOT fit cache.
+- **Thread oversubscription is catastrophic:** -j32 (all 16 cores/32 threads) → RTF 6.38, 3.9× WORSE than -j1
+  (cache thrash + cross-CCD latency on a bandwidth-bound load). Confirms our 4-thread-sweet-spot / EPYC -j1>-j4.
+  → PRODUCT IDEA: auto-detect X3D, pin CP to the V-Cache CCD, cap threads low. Never oversubscribe.
+- **SD is BLAS-bound (verified: `cblas_sgemm` in speech_decoder.c).** Native Windows SD drain = 153 ms/f vs Linux
+  20 (OpenBLAS Win32 CreateThread/WaitForSingleObject per-GEMM sync). This single number kills native Windows
+  (RTF 2.10). **CHEAP FIX to try before any dual-boot: `OPENBLAS_NUM_THREADS=1` for the SD on Windows** — if the
+  cost is per-GEMM thread sync, single-thread (no spawn/join) likely beats 153 → ~30-40, putting Windows-native at
+  ~1.0 with NO Linux/hybrid. Or a persistent BLAS pool / our own Win32 pool for SD.
+- **#1 UNTAPPED WIN — int8 the TALKER.** Leo's Talker is pinned at 21 ms/f across bf16/int8/int4 → tell that his
+  Talker is NOT being quantized (stays bf16=1.2GB). On our tree `--int8` DOES quantize the 0.6B Talker (the
+  `hidden<2048` gate was removed). Quantizing it → 600MB halves DRAM traffic on the bottleneck HE correctly named
+  (Talker=DRAM-bound). Verify dtype via `--debug`; OS-independent win, ~−0.7..0.9s.
+- **Docker CP=54 likely contaminated by 9P filesystem** (his own note: model on /mnt/c = +30% CP). Clean on ext4
+  ≈ 38-42 → the "Windows 1.82× faster CP" (54→30) shrinks to ~1.3× and is partly mmap/filesystem, not V-Cache.
+- **RTF/per-frame table don't reconcile:** int4-j4-CCD1 (CP60+Talker21=81ms/f) shows RTF 1.11 < int8-j1-CCD0
+  (CP54=75ms/f) RTF 1.21 → only explained by prefill (threaded GEMM, faster at -j4) and SD-overlap differences;
+  per-frame table ≠ whole-utterance RTF. The hybrid streaming RTF 0.91 ignores per-frame cross-VM IPC (optimistic);
+  Linux-BM 0.80-0.84 stacks best-cases (Talker won't improve — DRAM-bound; CP 30→22 is speculative) → realistically
+  0.85-1.0. The dual-boot is likely UNNECESSARY (fix Windows SD threading + int8 Talker instead).
+- **Confirmed-good & worth keeping:** Leo's native Windows port (5 changes: CreateFileMapping mmap shim, O_BINARY,
+  Win32 server stub, posix_memalign→aligned_alloc, OS detect) closes our "Windows won't compile" gap → ask for the
+  patch. The `__AVX512VNNI__` Makefile-clean-bug he hit = our known gotcha. Cooperlake-BLAS-beats-AOCL on Zen5 SD
+  (medium ConvNet shapes favor Ice Lake blocking; Zen5 has full AVX-512) — plausible, use `OPENBLAS_CORETYPE=COOPERLAKE`.
+- **Streaming clarification:** Leo's "streaming not yet implemented" = HIS hybrid Win-CP→Linux-SD per-frame token
+  PIPE only (`--emit-tokens`/`--decode-tokens`, his local patch, NOT in our tree). It does NOT mean we lack
+  streaming — we HAVE `--stream` (TTFA, feat/streaming-ttfa) + OpenAI-compatible server streaming. Different layer.
+
+### B. Weight-stationary batching = the throughput lever for the SERVER
+> **Branch plan (2026-06-04):** this becomes its OWN branch (e.g. `feat/batched-generation` off
+> `feat/labs`) — batch-dim in Talker/CP step fns, batched int8/bf16 GEMM, per-stream attention+sampling,
+> continuous-batch scheduler. The perf bet for LONG-FORM/server (N≥6-8). NEXT cheap step before building:
+> re-run the batching microbench with the REAL int8/bf16 kernels (not f32 BLAS) for the true threshold.
+Single-stream (one audio) cannot reorder to keep weights cache-hot: the CP's 16 steps (and the
+Talker's tokens) are a hard autoregressive chain (step g input = step g-1 output), so the weight
+read order `L1..L5 x16` can't be reordered ("weights-outer, steps-inner" needs all step inputs at
+once — they don't exist yet). BUT across **independent concurrent requests** the reorder is valid:
+batch N requests -> each weight read is reused across all N (weight-stationary across the batch) ->
+~Nx throughput. This is standard LLM continuous-batching. **Not a single-file latency win; a big
+multi-request server throughput win.** Re-analyze when optimizing the HTTP server for concurrency.
+
+**2026-06-04 — MEASURED: `--workers` (N parallel GEMVs) is NOT batching, and is a DEAD-END on M1.**
+The `--workers N` pool runs N INDEPENDENT GEMVs, each re-reading the weights → on a bandwidth-bound
+bf16 workload that's N× the DRAM demand → contention, not reuse. Bench (3-sentence text, full vs 3
+concurrent reqs on `--workers 3`, 0.6B M1): per-chunk latency TRIPLED (~6s→~17s), aggregate throughput
++8% only, total wall-clock WORSE (17.7 vs 16.4s). A single 4-thread synthesis already saturates M1
+bandwidth. **So the worker-pool is correctness-validated but NOT a throughput win on M1.** See
+[[project_split_parallel_bench]] + `docs/pipeline.md`. The fix is TRUE batching (the N current-frame
+vectors stacked into ONE GEMM `Y=W·X`, weight read ONCE) — a different code path from the worker pool
+(needs a batch-dim in the step functions; the matvecs become GEMMs like prefill already does, attention
+stays per-stream since each request has its own KV — but attention is <1% so the 90% matvec slice
+batches cleanly). Microbench of the GEMV-loop vs GEMM ceiling: see section-B addendum below / `docs`.
+NUANCE: after int8+SDOT the CP shifts toward compute-bound (PLAN "Speed must come from compute
+throughput"), so the batching win is largest in the bf16 path and smaller (but still real, via better
+GEMM FMA/SIMD utilization) in int8. **Decision: park worker-parallel behind real batched-GEMM OR a
+higher-bandwidth box (Ryzen/server). The DUAL-PURPOSE insight — text-splitting is ALSO the unit of
+prosodic control (track A) — means the EXPRESSIVITY half of splitting is the live track; it needs no
+parallelism and stands alone. First-audio latency → sequential chunk-1-first (~6s vs ~16s), not
+concurrency (which tripled chunk-1's latency).**
+
+**2026-06-04 — MICROBENCH: true batched-GEMM DOES reuse the weights, but only pays off at N≥4-6.**
+`/tmp/batch_bench.c` (Accelerate f32, M1): N sequential GEMV (= workers) vs 1 GEMM width-N (= batch),
+on the real CP/Talker matvecs. speedup = gemv_loop / gemm:
+
+| W | N=2 | N=3 | N=4 | N=6 | N=8 |
+|---|---|---|---|---|---|
+| CP gate_up [3072×1024] | 0.77× | 1.20× | 1.66× | 2.31× | 3.23× |
+| CP down [1024×3072] | 0.86× | 1.16× | 1.63× | 2.30× | 3.12× |
+| CP QKV [2048×1024] | 0.53× | 0.84× | 1.17× | 1.77× | 2.46× |
+| Talker-1.7B gate_up [6144×2048] | 0.80× | 1.15× | 1.66× | 2.69× | 3.74× |
+
+- **Weights ARE reused** (the win mechanism is real): GEMM time is ~FLAT in N (gate_up 0.48ms at
+  N=2..8) while the GEMV loop grows linearly — the weight is read once, extra columns ~free.
+- **BUT the GEMM has a fixed cost ~2.5× a single GEMV** → N=2 LOSES, break-even N≈3, strong (2-3.7×)
+  only at N≥6. So batching is a **server-scale / many-chunk lever, NOT a 2-3-sentence win** — exactly
+  what this section always said ("not a single-file latency win").
+- **Consequence for the use cases:** short one-shot (2-3 sentences, N≤3) → batching does NOT help on M1
+  (neither do workers). LONG-FORM / AUDIOBOOK is the natural home: split a book into many chunks → keep
+  N≥6-8 active in a continuous batch → **2.3-3.7× throughput**, the real lever. Server with many
+  concurrent users → same regime.
+- **Build cost (real):** batched generation needs a batch-dim in the Talker/CP step functions (matvecs
+  → GEMM like prefill already does; attention stays PER-STREAM since each request has its own KV, but
+  attention is <1%), per-stream sampling, and a continuous-batch scheduler. Caveat: this f32 Accelerate
+  ceiling is the bf16-regime story; the int8+SDOT hot path is more compute-bound, so a batched int8
+  kernel's win is smaller (still real via better FMA/SIMD utilization). NEXT before building: re-run
+  this microbench with the ACTUAL int8/bf16 kernels (not f32 BLAS) to get the realized threshold/curve.
+
+### C. Break the single-stream autoregressive wall — speculative decode + contextual sparsity
+The status-quo breakers used by DeepSeek/Qwen3.6 MTP etc., applied to the CP. Both could win
+SINGLE-STREAM (unlike B which needs concurrent requests). Both gated on an empirical measurement.
+
+**C1. Self-speculative decoding on the CP.** A cheap DRAFT predicts all 15 codebooks fast (e.g.
+the CP run at q2 — the "death metal" build — or a tiny head); the real CP (int4/bf16) VERIFIES all
+15 in ONE batched pass (parallel over positions, like prefill — machinery already exists). Weight
+read amortized over 15 positions instead of 15 sequential reads = the cache/bandwidth win, on a
+single stream. Speedup = f(acceptance rate). Greedy needs exact argmax match; if the q2 draft
+diverges too much (we saw it does for audio quality) acceptance may be low. (NB: the CP is named
+"MTP" in-code but that's the residual predictor, NOT a spec-decode draft head — don't conflate.)
+
+**C2. Contextual sparsity (Deja Vu / PowerInfer style).** If only a fraction of the 3072 FFN
+intermediate neurons meaningfully fire per token, compute only those rows → fewer weight bytes
+read → bandwidth win, single-stream. Needs a cheap predictor of which neurons fire.
+
+**FIRST STEP = MEASURE — ✅ DONE 2026-06-04 (`make quant-ladder` + `tests/quant_ladder.py`).**
+
+**⚠ Architectural finding that reshaped the measurement:** the CP output (codebooks 1-15)
+FEEDS BACK into the Talker's next-step input embedding (`qwen_tts.c:1300-1310`:
+`step_embed = codec_embed(code0) + Σ cp_codec_embed(codes 1-15) + tts_pad`). So changing CP
+precision forks the ENTIRE autoregressive trajectory — different `code0`, different LENGTH
+(free-running q2 ran 190 frames vs bf16's 128). A naive free-running precision sweep therefore
+measures NOTHING (≈1-8% agreement = pure trajectory decorrelation, near random). **This feedback
+coupling is also the mechanistic reason int4/q2 audibly change prosody AND duration, not just
+texture.** → measurement must TEACHER-FORCE: lay bf16 "rails" (the 16-codes/frame stream), then
+replay them (`QWEN_TF_CODES`) at each CP precision (`QWEN_CP_PREC`, Talker held bf16) so every
+precision sees bit-identical per-step inputs. Implemented; bf16-TF == rails = 100% (harness valid).
+
+**Quant-ladder results (0.6B, 128 frames, teacher-forced, argmax agreement vs bf16):**
+
+| codebook | int8 | int4 | q2(down) |
+|---|---|---|---|
+| c1 (coarsest residual) | 90% | 77% | 33% |
+| c5  | 80% | 57% | 12% |
+| c10 | 77% | 45% | 5% |
+| c15 (finest) | 73% | 23% | 8% |
+| **overall** | **78%** | **46%** | **9%** |
+
+- **Drift GROWS with codebook index** — the late/fine RVQ residuals (c11-c15) are the most
+  quant-sensitive. int4 holds the early residuals (c1-c5: 57-77%) but collapses on late ones
+  (c12-c15: 23-27%). int8 degrades gently and uniformly (≈73-90%). q2 destroys everything past c5.
+- **int4-vs-int8 = 44% overall, worst at c11-c15 (20-35%)** → int8 IS the artifact-free gold;
+  int4's "slight aggression" lives in the late/fine codebooks where it diverges most from int8.
+- **FFN activation sparsity (post-SwiGLU |x|<eps): 0.28% @1e-4, 2.25% @1e-3, 14% @1e-2, 59% @1e-1.**
+  The CP FFN is essentially DENSE — NOT the 80-90% sparsity big LLMs show. **→ C2 (contextual
+  sparsity) is NOT worth building for the CP: even an optimistic 1e-2 threshold skips only ~14%,
+  and that's before verifying it doesn't flip argmax. Negative result, settled.**
+
+**Verdict (data-driven):**
+- **C2 contextual sparsity — DROP.** CP FFN is dense; no exploitable sparsity.
+- **C1 self-speculative — MARGINAL, conditionally.** Greedy spec-decode needs exact argmax match.
+  q2 draft acceptance is hopeless (9%). int4 draft → int8/bf16 verify would accept ~the early
+  codebooks (c1-c5, 57-77%) but reject the late ones, and you pay a full verify pass anyway, so
+  net win is small and fragile. Best framing if pursued: int8 draft (78% vs bf16) with a single
+  batched bf16 verify, accepting the common prefix of codebooks — but 78% per-codebook compounds
+  to a low whole-frame acceptance. Re-derive expected speedup from these numbers before building.
+- **A prosody knob — STRONGEST lead.** The late codebooks (c11-c15) ARE the texture/prosody
+  control surface, and the Talker-feedback coupling means perturbing them shifts delivery
+  globally. The q2-on-`down` "death metal" finding sits exactly here. A controllable strength
+  knob on late-codebook CP precision is the most promising thing this measurement surfaced.
+
+Caveat: teacher-forcing fixes the TOKEN feedback but each precision still builds its own intra-frame
+KV cache, so per-codebook drift conflates step sensitivity + intra-frame KV accumulation (realistic,
+but not a pure per-step isolate). Good enough for the decisions above.
+
+**DECOMPOSITION EXPERIMENTS — ✅ DONE 2026-06-04 (commit pending; env knobs QWEN_TALKER_PREC /
+QWEN_CP_LMHEAD_PREC / QWEN_CP_LAYER_PREC / QWEN_DUMP_CODE0; script `/tmp/ql_decomp.sh`).**
+Tested the user's "low-bit early codebooks / high-bit late delicate ones" hybrid hypothesis. Verdict:
+**the hybrid has NO sweet spot — the int4 cost is in the SHARED transformer, spread evenly.**
+
+- **Talker int4 → code0 (= the WORDS) agreement 92.97% vs bf16** (teacher-forced). int4 on the Talker
+  FLIPS ~7% of word tokens → confirms the workflow's #1 blind spot: **keep the Talker ≥ int8 for
+  intelligibility.** (int8 on the 0.6B Talker is gated off at hidden<2048; needs 1.7B or gate bypass.)
+- **Exp1 — drift is in the shared transformer, NOT the lm_heads.** Full int4 = 46%; int4-transformer +
+  bf16-lm_heads = 48% (keeping heads precise recovers only +2%); **bf16-transformer + int4-lm_heads =
+  84%** (the 15 lm_heads TOLERATE int4 fine). So the ONLY per-codebook weights (the heads) are not the
+  problem → "keep late codebooks precise" = keep late heads precise = +2%, useless.
+- **Exp2 — all 5 CP layers contribute ~equally** (one-layer-int4: L0 72%, L1 72%, L2 71%, L3 71%,
+  L4 69%). No sacrificial layer; degradation compounds ≈multiplicatively (5 layers → 46%). Per-layer
+  mix = smooth linear speed/quality trade, not a win.
+
+**Consequences for the quant roadmap:**
+- **int8 is the quality floor.** int4 on the CP transformer is unrecoverable via per-codebook (heads
+  aren't the driver) or per-layer (all equal) tricks. DeepSeek-style per-tensor mix has no obvious
+  CP sweet spot — the cost is in the shared FFN/attn.
+- **Only safe low-bit hybrid: int4 on the 15 lm_heads** (84% agreement) → memory saving (60→15 MB),
+  but heads are 4.3% of CP time → negligible speed. Marginal, clean, optional.
+- [ ] **OPEN QUESTION (added 2026-06-04): can int4 shed the "anger" and become the TRUE default, or not?**
+  int4 introduced slight aggression (ear), q2 strong "death-metal" — the quant-ladder localised it to
+  the LATE/fine CP codebooks (c11-c15: int4 23-27% vs bf16) that carry texture/prosody. The anger is
+  the SAME perturbation as the prosody knob (track A), just uncontrolled. Question: is there an int4
+  variant that keeps the speed/memory but NOT the roughness? Candidates to test: (a) **int4 transformer
+  + int8 (or bf16) lm_heads** — but Exp1 showed heads aren't the driver (+2%), so unlikely; (b) **finer
+  int4 (per-group scales / smaller block than 32, or int4 + a few high-precision outlier channels** à la
+  AWQ/per-channel) — the block-32 absmax may be too coarse for the sensitive late residuals; (c) **int4
+  everywhere EXCEPT the FFN `down` (kept int8/bf16)** — `down` is the causal driver of the roughness
+  (q2-on-down = death-metal), so int8-down + int4-rest might remove the anger at most of the speed. If
+  any (b)/(c) yields int4-speed + int8-quality → int4 becomes the real default; if not, int8 stays the
+  default and int4 lives only as the deliberate `--roughness` knob. MEASURE with the quant-ladder (code0
+  + per-codebook agreement) AND by ear. Decide the `.qvoice`-save-quantized design (test backlog) after.
+- **Speed must come from compute throughput, not byte-cutting:** the CP is COMPUTE-bound after
+  SDOT (the workflow corrected our "bandwidth-bound" framing — int8 weight → one vdotq_s32 vs
+  dequant+FMA×8, so the FMA reduction is the limiter; int4's 1-row q4 kernel made x-loads the new
+  bottleneck = why int4 lost). Levers: SDOT (done, ARM), VNNI (x86, written/unvalidated), SDOT on
+  `argmax_matvec_int8` (CP lm_heads still on f32 dequant → easy ~−20% on the 4.3% slice), 2-row-fuse
+  the q4_0 kernel (separate the architecture penalty from the −26% true quality floor).
+
+---
+
+## End-to-end leverage map (workflow `qwen-tts-flow-map`, 6 agents, 2026-06-04)
+
+A multi-agent static map of the whole pipeline (Talker / CP / decoder / conditioning / kernels),
+spot-verified against source. Condensed; full synthesis in session transcript.
+
+**Byte & time budget per frame (12.5 Hz → 80 ms audio/frame, 0.6B/M1):**
+| Stage | re-reads/frame | time share | bound |
+|---|---|---|---|
+| **Code Predictor** | 30 MB transformer re-read **15×** + 15 lm_heads 1× | **74–90% (~76 ms/f)** | bandwidth at bf16 → **compute at int8+SDOT** |
+| Talker (code0=words) | 28 layers 1×; codec_head 1×; KV pos+1 | 9–15% (~25 ms/f) | compute |
+| Speech decoder | conv ~80 MB f32 1× on drain | 5–8% non-stream, ~0% streamed (overlapped pthread) | conv-bound, off critical path |
+| Conditioning/prompt | prefill-amortized | negligible/frame | — |
+
+**Quant-sensitivity ranking (most → least fragile):** (1) Talker code0 path (codec_head bf16 but its
+input quantized — HIGH, now measured: int4 flips ~7% words); (2) CP late codebooks c11-15 (HIGH,
+measured); (3) CP FFN gate_up/down = 53% of CP time + the causal driver of per-codebook drift + the
+q2 "roughness" effect (HIGH); (4) CP attn q/k/v/o (MEDIUM); (5) Talker bf16 KV (MEDIUM); (6) decoder
+ConvNeXt pw1/pw2 if ever quantized (MEDIUM-HIGH, currently f32); (7) embeddings + all norms (LOW —
+keep f32/bf16). **codec_head itself is NEVER quantized despite gating intelligibility.**
+
+**Speed levers (ranked):** SDOT (validated, ARM) · **0.6B Talker int8 — ✅ SHIPPED 2026-06-04**
+(dropped the stale `hidden<2048` gate; --int8 now quantizes the 0.6B Talker too: Talker step
+30→16 ms/f = −47%, 0.6B int8 RTF → 0.87–0.92 sub-1.0, no 4-thread hang, code0 96.9% = int8-gentle on
+words, user ear-approved, int8 golden regenerated) · **x86 AVX2 + cross-OS pthread pool + int4 —
+✅ VALIDATED on Ryzen 6800H 2026-06-04 (RTF ~2.02, int4/4-thread; AVX2 +6% over scalar, bandwidth-
+bound)** · **x86 AVX-512/VNNI — written (d67648a/b89f30e), UNVALIDATED, needs a rented Zen4+/Intel
+box (6800H is AVX2-only)** · server continuous-batching (throughput only).
+**Refuted/closed (all verified 2026-06-04):**
+- int4-Q4_0 global on CP, self-speculative (marginal), contextual sparsity (CP FFN dense).
+- SDOT-on-lm_head — forks int8 trajectory (golden mel-corr → 0.51); reverted.
+- q4_0 2-row-fuse — no win on NEON (decode-bound, not x-load-bound); reverted.
+- **"vectorize RoPE + attention" — ALREADY DONE (workflow was WRONG here).** Hot-path attention
+  (`qwen_causal_attention_bf16kv`) has full NEON (Q·K dot + online-softmax V accumulation) + AVX2
+  twins; RoPE (`apply_rope_neox_inplace`, Talker + CP) is NEON+AVX2. The only scalar RoPE
+  (`qwen_apply_rope_interleaved`, kernels.c:2209) has ZERO callers = dead code. Nothing to do.
+- **"fuse codec_head into final Talker wo" — NOT a real fusion.** codec_head applies to last_hidden
+  = output AFTER the final layer's residual+FFN+RMSNorm (nonlinearities in between), so it can't fold
+  into wo. It's one already-optimized bf16 matvec (~1% of total). Skip-special-token rows would save
+  ~0.3% total — not worth the branching. Closed.
+
+**Prosody/instruct knobs (ranked, concrete):** (1) `--roughness` = bf16↔q2 blend on CP `down`
+(code_predictor.c FFN); (2) steerable prosody vector added to `cp_x` BEFORE CP layer 0 (the single
+Talker→CP injection point, `cp_mtp_project`); (3) instruct→CP control vector `diff(neutral−angry)`
+injected scaled (amplifies the architecturally-weak instruct); (4) per-codebook weights on the CP-code
+feedback sum into the next Talker step (`qwen_tts.c:1300`, currently flat sum); (5) speaker_scale on the
+voice-clone ECAPA norm-match; (6) per-step instruct re-injection decayed across codebook steps.
+
+**Open questions still needing measurement:** intrinsic-vs-KV-accumulation isolate (bf16 KV +
+quantized matvec only); `--roughness`/q2 generalization across speakers×langs×models;
+do CP layer-wise emotion directions exist (dump neutral-vs-angry activations); x86/VNNI runtime
+correctness + RTF (Ryzen box); 2-row q4_0 true quality floor; decoder bf16 (cheapest unmeasured
+DRAM saving, 80 MB f32 → no quant infra yet).
+
+---
+
+## References
+
+- [Qwen3-TTS GitHub](https://github.com/QwenLM/Qwen3-TTS) ·
+  [Technical Report (arXiv:2601.15621)](https://arxiv.org/abs/2601.15621)
+- HuggingFace: [0.6B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice) ·
+  [1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice)
+- Community: [FastAPI server](https://github.com/ValyrianTech/Qwen3-TTS_server) ·
+  [OpenAI API](https://github.com/groxaxo/Qwen3-TTS-Openai-Fastapi) ·
+  [streaming](https://github.com/rekuenkdr/Qwen3-TTS-streaming) ·
+  [faster-qwen3-tts (Andres Marafioti)](https://github.com/andimarafioti/faster-qwen3-tts)

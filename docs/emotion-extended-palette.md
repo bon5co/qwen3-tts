@@ -1,7 +1,8 @@
 # Beyond the 6 base emotions — extended palette analysis (2026-07-02)
 
 *Analysis for extending `--emotion` past {sad, joy, anger, fear, disgust, surprise}. THE recipe
-(`docs/emotion-THE-recipe.md`) stays untouched — this is about what to ADD on top of it. TODOs in*
+(`docs/emotion-THE-recipe.md`) stays untouched — this is about what to ADD on top of it. TODOs in
+`plan_v4.md` §E5.*
 
 ---
 
