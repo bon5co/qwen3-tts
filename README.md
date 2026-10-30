@@ -1,5 +1,9 @@
 # Qwen3-TTS Pure C Implementation
 
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/qwen3-tts?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
+**Deploy on Railway:** [qwen3-tts template](https://railway.com/deploy/qwen3-tts?referralCode=Z1xivh&utm_medium=integration&utm_source=template&utm_campaign=generic)
+
 [![Build](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/build.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/build.yml)
 [![CodeQL](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/codeql.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/codeql.yml)
 [![Memory Safety](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/safety.yml/badge.svg)](https://github.com/gabriele-mastrapasqua/qwen3-tts/actions/workflows/safety.yml)
